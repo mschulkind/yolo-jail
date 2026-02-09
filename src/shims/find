@@ -1,5 +1,5 @@
 #!/bin/sh
-if [ -t 1 ]; then
+if [ -t 1 ] && [ -z "$YOLO_BYPASS_SHIMS" ]; then
   echo "Error: 'find' is disabled for direct use. Use 'fd' instead." >&2
   echo "If you absolutely need the real find in a script, use /bin/find" >&2
   exit 127

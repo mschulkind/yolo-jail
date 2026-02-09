@@ -35,7 +35,7 @@ run-path path *args:
         --user $(id -u):$(id -g) \
         --workdir /workspace \
         yolo-jail \
-        bash -c "[[ -f mise.toml ]] && (mise trust && mise install && mise upgrade); {{ if args == "" { "bash" } else { args } }}"
+        bash -c "[[ -f mise.toml ]] && (mise trust && YOLO_BYPASS_SHIMS=1 mise install && YOLO_BYPASS_SHIMS=1 mise upgrade); {{ if args == "" { "bash" } else { args } }}"
 
 # Clean up build artifacts
 clean:

@@ -30,6 +30,8 @@ yolo
 ```
 The jail will launch, mounting your current directory to `/workspace`. It will share your global `gh` and `gemini-cli` authentication, and tools will be persistent across sessions.
 
+> **Note:** If you see a warning about `mise.toml` not being trusted on your host, you can run `mise trust` in the `yolo_jail` directory to silence it.
+
 ## Tool Management (Mise)
 
 This project uses **Mise** to manage project-specific tools.

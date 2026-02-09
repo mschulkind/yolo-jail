@@ -28,6 +28,10 @@
           ln -s ${pkgs.coreutils}/bin/env $out/usr/bin/env
           ln -s ${pkgs.bashInteractive}/bin/bash $out/bin/bash
           ln -s ${pkgs.bashInteractive}/bin/sh $out/bin/sh
+          ln -s ${pkgs.gawk}/bin/awk $out/bin/awk
+          ln -s ${pkgs.gnused}/bin/sed $out/bin/sed
+          ln -s ${pkgs.gnugrep}/bin/grep $out/bin/grep
+          ln -s ${pkgs.findutils}/bin/find $out/bin/find
         '';
 
         # The Docker Image
