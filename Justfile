@@ -31,6 +31,7 @@ run-path path *args:
         -e MISE_CONFIG_DIR=/workspace \
         -e MISE_TRUST=1 \
         -e MISE_YES=1 \
+        -e LD_LIBRARY_PATH=/lib:/usr/lib \
         -e PATH=/mise/shims:/bin:/usr/bin \
         --user $(id -u):$(id -g) \
         --workdir /workspace \

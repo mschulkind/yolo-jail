@@ -24,7 +24,7 @@
 
         # Derivation to provide /usr/bin/env and other standard paths
         binPathLinks = pkgs.runCommand "bin-path-links" {} ''
-          mkdir -p $out/usr/bin $out/bin
+          mkdir -p $out/usr/bin $out/bin $out/lib64 $out/lib $out/usr/lib
           ln -s ${pkgs.coreutils}/bin/env $out/usr/bin/env
           ln -s ${pkgs.bashInteractive}/bin/bash $out/bin/bash
           ln -s ${pkgs.bashInteractive}/bin/sh $out/bin/sh
@@ -32,6 +32,16 @@
           ln -s ${pkgs.gnused}/bin/sed $out/bin/sed
           ln -s ${pkgs.gnugrep}/bin/grep $out/bin/grep
           ln -s ${pkgs.findutils}/bin/find $out/bin/find
+          
+          # Link the dynamic linker for x86_64
+          ln -s ${pkgs.stdenv.cc.bintools.dynamicLinker} $out/lib64/ld-linux-x86-64.so.2
+          
+          # Link standard libraries to both /lib and /usr/lib
+          for dir in $out/lib $out/usr/lib; do
+            ln -s ${pkgs.glibc}/lib/* $dir/
+            ln -s ${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6 $dir/libstdc++.so.6
+            ln -s ${pkgs.zlib}/lib/libz.so.1 $dir/libz.so.1
+          done
         '';
 
         # The Docker Image
@@ -61,6 +71,7 @@
             pkgs.gcc
             pkgs.gnumake
             pkgs.binutils
+            pkgs.zlib
           ];
 
           config = {
