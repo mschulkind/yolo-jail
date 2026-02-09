@@ -52,6 +52,7 @@
             pkgs.gh
             pkgs.gnused
             pkgs.gnugrep
+            pkgs.gawk
             pkgs.findutils
             pkgs.gcc
             pkgs.gnumake

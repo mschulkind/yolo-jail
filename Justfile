@@ -33,7 +33,7 @@ run-path path:
         --user $(id -u):$(id -g) \
         --workdir /workspace \
         yolo-jail \
-        bash -c "[[ -f mise.toml ]] && (mise install && mise upgrade); bash"
+        bash -c "[[ -f mise.toml ]] && (mise trust && mise install && mise upgrade); bash"
 
 # Clean up build artifacts
 clean:

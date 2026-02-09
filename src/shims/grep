@@ -1,3 +1,9 @@
 #!/bin/sh
-echo "Error: 'grep' is disabled in this environment. Use 'rg' (ripgrep) instead." >&2
-exit 127
+# If stdout is a TTY, we assume a human/agent is running it directly and block it.
+if [ -t 1 ]; then
+  echo "Error: 'grep' is disabled for direct use. Use 'rg' (ripgrep) instead." >&2
+  echo "If you absolutely need the real grep in a script, use /bin/grep" >&2
+  exit 127
+fi
+# Otherwise, pass through to the real grep
+exec /bin/grep "$@"
