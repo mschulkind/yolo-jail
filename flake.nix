@@ -22,6 +22,14 @@
           '';
         };
 
+        # Derivation to provide /usr/bin/env and other standard paths
+        binPathLinks = pkgs.runCommand "bin-path-links" {} ''
+          mkdir -p $out/usr/bin $out/bin
+          ln -s ${pkgs.coreutils}/bin/env $out/usr/bin/env
+          ln -s ${pkgs.bashInteractive}/bin/bash $out/bin/bash
+          ln -s ${pkgs.bashInteractive}/bin/sh $out/bin/sh
+        '';
+
         # The Docker Image
         dockerImage = pkgs.dockerTools.buildLayeredImage {
           name = "yolo-jail";
@@ -29,31 +37,32 @@
           created = "now";
           
           contents = [
+            binPathLinks
             shims
             pkgs.bashInteractive
-            pkgs.coreutils-full  # basic file manip
+            pkgs.coreutils-full
             pkgs.git
             pkgs.ripgrep
             pkgs.fd
             pkgs.curl
             pkgs.cacert
-            pkgs.mise      # Tool manager
-            pkgs.nodejs_22 # Use a specific stable version
-            pkgs.python3   # Bootstrap for mise plugins
-            pkgs.gh        # GitHub CLI
-            pkgs.bashInteractive
-            pkgs.coreutils-full
+            pkgs.mise
+            pkgs.nodejs_22
+            pkgs.python3
+            pkgs.gh
             pkgs.gnused
-            pkgs.gnugrep   # We will shim these later, but we need the originals for some scripts
+            pkgs.gnugrep
             pkgs.findutils
+            pkgs.gcc
+            pkgs.gnumake
+            pkgs.binutils
           ];
 
           config = {
-            Cmd = [ "${pkgs.bashInteractive}/bin/bash" ];
-            # We explicitly place shims first in PATH, though they shouldn't conflict if the others are missing.
-            # But if bash pulls them in as deps, this ensures shims win.
+            Cmd = [ "/bin/bash" ];
+            # We explicitly place shims first in PATH
             Env = [ 
-              "PATH=/bin:${shims}/bin:/usr/bin" 
+              "PATH=${shims}/bin:/bin:/usr/bin" 
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
             ];
             WorkingDir = "/workspace";
