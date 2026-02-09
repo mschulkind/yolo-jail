@@ -3,7 +3,7 @@ default:
 
 # Build the docker image using Nix
 build:
-    nix build .#dockerImage
+    nix --extra-experimental-features 'nix-command flakes' build .#dockerImage
 
 # Build and load the image into the local Docker daemon
 load: build
