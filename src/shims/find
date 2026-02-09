@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "Error: 'find' is disabled in this environment. Use 'fd' instead." >&2
+exit 127
