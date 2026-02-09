@@ -9,9 +9,12 @@ build:
 load: build
     docker load < result
 
-# Run the jail, mounting the current directory to /workspace
+# Run the jail, mounting the current directory to /workspace with user mapping
 run:
-    docker run --rm -it -v $(pwd):/workspace yolo-jail
+    docker run --rm -it \
+        -v $(pwd):/workspace \
+        --user $(id -u):$(id -g) \
+        yolo-jail
 
 # Run the jail on a specific target path
 run-repo path:

@@ -1,0 +1,4 @@
+#!/bin/sh
+echo "Error: 'rm' is restricted. Please move files to the 'trash/' directory instead to allow for recovery." >&2
+echo "Example: mv path/to/file trash/" >&2
+exit 127

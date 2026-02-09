@@ -37,7 +37,7 @@
             pkgs.fd
             pkgs.curl
             pkgs.cacert
-            # Explicitly NOT including findutils (find) or gnugrep (grep)
+            # We explicitly exclude findutils, gnugrep, and prevent package managers
           ];
 
           config = {
