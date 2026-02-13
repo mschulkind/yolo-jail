@@ -81,6 +81,9 @@
             pkgs.binutils
             pkgs.zlib
             pkgs.chromium   # For chrome-devtools-mcp
+            pkgs.procps     # ps, pgrep, pkill
+            pkgs.net-tools  # netstat
+            pkgs.iproute2   # ss, ip
           ];
 
           config = {
