@@ -79,8 +79,25 @@ alias ll='ls -alF'
 alias grep='grep --color=auto'
 EOF
 
-# 6. Place shims first in PATH
+# 6. Bootstrap Default Agent Configs (YOLO Mode)
+AGENT_HOME="${JAIL_HOME:-/home/agent}"
+
+# Copilot Config
+COPILOT_CONFIG_DIR="$AGENT_HOME/.config/.copilot"
+if [ ! -f "$COPILOT_CONFIG_DIR/config.json" ]; then
+    mkdir -p "$COPILOT_CONFIG_DIR"
+    echo '{"yolo": true}' > "$COPILOT_CONFIG_DIR/config.json"
+fi
+
+# Gemini Config
+GEMINI_CONFIG_DIR="$AGENT_HOME/.gemini"
+if [ ! -f "$GEMINI_CONFIG_DIR/settings.json" ]; then
+    mkdir -p "$GEMINI_CONFIG_DIR"
+    echo '{"security": {"enablePermanentToolApproval": true}}' > "$GEMINI_CONFIG_DIR/settings.json"
+fi
+
+# 7. Place shims first in PATH
 export PATH="$SHIM_DIR:$PATH"
 
-# 7. Run the startup command passed from Justfile
+# 8. Run the startup command passed from Justfile
 exec bash --rcfile "$BASHRC" -c "$@"
