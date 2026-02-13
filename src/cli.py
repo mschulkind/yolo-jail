@@ -124,7 +124,13 @@ def init():
     "mode": "bridge",
     // Ports to publish in bridge mode [\"Host:Container\"]
     // \"ports\": [\"8000:8000\"]
-  }
+  },
+  // Extra host paths to mount read-only into the jail for context.
+  // Each entry is a host path (mounted at /ctx/<basename>) or "host:container".
+  // \"mounts\": [
+  //   \"~/code/other-repo\",
+  //   \"/home/matt/code/shared-lib:/ctx/shared-lib\"
+  // ]
 }
 """
     with open(config_path, "w") as f:
@@ -174,6 +180,22 @@ def run(
             
     blocked_config_json = json.dumps(normalized_blocked)
 
+    # Process Extra Mounts
+    mount_args = []
+    for mount in config.get("mounts", []):
+        if ":" in mount and not mount.startswith("~") and not mount.startswith("/"):
+            # Explicit host:container mapping
+            host_path, container_path = mount.split(":", 1)
+        else:
+            # Auto-map to /ctx/<basename>
+            host_path = mount
+            container_path = f"/ctx/{Path(host_path).expanduser().resolve().name}"
+        host_path = str(Path(host_path).expanduser().resolve())
+        if not Path(host_path).exists():
+            console.print(f"[yellow]Warning: mount path does not exist, skipping: {host_path}[/yellow]")
+            continue
+        mount_args.extend(["-v", f"{host_path}:{container_path}:ro"])
+
     # Construct Docker Command
     docker_flags = ["--rm", "-i"]
     if sys.stdout.isatty():
@@ -204,6 +226,7 @@ def run(
     ]
     
     docker_cmd.extend(publish_args)
+    docker_cmd.extend(mount_args)
 
     if "TERM" in os.environ:
         docker_cmd.extend(["-e", f"TERM={os.environ['TERM']}"])
