@@ -157,39 +157,46 @@ fi
 python3 -c "
 import json, os
 
-# Write MCP Config
-mcp_path = os.path.join('$COPILOT_CONFIG_DIR', 'mcp-config.json')
-mcp_config = {
-    'mcpServers': {
-        'chrome-devtools': {
-            'command': '/home/agent/.npm-global/bin/chrome-devtools-mcp',
-            'args': ['--headless', '--no-sandbox']
-        },
-        'sequential-thinking': {
-            'command': '/home/agent/.npm-global/bin/mcp-server-sequential-thinking',
-            'args': []
-        }
-    }
-}
-with open(mcp_path, 'w') as f:
-    json.dump(mcp_config, f, indent=2)
+# Copilot Config Locations
+config_dirs = ['$AGENT_HOME/.copilot', '$AGENT_HOME/.config/.copilot']
 
-# Write LSP Config
-lsp_path = os.path.join('$COPILOT_CONFIG_DIR', 'lsp-config.json')
-lsp_config = {
-    'lspServers': {
-        'python': {
-            'command': '/home/agent/.npm-global/bin/pyright-langserver',
-            'args': ['--stdio']
-        },
-        'typescript': {
-            'command': '/home/agent/.npm-global/bin/typescript-language-server',
-            'args': ['--stdio']
+for d in config_dirs:
+    os.makedirs(d, exist_ok=True)
+    
+    # Write MCP Config
+    mcp_path = os.path.join(d, 'mcp-config.json')
+    # Rename to jail-devtools to avoid built-in collision
+    mcp_config = {
+        'mcpServers': {
+            'jail-devtools': {
+                'command': 'node',
+                'args': ['/home/agent/.npm-global/bin/chrome-devtools-mcp', '--headless', '--no-sandbox']
+            },
+            'sequential-thinking': {
+                'command': 'node',
+                'args': ['/home/agent/.npm-global/bin/mcp-server-sequential-thinking']
+            }
         }
     }
-}
-with open(lsp_path, 'w') as f:
-    json.dump(lsp_config, f, indent=2)
+    with open(mcp_path, 'w') as f:
+        json.dump(mcp_config, f, indent=2)
+
+    # Write LSP Config
+    lsp_path = os.path.join(d, 'lsp-config.json')
+    lsp_config = {
+        'lspServers': {
+            'python': {
+                'command': '/home/agent/.npm-global/bin/pyright-langserver',
+                'args': ['--stdio']
+            },
+            'typescript': {
+                'command': '/home/agent/.npm-global/bin/typescript-language-server',
+                'args': ['--stdio']
+            }
+        }
+    }
+    with open(lsp_path, 'w') as f:
+        json.dump(lsp_config, f, indent=2)
 "
 
 # Gemini Config with MCP Servers
