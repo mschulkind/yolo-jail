@@ -92,7 +92,7 @@
             pkgs.jq
             pkgs.bat
             pkgs.eza
-            pkgs.git-delta
+            pkgs.delta
             pkgs.fzf
           ];
 
