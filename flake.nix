@@ -69,6 +69,8 @@
             pkgs.curl
             pkgs.cacert
             pkgs.mise
+            pkgs.findutils
+            pkgs.which
             pkgs.nodejs_22
             pkgs.python3
             pkgs.gh
