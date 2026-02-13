@@ -109,6 +109,38 @@ if [ ! -f "$COPILOT_CONFIG_DIR/config.json" ]; then
     echo '{"yolo": true}' > "$COPILOT_CONFIG_DIR/config.json"
 fi
 
+# Copilot MCP Config (Standard Location)
+COPILOT_ROOT_DIR="$AGENT_HOME/.copilot"
+mkdir -p "$COPILOT_ROOT_DIR"
+python3 -c "
+import json, os
+
+config_path = '$COPILOT_ROOT_DIR/mcp-config.json'
+mcp_config = {
+    'mcpServers': {
+        'chrome-devtools': {
+            'command': 'npx',
+            'args': ['-y', 'chrome-devtools-mcp', '--headless']
+        },
+        'sequential-thinking': {
+            'command': 'npx',
+            'args': ['-y', '@modelcontextprotocol/server-sequential-thinking']
+        },
+        'python-lsp': {
+            'command': 'npx',
+            'args': ['-y', 'mcp-language-server', '--mode', 'stdio', '--', 'pyright-langserver', '--stdio']
+        },
+        'typescript-lsp': {
+            'command': 'npx',
+            'args': ['-y', 'mcp-language-server', '--mode', 'stdio', '--', 'typescript-language-server', '--stdio']
+        }
+    }
+}
+
+with open(config_path, 'w') as f:
+    json.dump(mcp_config, f, indent=2)
+"
+
 # Gemini Config with MCP Servers
 GEMINI_CONFIG_DIR="$AGENT_HOME/.gemini"
 # We overwrite or create settings.json to ensure MCPs are configured. 

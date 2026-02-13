@@ -32,6 +32,7 @@
           ln -s ${pkgs.gnused}/bin/sed $out/bin/sed
           ln -s ${pkgs.gnugrep}/bin/grep $out/bin/grep
           ln -s ${pkgs.findutils}/bin/find $out/bin/find
+          ln -s ${pkgs.chromium}/bin/chromium $out/usr/bin/chromium
           
           # Link the dynamic linker for x86_64
           ln -s ${pkgs.stdenv.cc.bintools.dynamicLinker} $out/lib64/ld-linux-x86-64.so.2
