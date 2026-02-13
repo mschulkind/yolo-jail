@@ -73,6 +73,9 @@ HOST_INFO="${CYAN}(host: ${YOLO_HOST_DIR:-unknown})${NC}"
 
 export PS1="\n${JAIL_BANNER} ${HOST_INFO}\n${GREEN}jail${NC}:${BLUE}\w${NC}\$ "
 
+# Initialize font cache for Chromium
+fc-cache -f >/dev/null 2>&1
+
 # Agent-friendly defaults (no pagers, no line numbers)
 export PAGER=cat
 export BAT_PAGER=""
@@ -156,9 +159,10 @@ for d in config_dirs:
     
     # Write MCP Config
     mcp_path = os.path.join(d, 'mcp-config.json')
+    # Rename to jail-devtools to avoid built-in collision
     mcp_config = {
         'mcpServers': {
-            'chrome-devtools': {
+            'jail-devtools': {
                 'command': 'node',
                 'args': [
                     '/home/agent/.npm-global/bin/chrome-devtools-mcp', 

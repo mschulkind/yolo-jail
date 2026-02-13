@@ -74,11 +74,24 @@
             pkgs.nodejs_22
             pkgs.python3
             pkgs.gh
+            pkgs.gnused
+            pkgs.gnugrep
+            pkgs.gawk
+            pkgs.patch
+            pkgs.diffutils
+            pkgs.gzip
+            pkgs.bzip2
+            pkgs.xz
+            pkgs.tar
+            pkgs.unzip
+            pkgs.zip
             pkgs.gcc
             pkgs.gnumake
             pkgs.binutils
             pkgs.zlib
             pkgs.chromium   # For both MCP and Playwright
+            pkgs.fontconfig
+            pkgs.freefont_ttf
             pkgs.glibc.bin  # For ldd
             pkgs.procps     # ps, pgrep, pkill
             pkgs.net-tools  # netstat
