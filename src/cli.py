@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 import json
+import shlex
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 import typer
@@ -206,10 +207,6 @@ def run(
 
     docker_cmd.append(JAIL_IMAGE)
     docker_cmd.append("yolo-entrypoint")
-
-import shlex
-
-# ... (rest of imports)
 
     # Command construction
     full_command = ctx.args
