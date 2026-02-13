@@ -37,7 +37,6 @@
           ln -s ${pkgs.chromium}/bin/chromium $out/usr/bin/chrome
           
           # Link the dynamic linker for x86_64
-          # Dummy change for status check
           ln -s ${pkgs.stdenv.cc.bintools.dynamicLinker} $out/lib64/ld-linux-x86-64.so.2
           
           # Link standard libraries to both /lib and /usr/lib
@@ -46,9 +45,6 @@
             ln -s ${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6 $dir/libstdc++.so.6
             ln -s ${pkgs.zlib}/lib/libz.so.1 $dir/libz.so.1
           done
-          
-          # Link Playwright browsers
-          ln -s ${pkgs.playwright-driver.browsers} $out/usr/lib/playwright
         '';
 
         # Derivation for the entrypoint
@@ -59,6 +55,7 @@
           name = "yolo-jail";
           tag = "latest";
           created = "now";
+          maxLayers = 100; # Optimize for faster loading by merging layers
           
           contents = [
             binPathLinks
@@ -75,16 +72,11 @@
             pkgs.nodejs_22
             pkgs.python3
             pkgs.gh
-            pkgs.gnused
-            pkgs.gnugrep
-            pkgs.gawk
-            pkgs.findutils
             pkgs.gcc
             pkgs.gnumake
             pkgs.binutils
             pkgs.zlib
-            pkgs.chromium   # For chrome-devtools-mcp
-            pkgs.playwright-driver.browsers # For showboat/playwright
+            pkgs.chromium   # For both MCP and Playwright
             pkgs.procps     # ps, pgrep, pkill
             pkgs.net-tools  # netstat
             pkgs.iproute2   # ss, ip
