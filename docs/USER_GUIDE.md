@@ -13,8 +13,14 @@ sudo ln -s $(pwd)/yolo-enter.sh /usr/local/bin/yolo
 ### 2. Enter a Project
 Navigate to any directory you want the agent to work in and type:
 ```bash
+# To open an interactive shell:
 yolo
+
+# To run a command directly and exit:
+yolo gemini prompt "What is this repo?"
+yolo copilot
 ```
+The jail will launch, mounting your current directory to `/workspace`. It will share your global `gh` and `gemini-cli` authentication, and tools will be persistent across sessions.
 
 ### 3. First-Time Authentication
 The jail uses an **Isolated Identity**. You must log in once inside the jail for your tools to work. These credentials persist across all projects you use with YOLO Jail.

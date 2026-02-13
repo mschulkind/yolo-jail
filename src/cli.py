@@ -68,8 +68,9 @@ def init():
         f.write(content)
     typer.echo("Created yolo-jail.jsonc")
 
-@app.command()
+@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
 def run(
+    ctx: typer.Context,
     command: Optional[List[str]] = typer.Argument(None, help="Command to run inside the jail (default: bash)"),
     network: str = typer.Option("bridge", help="Docker network mode (bridge/host)"),
 ):
@@ -121,7 +122,6 @@ def run(
         "-e", "HOME=/home/agent",
         "-e", "XDG_CONFIG_HOME=/home/agent/.config",
         "-e", "MISE_DATA_DIR=/mise",
-        "-e", "MISE_CONFIG_DIR=/workspace",
         "-e", "MISE_TRUST=1",
         "-e", "MISE_YES=1",
         "-e", "LD_LIBRARY_PATH=/lib:/usr/lib",
@@ -142,12 +142,20 @@ def run(
     docker_cmd.append("yolo-entrypoint")
 
     # Command construction
-    target_cmd = "bash"
+    full_command = []
     if command:
-        target_cmd = " ".join(command)
+        full_command.extend(command)
+    if ctx.args:
+        full_command.extend(ctx.args)
+
+    target_cmd = "bash"
+    if full_command:
+        target_cmd = " ".join(full_command)
     
-    setup_script = "[[ -f mise.toml ]] && (mise trust && YOLO_BYPASS_SHIMS=1 mise install && YOLO_BYPASS_SHIMS=1 mise upgrade)"
-    final_internal_cmd = f"{setup_script}; {target_cmd}"
+    # If mise.toml exists in workspace, install/upgrade those. 
+    # Otherwise, ensure global tools are ready.
+    setup_script = "(if [ -f mise.toml ]; then mise trust && mise install && mise upgrade; else mise install -g && mise upgrade -g; fi)"
+    final_internal_cmd = f"{setup_script} >/dev/null 2>&1; {target_cmd}"
     
     docker_cmd.append(final_internal_cmd)
 

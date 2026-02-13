@@ -82,6 +82,19 @@ EOF
 # 6. Bootstrap Default Agent Configs (YOLO Mode)
 AGENT_HOME="${JAIL_HOME:-/home/agent}"
 
+# Global Mise Config (to provide defaults if project has no mise.toml)
+MISE_CONFIG_DIR="$AGENT_HOME/.config/mise"
+if [ ! -f "$MISE_CONFIG_DIR/config.toml" ]; then
+    mkdir -p "$MISE_CONFIG_DIR"
+    cat <<EOF > "$MISE_CONFIG_DIR/config.toml"
+[tools]
+node = "system"
+python = "system"
+"npm:@google/gemini-cli" = "latest"
+"npm:@github/copilot" = "latest"
+EOF
+fi
+
 # Copilot Config
 COPILOT_CONFIG_DIR="$AGENT_HOME/.config/.copilot"
 if [ ! -f "$COPILOT_CONFIG_DIR/config.json" ]; then
@@ -93,11 +106,12 @@ fi
 GEMINI_CONFIG_DIR="$AGENT_HOME/.gemini"
 if [ ! -f "$GEMINI_CONFIG_DIR/settings.json" ]; then
     mkdir -p "$GEMINI_CONFIG_DIR"
-    echo '{"security": {"enablePermanentToolApproval": true}}' > "$GEMINI_CONFIG_DIR/settings.json"
+    echo '{"security": {"approvalMode": "yolo", "enablePermanentToolApproval": true}}' > "$GEMINI_CONFIG_DIR/settings.json"
 fi
 
 # 7. Place shims first in PATH
 export PATH="$SHIM_DIR:$PATH"
 
 # 8. Run the startup command passed from Justfile
-exec bash --rcfile "$BASHRC" -c "$@"
+# We bypass shims for mise and startup tasks
+YOLO_BYPASS_SHIMS=1 exec bash --rcfile "$BASHRC" -c "$@"

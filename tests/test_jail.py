@@ -106,6 +106,22 @@ def test_agent_tools_available(temp_project):
     result = run_yolo(temp_project, "gemini --version && copilot --version")
     assert result.returncode == 0
 
+def test_yolo_direct_command(tmp_path):
+    """Test running a direct command like 'yolo ls'."""
+    project_dir = tmp_path / "direct_cmd_test"
+    project_dir.mkdir()
+    
+    # Run yolo without explicitly saying 'run', just the command
+    result = subprocess.run(
+        [str(YOLO_CMD), "ls", "-d", "/workspace"],
+        cwd=str(project_dir),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "TERM": "dumb"}
+    )
+    assert result.returncode == 0
+    assert "/workspace" in result.stdout
+
 def test_jail_configs_present(temp_project):
     """Test that the persistent jail configs (YOLO mode) are visible."""
     # We check if the files we just created in the global storage are visible inside
