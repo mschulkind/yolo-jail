@@ -14,6 +14,11 @@ GLOBAL_STORAGE = Path.home() / ".local/share/yolo-jail"
 GLOBAL_HOME = GLOBAL_STORAGE / "home"
 GLOBAL_MISE = GLOBAL_STORAGE / "mise"
 
+from rich.console import Console
+from rich.status import Status
+
+console = Console()
+
 def ensure_global_storage():
     GLOBAL_HOME.mkdir(parents=True, exist_ok=True)
     GLOBAL_MISE.mkdir(parents=True, exist_ok=True)
@@ -23,15 +28,16 @@ def auto_load_image(repo_root: Path):
     sentinel = repo_root / ".last-load"
     
     # 1. Build the image (cheap if no changes)
-    try:
-        # Use a temporary result link
-        subprocess.run(
-            ["nix", "--extra-experimental-features", "nix-command flakes", "build", ".#dockerImage", "--out-link", ".run-result"],
-            cwd=repo_root, check=True, capture_output=True
-        )
-    except subprocess.CalledProcessError as e:
-        typer.echo(f"Warning: Automatic nix build failed: {e.stderr.decode()}", err=True)
-        return
+    with console.status("[bold blue]Checking jail image...", spinner="dots"):
+        try:
+            # Use a temporary result link
+            subprocess.run(
+                ["nix", "--extra-experimental-features", "nix-command flakes", "build", ".#dockerImage", "--out-link", ".run-result"],
+                cwd=repo_root, check=True, capture_output=True
+            )
+        except subprocess.CalledProcessError as e:
+            console.print(f"[yellow]Warning: Automatic nix build failed: {e.stderr.decode()}[/yellow]")
+            return
 
     # 2. Check if the store path has changed
     current_path = (repo_root / ".run-result").resolve()
@@ -40,13 +46,33 @@ def auto_load_image(repo_root: Path):
         last_path = sentinel.read_text().strip()
 
     if str(current_path) != last_path:
-        typer.echo("Detected changes in jail config. Loading new image...", err=True)
+        console.print("[bold green]Detected changes in jail config. Loading new image...[/bold green]")
+        
         try:
-            with open(repo_root / ".run-result", "rb") as f:
-                subprocess.run(["docker", "load"], stdin=f, check=True, capture_output=True)
-            sentinel.write_text(str(current_path))
-        except subprocess.CalledProcessError as e:
-            typer.echo(f"Error loading docker image: {e.stderr.decode()}", err=True)
+            with open(repo_root / ".run-result", "rb") as image_file:
+                # Use Popen to stream output line by line for the fancy status
+                process = subprocess.Popen(
+                    ["docker", "load"],
+                    stdin=image_file,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True
+                )
+                
+                with console.status("[bold cyan]Loading into Docker...", spinner="bouncingBar") as status:
+                    if process.stdout:
+                        for line in iter(process.stdout.readline, ""):
+                            clean_line = line.strip()
+                            if clean_line:
+                                status.update(f"[bold cyan]Loading into Docker: [dim]{clean_line}[/dim]")
+                
+                process.wait()
+                if process.returncode != 0:
+                    console.print("[bold red]Error loading docker image.[/bold red]")
+                else:
+                    sentinel.write_text(str(current_path))
+        except Exception as e:
+            console.print(f"[bold red]Error loading docker image: {e}[/bold red]")
     
     # Cleanup temp link
     (repo_root / ".run-result").unlink(missing_ok=True)
