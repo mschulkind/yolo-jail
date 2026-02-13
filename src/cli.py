@@ -207,6 +207,10 @@ def run(
     docker_cmd.append(JAIL_IMAGE)
     docker_cmd.append("yolo-entrypoint")
 
+import shlex
+
+# ... (rest of imports)
+
     # Command construction
     full_command = ctx.args
 
@@ -216,7 +220,9 @@ def run(
         if full_command[0] in ["gemini", "copilot"]:
             if "--yolo" not in full_command and "-y" not in full_command:
                 full_command.insert(1, "--yolo")
-        target_cmd = " ".join(full_command)
+        
+        # Use shlex.join to properly quote arguments for the shell
+        target_cmd = shlex.join(full_command)
     
     # If mise.toml exists in workspace, install/upgrade those. 
     # Otherwise, ensure global tools are ready.
