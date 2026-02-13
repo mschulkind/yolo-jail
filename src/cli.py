@@ -185,6 +185,7 @@ def run(
         "-v", f"{GLOBAL_HOME}:/home/agent",
         "-v", f"{GLOBAL_MISE}:/mise",
         "--tmpfs", "/tmp",
+        "--shm-size=2g",
         "-e", "HOME=/home/agent",
         "-e", "XDG_CONFIG_HOME=/home/agent/.config",
         "-e", "MISE_DATA_DIR=/mise",
@@ -227,14 +228,6 @@ def run(
     # Then ensure all tools (global + local) are ready.
     setup_script = "(if [ -f mise.toml ]; then mise trust; fi) && mise install && mise upgrade && ~/.yolo-bootstrap.sh"
     final_internal_cmd = f"{setup_script} >/dev/null 2>&1; {target_cmd}"
-    
-    docker_cmd.append(final_internal_cmd)
-
-    try:
-        os.execvp("docker", docker_cmd)
-    except FileNotFoundError:
-        typer.echo("Error: docker command not found.", err=True)
-        sys.exit(1)
     
     docker_cmd.append(final_internal_cmd)
 

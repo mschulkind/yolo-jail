@@ -148,6 +148,42 @@ go = "latest"
 EOF
 fi
 
+# Chrome Wrapper Script for MCP (avoids pipe-mode fd conflicts when spawned by agents)
+CHROME_WRAPPER="$AGENT_HOME/.local/bin/chrome-devtools-mcp-wrapper"
+mkdir -p "$(dirname "$CHROME_WRAPPER")"
+cat <<'WRAPPER' > "$CHROME_WRAPPER"
+#!/bin/bash
+CHROME_PORT=9222
+CHROME_URL="http://127.0.0.1:$CHROME_PORT"
+
+# Start Chromium if not already running
+if ! curl -s "$CHROME_URL/json/version" >/dev/null 2>&1; then
+    /usr/bin/chromium \
+        --headless \
+        --no-sandbox \
+        --disable-dev-shm-usage \
+        --disable-gpu \
+        --disable-software-rasterizer \
+        --disable-setuid-sandbox \
+        --remote-debugging-address=127.0.0.1 \
+        --remote-debugging-port=$CHROME_PORT \
+        &>/dev/null &
+
+    # Wait for Chrome to be ready
+    for i in $(seq 1 30); do
+        if curl -s "$CHROME_URL/json/version" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.2
+    done
+fi
+
+exec node /home/agent/.npm-global/bin/chrome-devtools-mcp \
+    --browser-url "$CHROME_URL" \
+    "$@"
+WRAPPER
+chmod +x "$CHROME_WRAPPER"
+
 # Consolidate Copilot Config to ~/.config/.copilot
 # and symlink ~/.copilot to it for absolute compatibility.
 if [ -d "$AGENT_HOME/.copilot" ] && [ ! -L "$AGENT_HOME/.copilot" ]; then
@@ -175,21 +211,7 @@ mcp_path = os.path.join(config_dir, 'mcp-config.json')
 mcp_config = {
     'mcpServers': {
         'chrome-devtools': {
-            'command': 'node',
-            'args': [
-                '/home/agent/.npm-global/bin/chrome-devtools-mcp', 
-                '--headless', 
-                '--no-sandbox', 
-                '--executable-path', '/usr/bin/chromium', 
-                '--disable-dev-shm-usage', 
-                '--disable-gpu',
-                '--disable-software-rasterizer',
-                '--disable-setuid-sandbox',
-                '--isolated'
-            ],
-            'env': {
-                'DEBUG': '*'
-            }
+            'command': '/home/agent/.local/bin/chrome-devtools-mcp-wrapper'
         },
         'sequential-thinking': {
             'command': 'node',
@@ -231,21 +253,7 @@ default_config = {
     'security': {'approvalMode': 'yolo', 'enablePermanentToolApproval': True},
     'mcpServers': {
         'chrome-devtools': {
-            'command': 'node',
-            'args': [
-                '/home/agent/.npm-global/bin/chrome-devtools-mcp', 
-                '--headless', 
-                '--no-sandbox', 
-                '--executable-path', '/usr/bin/chromium', 
-                '--disable-dev-shm-usage', 
-                '--disable-gpu',
-                '--disable-software-rasterizer',
-                '--disable-setuid-sandbox',
-                '--isolated'
-            ],
-            'env': {
-                'DEBUG': '*'
-            }
+            'command': '/home/agent/.local/bin/chrome-devtools-mcp-wrapper'
         },
         'sequential-thinking': {
             'command': 'node',
