@@ -11,11 +11,9 @@ while [ -L "$SOURCE" ]; do
 done
 REPO_ROOT=$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )
 
-cd "$REPO_ROOT"
-
-# Default to 'run' command if the first argument isn't a known subcommand or help
+# Run the CLI using uv, pointing to the jail project while staying in the user's current directory
 if [ "$1" == "init" ] || [ "$1" == "--help" ]; then
-    exec uv run src/cli.py "$@"
+    exec uv run --project "$REPO_ROOT" "$REPO_ROOT/src/cli.py" "$@"
 else
-    exec uv run src/cli.py run "$@"
+    exec uv run --project "$REPO_ROOT" "$REPO_ROOT/src/cli.py" run "$@"
 fi
