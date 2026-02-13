@@ -7,11 +7,6 @@ from typing import Optional, List, Dict, Any, Union
 import typer
 import pyjson5
 
-try:
-    import tomli as toml
-except ImportError:
-    import tomllib as toml  # type: ignore
-
 app = typer.Typer()
 
 JAIL_IMAGE = "yolo-jail:latest"
@@ -24,7 +19,7 @@ def ensure_global_storage():
     GLOBAL_MISE.mkdir(parents=True, exist_ok=True)
 
 def load_config() -> Dict[str, Any]:
-    # Try JSONC first
+    # Only support JSONC
     jsonc_path = Path.cwd() / "yolo-jail.jsonc"
     if jsonc_path.exists():
         try:
@@ -32,26 +27,6 @@ def load_config() -> Dict[str, Any]:
                 return pyjson5.load(f)
         except Exception as e:
             typer.echo(f"Warning: Failed to parse yolo-jail.jsonc: {e}", err=True)
-            return {}
-
-    # Try JSON second
-    json_path = Path.cwd() / "yolo-jail.json"
-    if json_path.exists():
-        try:
-            with open(json_path, "r") as f:
-                return pyjson5.load(f)
-        except Exception as e:
-            typer.echo(f"Warning: Failed to parse yolo-jail.json: {e}", err=True)
-            return {}
-            
-    # Fallback to TOML
-    toml_path = Path.cwd() / "yolo-jail.toml"
-    if toml_path.exists():
-        try:
-            with open(toml_path, "rb") as f:
-                return toml.load(f)
-        except Exception as e:
-            typer.echo(f"Warning: Failed to parse yolo-jail.toml: {e}", err=True)
             return {}
     
     return {}

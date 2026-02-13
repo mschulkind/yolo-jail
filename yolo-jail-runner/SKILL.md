@@ -10,13 +10,18 @@ This skill manages the configuration and execution of the YOLO Jail, a secure Do
 ## Core Functions
 
 ### 1. Configure Jail
-Before running, you can configure blocked utilities. Create a `yolo-jail.toml` in the target project root (not the jail repo itself).
+Before running, you can configure blocked utilities. Create a `yolo-jail.jsonc` in the target project root (not the jail repo itself).
 
-**`yolo-jail.toml` Example:**
-```toml
-[security]
-blocked_tools = ["grep", "find", "curl"] # Add tools to block
-allow_internet = true
+**`yolo-jail.jsonc` Example:**
+```jsonc
+{
+  "security": {
+    "blocked_tools": ["grep", "find", "curl"] // Add tools to block
+  },
+  "network": {
+    "mode": "bridge"
+  }
+}
 ```
 
 ### 2. Start Jail
