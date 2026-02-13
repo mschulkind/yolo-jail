@@ -148,60 +148,72 @@ go = "latest"
 EOF
 fi
 
+# Consolidate Copilot Config to ~/.config/.copilot
+# and symlink ~/.copilot to it for absolute compatibility.
+if [ -d "$AGENT_HOME/.copilot" ] && [ ! -L "$AGENT_HOME/.copilot" ]; then
+    # Real directory exists, move contents to the XDG path
+    mkdir -p "$AGENT_HOME/.config/.copilot"
+    cp -r "$AGENT_HOME/.copilot/." "$AGENT_HOME/.config/.copilot/"
+    rm -rf "$AGENT_HOME/.copilot"
+fi
+ln -sf "$AGENT_HOME/.config/.copilot" "$AGENT_HOME/.copilot"
+
+# Ensure config.json exists (YOLO mode)
+COPILOT_CONFIG_DIR="$AGENT_HOME/.config/.copilot"
+mkdir -p "$COPILOT_CONFIG_DIR"
+if [ ! -f "$COPILOT_CONFIG_DIR/config.json" ]; then
+    echo '{"yolo": true}' > "$COPILOT_CONFIG_DIR/config.json"
+fi
+
 python3 -c "
 import json, os
 
-# Copilot Config Locations
-config_dirs = ['$AGENT_HOME/.copilot', '$AGENT_HOME/.config/.copilot']
+config_dir = '$COPILOT_CONFIG_DIR'
 
-for d in config_dirs:
-    os.makedirs(d, exist_ok=True)
-    
-    # Write MCP Config
-    mcp_path = os.path.join(d, 'mcp-config.json')
-    # Rename to jail-devtools to avoid built-in collision in Copilot
-    mcp_config = {
-        'mcpServers': {
-            'jail-devtools': {
-                'command': 'node',
-                'args': [
-                    '/home/agent/.npm-global/bin/chrome-devtools-mcp', 
-                    '--headless', 
-                    '--no-sandbox', 
-                    '--executable-path', '/usr/bin/chromium', 
-                    '--disable-dev-shm-usage', 
-                    '--disable-gpu',
-                    '--disable-software-rasterizer',
-                    '--disable-setuid-sandbox'
-                ]
-            },
-            'sequential-thinking': {
-                'command': 'node',
-                'args': ['/home/agent/.npm-global/bin/mcp-server-sequential-thinking']
-            }
+# Write MCP Config
+mcp_path = os.path.join(config_dir, 'mcp-config.json')
+mcp_config = {
+    'mcpServers': {
+        'jail-devtools': {
+            'command': 'node',
+            'args': [
+                '/home/agent/.npm-global/bin/chrome-devtools-mcp', 
+                '--headless', 
+                '--no-sandbox', 
+                '--executable-path', '/usr/bin/chromium', 
+                '--disable-dev-shm-usage', 
+                '--disable-gpu',
+                '--disable-software-rasterizer',
+                '--disable-setuid-sandbox'
+            ]
+        },
+        'sequential-thinking': {
+            'command': 'node',
+            'args': ['/home/agent/.npm-global/bin/mcp-server-sequential-thinking']
         }
     }
-    with open(mcp_path, 'w') as f:
-        json.dump(mcp_config, f, indent=2)
+}
+with open(mcp_path, 'w') as f:
+    json.dump(mcp_config, f, indent=2)
 
-    # Write LSP Config
-    lsp_path = os.path.join(d, 'lsp-config.json')
-    lsp_config = {
-        'lspServers': {
-            'python': {
-                'command': '/home/agent/.npm-global/bin/pyright-langserver',
-                'args': ['--stdio'],
-                'fileExtensions': ['py']
-            },
-            'typescript': {
-                'command': '/home/agent/.npm-global/bin/typescript-language-server',
-                'args': ['--stdio'],
-                'fileExtensions': ['ts', 'tsx', 'js', 'jsx']
-            }
+# Write LSP Config
+lsp_path = os.path.join(config_dir, 'lsp-config.json')
+lsp_config = {
+    'lspServers': {
+        'python': {
+            'command': '/home/agent/.npm-global/bin/pyright-langserver',
+            'args': ['--stdio'],
+            'fileExtensions': ['py']
+        },
+        'typescript': {
+            'command': '/home/agent/.npm-global/bin/typescript-language-server',
+            'args': ['--stdio'],
+            'fileExtensions': ['ts', 'tsx', 'js', 'jsx']
         }
     }
-    with open(lsp_path, 'w') as f:
-        json.dump(lsp_config, f, indent=2)
+}
+with open(lsp_path, 'w') as f:
+    json.dump(lsp_config, f, indent=2)
 "
 
 # Gemini Config with MCP Servers
