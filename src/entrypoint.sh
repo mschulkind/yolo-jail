@@ -2,7 +2,7 @@
 # YOLO Jail Entrypoint Script
 
 # 1. Create a writable directory for dynamic shims
-SHIM_DIR="/tmp/yolo-shims"
+SHIM_DIR="$HOME/.yolo-shims"
 mkdir -p "$SHIM_DIR"
 
 # 2. Default blocked tools
