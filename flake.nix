@@ -83,6 +83,8 @@
             pkgs.procps     # ps, pgrep, pkill
             pkgs.net-tools  # netstat
             pkgs.iproute2   # ss, ip
+            pkgs.iputils    # ping
+            pkgs.dnsutils   # dig, host, nslookup
             pkgs.htop
             pkgs.neovim
             pkgs.hivemind
