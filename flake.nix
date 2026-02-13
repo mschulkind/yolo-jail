@@ -44,6 +44,9 @@
           done
         '';
 
+        # Derivation for the entrypoint
+        entrypoint = pkgs.writeShellScriptBin "yolo-entrypoint" (builtins.readFile ./src/entrypoint.sh);
+
         # The Docker Image
         dockerImage = pkgs.dockerTools.buildLayeredImage {
           name = "yolo-jail";
@@ -53,6 +56,7 @@
           contents = [
             binPathLinks
             shims
+            entrypoint
             pkgs.bashInteractive
             pkgs.coreutils-full
             pkgs.git

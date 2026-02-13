@@ -29,10 +29,11 @@ run-path path *args:
         -e MISE_YES=1 \
         -e LD_LIBRARY_PATH=/lib:/usr/lib \
         -e PATH=/mise/shims:/bin:/usr/bin \
-        --user $(id -u):$(id -g) \
+        -u $(id -u):$(id -g) \
+        --env-file <(env | grep -vE '^(SSH_|GIT_|DOCKER_|NIX_)' || true) \
         --workdir /workspace \
         yolo-jail \
-        bash -c "[[ -f mise.toml ]] && (mise trust && YOLO_BYPASS_SHIMS=1 mise install && YOLO_BYPASS_SHIMS=1 mise upgrade); {{ if args == "" { "bash" } else { args } }}"
+        yolo-entrypoint "[[ -f mise.toml ]] && (mise trust && YOLO_BYPASS_SHIMS=1 mise install && YOLO_BYPASS_SHIMS=1 mise upgrade); {{ if args == "" { "bash" } else { args } }}"
 
 # Clean up build artifacts
 clean:
