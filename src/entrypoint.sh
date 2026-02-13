@@ -160,7 +160,16 @@ for d in config_dirs:
         'mcpServers': {
             'chrome-devtools': {
                 'command': 'node',
-                'args': ['/home/agent/.npm-global/bin/chrome-devtools-mcp', '--headless', '--no-sandbox', '--executable-path', '/usr/bin/chromium', '--disable-dev-shm-usage', '--disable-gpu']
+                'args': [
+                    '/home/agent/.npm-global/bin/chrome-devtools-mcp', 
+                    '--headless', 
+                    '--no-sandbox', 
+                    '--executable-path', '/usr/bin/chromium', 
+                    '--disable-dev-shm-usage', 
+                    '--disable-gpu',
+                    '--disable-software-rasterizer',
+                    '--disable-setuid-sandbox'
+                ]
             },
             'sequential-thinking': {
                 'command': 'node',
@@ -177,11 +186,13 @@ for d in config_dirs:
         'lspServers': {
             'python': {
                 'command': '/home/agent/.npm-global/bin/pyright-langserver',
-                'args': ['--stdio']
+                'args': ['--stdio'],
+                'fileExtensions': ['py']
             },
             'typescript': {
                 'command': '/home/agent/.npm-global/bin/typescript-language-server',
-                'args': ['--stdio']
+                'args': ['--stdio'],
+                'fileExtensions': ['ts', 'tsx', 'js', 'jsx']
             }
         }
     }
@@ -201,7 +212,16 @@ default_config = {
     'mcpServers': {
         'chrome-devtools': {
             'command': 'node',
-            'args': ['/home/agent/.npm-global/bin/chrome-devtools-mcp', '--headless', '--no-sandbox', '--executable-path', '/usr/bin/chromium', '--disable-dev-shm-usage', '--disable-gpu']
+            'args': [
+                '/home/agent/.npm-global/bin/chrome-devtools-mcp', 
+                '--headless', 
+                '--no-sandbox', 
+                '--executable-path', '/usr/bin/chromium', 
+                '--disable-dev-shm-usage', 
+                '--disable-gpu',
+                '--disable-software-rasterizer',
+                '--disable-setuid-sandbox'
+            ]
         },
         'sequential-thinking': {
             'command': 'node',
