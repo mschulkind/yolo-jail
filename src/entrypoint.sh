@@ -98,16 +98,7 @@ export PATH="$NPM_CONFIG_PREFIX/bin:$HOME/go/bin:$PATH"
 # Install binaries if missing.
 if ! command -v chrome-devtools-mcp >/dev/null; then
     echo "Installing MCP tools via npm..."
-    YOLO_BYPASS_SHIMS=1 npm install -g chrome-devtools-mcp @modelcontextprotocol/server-sequential-thinking pyright typescript-language-server typescript
-fi
-
-if ! command -v mcp-language-server >/dev/null; then
-    if command -v go >/dev/null; then
-        echo "Installing mcp-language-server via go..."
-        YOLO_BYPASS_SHIMS=1 go install github.com/isaacphi/mcp-language-server@latest
-    else
-        echo "Warning: go not found, skipping mcp-language-server install"
-    fi
+    YOLO_BYPASS_SHIMS=1 npm install -g chrome-devtools-mcp @modelcontextprotocol/server-sequential-thinking pyright typescript-language-server typescript mcp-language-server
 fi
 EOF
 chmod +x "$BOOTSTRAP_SCRIPT"
@@ -144,11 +135,11 @@ config_path = '$COPILOT_ROOT_DIR/mcp-config.json'
 mcp_config = {
     'mcpServers': {
         'chrome-devtools': {
-            'command': 'chrome-devtools-mcp',
-            'args': ['--headless']
+            'command': '/home/agent/.npm-global/bin/chrome-devtools-mcp',
+            'args': ['--headless', '--no-sandbox']
         },
         'sequential-thinking': {
-            'command': 'mcp-server-sequential-thinking',
+            'command': '/home/agent/.npm-global/bin/mcp-server-sequential-thinking',
             'args': []
         }
     }
@@ -169,19 +160,19 @@ default_config = {
     'security': {'approvalMode': 'yolo', 'enablePermanentToolApproval': True},
     'mcpServers': {
         'chrome-devtools': {
-            'command': 'chrome-devtools-mcp',
-            'args': ['--headless']
+            'command': '/home/agent/.npm-global/bin/chrome-devtools-mcp',
+            'args': ['--headless', '--no-sandbox']
         },
         'sequential-thinking': {
-            'command': 'mcp-server-sequential-thinking',
+            'command': '/home/agent/.npm-global/bin/mcp-server-sequential-thinking',
             'args': []
         },
         'python-lsp': {
-            'command': 'mcp-language-server',
+            'command': '/home/agent/.npm-global/bin/mcp-language-server',
             'args': ['-lsp', 'pyright-langserver', '-workspace', '/workspace', '--', '--stdio']
         },
         'typescript-lsp': {
-            'command': 'mcp-language-server',
+            'command': '/home/agent/.npm-global/bin/mcp-language-server',
             'args': ['-lsp', 'typescript-language-server', '-workspace', '/workspace', '--', '--stdio']
         }
     }
