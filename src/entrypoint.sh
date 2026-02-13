@@ -159,12 +159,12 @@ for d in config_dirs:
     mcp_config = {
         'mcpServers': {
             'chrome-devtools': {
-                'command': '/home/agent/.npm-global/bin/chrome-devtools-mcp',
-                'args': ['--headless', '--no-sandbox', '--executable-path', '/usr/bin/chromium', '--disable-dev-shm-usage', '--disable-gpu']
+                'command': 'node',
+                'args': ['/home/agent/.npm-global/bin/chrome-devtools-mcp', '--headless', '--no-sandbox', '--executable-path', '/usr/bin/chromium', '--disable-dev-shm-usage', '--disable-gpu']
             },
             'sequential-thinking': {
-                'command': '/home/agent/.npm-global/bin/mcp-server-sequential-thinking',
-                'args': []
+                'command': 'node',
+                'args': ['/home/agent/.npm-global/bin/mcp-server-sequential-thinking']
             }
         }
     }
@@ -200,12 +200,12 @@ default_config = {
     'security': {'approvalMode': 'yolo', 'enablePermanentToolApproval': True},
     'mcpServers': {
         'chrome-devtools': {
-            'command': '/home/agent/.npm-global/bin/chrome-devtools-mcp',
-            'args': ['--headless', '--no-sandbox', '--executable-path', '/usr/bin/chromium', '--disable-dev-shm-usage', '--disable-gpu']
+            'command': 'node',
+            'args': ['/home/agent/.npm-global/bin/chrome-devtools-mcp', '--headless', '--no-sandbox', '--executable-path', '/usr/bin/chromium', '--disable-dev-shm-usage', '--disable-gpu']
         },
         'sequential-thinking': {
-            'command': '/home/agent/.npm-global/bin/mcp-server-sequential-thinking',
-            'args': []
+            'command': 'node',
+            'args': ['/home/agent/.npm-global/bin/mcp-server-sequential-thinking']
         },
         'python-lsp': {
             'command': '/home/agent/go/bin/mcp-language-server',
