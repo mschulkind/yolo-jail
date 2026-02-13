@@ -26,16 +26,33 @@ gemini login
 
 ## Project Configuration (`yolo-jail.toml`)
 
-You can customize the jail's behavior for a specific project by placing a `yolo-jail.toml` file in the project's root directory.
+You can customize the jail's behavior for a specific project.
 
-### Example Configuration
+### 1. Initialize Config
+Run this in your project root to generate a default configuration:
+```bash
+yolo init
+```
+
+### 2. Configuration Options
+Edit the generated `yolo-jail.toml`:
 ```toml
 [security]
 # Tools that the agent is strictly forbidden from using
-blocked_tools = ["curl", "wget", "ping", "grep", "find"]
+blocked_tools = ["curl", "wget", "grep", "find"]
 
-# Note: grep and find are blocked by default to encourage using 'rg' and 'fd'
+[network]
+# "bridge" (default): Isolated network with own IP.
+# "host": Shares host network (useful for servers, but less secure).
+mode = "bridge" 
+
+# For bridge mode, publish ports to host (Host:Container)
+# ports = ["8000:8000", "3000:3000"]
 ```
+
+### 3. Networking
+- **Default**: The jail runs in `bridge` mode. It has its own IP.
+- **Host Mode**: Use `yolo --network host` or set `mode = "host"` in config.
 
 ## Tool Management (`mise.toml`)
 
