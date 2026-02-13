@@ -2,7 +2,7 @@
 # YOLO Jail Entrypoint Script
 
 # 1. Create a writable directory for dynamic shims
-SHIM_DIR="$HOME/.yolo-shims"
+SHIM_DIR="${JAIL_HOME:-/home/agent}/.yolo-shims"
 rm -rf "$SHIM_DIR"
 mkdir -p "$SHIM_DIR"
 
@@ -12,10 +12,10 @@ BLOCKED_TOOLS="$DEFAULT_BLOCKED"
 
 # 3. Read blocked tools from environment variable (injected by Python CLI)
 if [ -n "$YOLO_BLOCK_CONFIG" ]; then
-    python3 -c "
+    SHIM_DIR="$SHIM_DIR" python3 -c "
 import json, os, sys, stat
 
-shim_dir = '$SHIM_DIR'
+shim_dir = os.environ.get('SHIM_DIR')
 try:
     config = json.loads(os.environ['YOLO_BLOCK_CONFIG'])
     for tool_cfg in config:
@@ -56,7 +56,7 @@ except Exception as e:
 fi
 
 # 5. Set up a colorful prompt in .bashrc
-BASHRC="$HOME/.bashrc"
+BASHRC="${JAIL_HOME:-/home/agent}/.bashrc"
 cat <<'EOF' > "$BASHRC"
 # YOLO Jail Prompt
 YELLOW='\[\033[1;33m\]'
