@@ -10,7 +10,7 @@ YOLO_CMD = REPO_ROOT / "yolo-enter.sh"
 
 @pytest.fixture
 def temp_project(tmp_path):
-    """Create a temporary project directory with a yolo-jail.json."""
+    """Create a temporary project directory with a yolo-jail.jsonc."""
     project_dir = tmp_path / "test_project"
     project_dir.mkdir()
     
@@ -24,7 +24,7 @@ def temp_project(tmp_path):
         "network": {"mode": "bridge"}
     }
     
-    with open(project_dir / "yolo-jail.json", "w") as f:
+    with open(project_dir / "yolo-jail.jsonc", "w") as f:
         json.dump(config, f)
         
     return project_dir
@@ -68,4 +68,4 @@ def test_yolo_init(tmp_path):
     
     subprocess.run([str(YOLO_CMD), "init"], cwd=str(project_dir), check=True)
     
-    assert (project_dir / "yolo-jail.json").exists()
+    assert (project_dir / "yolo-jail.jsonc").exists()

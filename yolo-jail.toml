@@ -1,9 +1,0 @@
-[security]
-# Tools to strictly block inside the jail
-blocked_tools = ["curl", "wget", "grep", "find"]
-
-[network]
-# Networking mode: "bridge" (default, isolated IP) or "host" (shares host IP/ports)
-# mode = "bridge" 
-# Ports to publish (only for bridge mode)
-# ports = ["8000:8000"]

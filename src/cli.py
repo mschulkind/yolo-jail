@@ -24,14 +24,22 @@ def ensure_global_storage():
     GLOBAL_MISE.mkdir(parents=True, exist_ok=True)
 
 def load_config() -> Dict[str, Any]:
-    # Try JSON first
+    # Try JSONC first
+    jsonc_path = Path.cwd() / "yolo-jail.jsonc"
+    if jsonc_path.exists():
+        try:
+            with open(jsonc_path, "r") as f:
+                return pyjson5.load(f)
+        except Exception as e:
+            typer.echo(f"Warning: Failed to parse yolo-jail.jsonc: {e}", err=True)
+            return {}
+
+    # Try JSON second
     json_path = Path.cwd() / "yolo-jail.json"
     if json_path.exists():
         try:
             with open(json_path, "r") as f:
-                data = pyjson5.load(f)
-                # typer.echo(f"Debug: Loaded config: {data}", err=True)
-                return data
+                return pyjson5.load(f)
         except Exception as e:
             typer.echo(f"Warning: Failed to parse yolo-jail.json: {e}", err=True)
             return {}
@@ -50,10 +58,10 @@ def load_config() -> Dict[str, Any]:
 
 @app.command()
 def init():
-    """Initialize a yolo-jail.json configuration file in the current directory."""
-    config_path = Path.cwd() / "yolo-jail.json"
+    """Initialize a yolo-jail.jsonc configuration file in the current directory."""
+    config_path = Path.cwd() / "yolo-jail.jsonc"
     if config_path.exists():
-        typer.echo("yolo-jail.json already exists.")
+        typer.echo("yolo-jail.jsonc already exists.")
         return
 
     content = """{
@@ -74,16 +82,16 @@ def init():
     ]
   },
   "network": {
-    // "bridge" (default) or "host"
+    // \"bridge\" (default) or \"host\"
     "mode": "bridge",
-    // Ports to publish in bridge mode ["Host:Container"]
-    // "ports": ["8000:8000"]
+    // Ports to publish in bridge mode [\"Host:Container\"]
+    // \"ports\": [\"8000:8000\"]
   }
 }
 """
     with open(config_path, "w") as f:
         f.write(content)
-    typer.echo("Created yolo-jail.json")
+    typer.echo("Created yolo-jail.jsonc")
 
 @app.command()
 def run(
@@ -121,8 +129,6 @@ def run(
             normalized_blocked.append({"name": tool})
         elif isinstance(tool, dict) and "name" in tool:
             normalized_blocked.append(tool)
-            
-    typer.echo(f"DEBUG: Configured to block: {normalized_blocked}", err=True)
             
     blocked_config_json = json.dumps(normalized_blocked)
 

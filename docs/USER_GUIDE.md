@@ -24,7 +24,7 @@ gh auth login
 gemini login
 ```
 
-## Project Configuration (`yolo-jail.toml`)
+## Project Configuration (`yolo-jail.jsonc`)
 
 You can customize the jail's behavior for a specific project.
 
@@ -35,19 +35,31 @@ yolo init
 ```
 
 ### 2. Configuration Options
-Edit the generated `yolo-jail.toml`:
-```toml
-[security]
-# Tools that the agent is strictly forbidden from using
-blocked_tools = ["curl", "wget", "grep", "find"]
+Edit the generated `yolo-jail.jsonc`:
+```jsonc
+{
+  "security": {
+    // Tools that the agent is strictly forbidden from using.
+    // Can be a string or an object with custom messages.
+    "blocked_tools": [
+      "curl", 
+      "wget",
+      {
+        "name": "grep",
+        "message": "Use 'rg' (ripgrep) for faster searching.",
+        "suggestion": "rg <pattern>"
+      }
+    ]
+  },
+  "network": {
+    // \"bridge\" (default): Isolated network with own IP.
+    // \"host\": Shares host network (useful for servers, but less secure).
+    "mode": "bridge",
 
-[network]
-# "bridge" (default): Isolated network with own IP.
-# "host": Shares host network (useful for servers, but less secure).
-mode = "bridge" 
-
-# For bridge mode, publish ports to host (Host:Container)
-# ports = ["8000:8000", "3000:3000"]
+    // For bridge mode, publish ports to host [\"Host:Container\"]
+    // \"ports\": [\"8000:8000\", \"3000:3000\"]
+  }
+}
 ```
 
 ### 3. Networking
