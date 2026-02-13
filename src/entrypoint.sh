@@ -11,43 +11,47 @@ BLOCKED_TOOLS="$DEFAULT_BLOCKED"
 
 # 3. Read blocked tools from environment variable (injected by Python CLI)
 if [ -n "$YOLO_BLOCK_CONFIG" ]; then
-    # Use python to parse the JSON and output bash-friendly arrays
-    # Output format: name|message|suggestion
     python3 -c "
-import json, os, sys
+import json, os, sys, stat
+
+shim_dir = '$SHIM_DIR'
 try:
     config = json.loads(os.environ['YOLO_BLOCK_CONFIG'])
-    for tool in config:
-        name = tool.get('name')
+    for tool_cfg in config:
+        name = tool_cfg.get('name')
         if not name: continue
-        msg = tool.get('message', f'Error: tool {name} is blocked in this project.')
-        sug = tool.get('suggestion', '')
-        print(f'{name}|{msg}|{sug}')
-except Exception:
-    pass
-" | while IFS='|' read -r tool message suggestion; do
-        SHIM_PATH="$SHIM_DIR/$tool"
         
-        if [ "$tool" == "grep" ] || [ "$tool" == "find" ]; then
-             cat <<EOF > "$SHIM_PATH"
-#!/bin/sh
-if [ -t 1 ] && [ -z "\$YOLO_BYPASS_SHIMS" ]; then
-  echo "$message" >&2
-  [ -n "$suggestion" ] && echo "Suggestion: $suggestion" >&2
+        msg = tool_cfg.get('message', f'Error: tool {name} is blocked in this project.')
+        sug = tool_cfg.get('suggestion', '')
+        
+        shim_path = os.path.join(shim_dir, name)
+        
+        content = ''
+        if name in ['grep', 'find']:
+            content = f'''#!/bin/sh
+if [ -t 1 ] && [ -z \"\$YOLO_BYPASS_SHIMS\" ]; then
+  echo \"{msg}\" >&2
+  [ -n \"{sug}\" ] && echo \"Suggestion: {sug}\" >&2
   exit 127
 fi
-exec /bin/$tool "\$@"
-EOF
-        else
-             cat <<EOF > "$SHIM_PATH"
-#!/bin/sh
-echo "$message" >&2
-[ -n "$suggestion" ] && echo "Suggestion: $suggestion" >&2
+exec /bin/{name} \"\$@\"
+'''
+        else:
+            content = f'''#!/bin/sh
+echo \"{msg}\" >&2
+[ -n \"{sug}\" ] && echo \"Suggestion: {sug}\" >&2
 exit 127
-EOF
-        fi
-        chmod +x "$SHIM_PATH"
-    done
+'''
+        
+        with open(shim_path, 'w') as f:
+            f.write(content)
+        
+        st = os.stat(shim_path)
+        os.chmod(shim_path, st.st_mode | stat.S_IEXEC)
+        
+except Exception as e:
+    sys.stderr.write(f'Error generating shims: {e}\\n')
+"
 fi
 
 # 5. Place shims first in PATH

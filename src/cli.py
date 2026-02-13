@@ -29,7 +29,9 @@ def load_config() -> Dict[str, Any]:
     if json_path.exists():
         try:
             with open(json_path, "r") as f:
-                return pyjson5.load(f)
+                data = pyjson5.load(f)
+                # typer.echo(f"Debug: Loaded config: {data}", err=True)
+                return data
         except Exception as e:
             typer.echo(f"Warning: Failed to parse yolo-jail.json: {e}", err=True)
             return {}
@@ -104,7 +106,14 @@ def run(
             publish_args.extend(["-p", p])
 
     # Process Blocked Tools for the Container
-    raw_blocked = config.get("security", {}).get("blocked_tools", ["grep", "find"])
+    security_section = config.get("security", {})
+    if security_section is None: 
+        security_section = {}
+    
+    raw_blocked = security_section.get("blocked_tools", ["grep", "find"])
+    if raw_blocked is None:
+        raw_blocked = ["grep", "find"]
+
     normalized_blocked = []
     
     for tool in raw_blocked:
@@ -113,11 +122,17 @@ def run(
         elif isinstance(tool, dict) and "name" in tool:
             normalized_blocked.append(tool)
             
+    typer.echo(f"DEBUG: Configured to block: {normalized_blocked}", err=True)
+            
     blocked_config_json = json.dumps(normalized_blocked)
 
     # Construct Docker Command
+    docker_flags = ["--rm", "-i"]
+    if sys.stdout.isatty():
+        docker_flags.append("-t")
+
     docker_cmd = [
-        "docker", "run", "--rm", "-it",
+        "docker", "run", *docker_flags,
         "-v", f"{Path.cwd()}:/workspace",
         "-v", f"{GLOBAL_HOME}:/home/agent",
         "-v", f"{GLOBAL_MISE}:/mise",

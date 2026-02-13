@@ -1,0 +1,24 @@
+{
+  "security": {
+    // Tools to block. Can be a simple string or an object with custom messages.
+    "blocked_tools": [
+      "curl", 
+      "wget",
+      {
+        "name": "grep",
+        "message": "Use 'rg' (ripgrep) for faster searching.",
+        "suggestion": "rg <pattern>"
+      },
+      {
+        "name": "find",
+        "message": "Use 'fd' for faster file finding."
+      }
+    ]
+  },
+  "network": {
+    // "bridge" (default) or "host"
+    "mode": "bridge",
+    // Ports to publish in bridge mode ["Host:Container"]
+    // "ports": ["8000:8000"]
+  }
+}
