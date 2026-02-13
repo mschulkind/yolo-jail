@@ -129,21 +129,20 @@ go = "latest"
 EOF
 fi
 
-# Copilot Config
+# Copilot Configs (Standardized to ~/.config/.copilot)
 COPILOT_CONFIG_DIR="$AGENT_HOME/.config/.copilot"
+mkdir -p "$COPILOT_CONFIG_DIR"
+
+# Ensure config.json exists (YOLO mode)
 if [ ! -f "$COPILOT_CONFIG_DIR/config.json" ]; then
-    mkdir -p "$COPILOT_CONFIG_DIR"
     echo '{"yolo": true}' > "$COPILOT_CONFIG_DIR/config.json"
 fi
 
-# Copilot MCP Config (Standard Location)
-COPILOT_ROOT_DIR="$AGENT_HOME/.copilot"
-mkdir -p "$COPILOT_ROOT_DIR"
 python3 -c "
 import json, os
 
-mcp_path = '$COPILOT_ROOT_DIR/mcp-config.json'
-# Copilot uses 'servers' top-level key
+# Write MCP Config
+mcp_path = os.path.join('$COPILOT_CONFIG_DIR', 'mcp-config.json')
 mcp_config = {
     'servers': {
         'chrome-devtools': {
@@ -156,11 +155,11 @@ mcp_config = {
         }
     }
 }
-
 with open(mcp_path, 'w') as f:
     json.dump(mcp_config, f, indent=2)
 
-lsp_path = '$COPILOT_ROOT_DIR/lsp-config.json'
+# Write LSP Config
+lsp_path = os.path.join('$COPILOT_CONFIG_DIR', 'lsp-config.json')
 lsp_config = {
     'lspServers': {
         'python': {
@@ -173,7 +172,6 @@ lsp_config = {
         }
     }
 }
-
 with open(lsp_path, 'w') as f:
     json.dump(lsp_config, f, indent=2)
 "
