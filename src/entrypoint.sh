@@ -145,15 +145,6 @@ go = "latest"
 EOF
 fi
 
-# Copilot Configs (Standardized to ~/.config/.copilot)
-COPILOT_CONFIG_DIR="$AGENT_HOME/.config/.copilot"
-mkdir -p "$COPILOT_CONFIG_DIR"
-
-# Ensure config.json exists (YOLO mode)
-if [ ! -f "$COPILOT_CONFIG_DIR/config.json" ]; then
-    echo '{"yolo": true}' > "$COPILOT_CONFIG_DIR/config.json"
-fi
-
 python3 -c "
 import json, os
 
@@ -165,16 +156,15 @@ for d in config_dirs:
     
     # Write MCP Config
     mcp_path = os.path.join(d, 'mcp-config.json')
-    # Rename to jail-devtools to avoid built-in collision
     mcp_config = {
         'mcpServers': {
-            'jail-devtools': {
-                'command': 'node',
-                'args': ['/home/agent/.npm-global/bin/chrome-devtools-mcp', '--headless', '--no-sandbox']
+            'chrome-devtools': {
+                'command': '/home/agent/.npm-global/bin/chrome-devtools-mcp',
+                'args': ['--headless', '--no-sandbox', '--executable-path', '/usr/bin/chromium', '--disable-dev-shm-usage', '--disable-gpu']
             },
             'sequential-thinking': {
-                'command': 'node',
-                'args': ['/home/agent/.npm-global/bin/mcp-server-sequential-thinking']
+                'command': '/home/agent/.npm-global/bin/mcp-server-sequential-thinking',
+                'args': []
             }
         }
     }
@@ -211,7 +201,7 @@ default_config = {
     'mcpServers': {
         'chrome-devtools': {
             'command': '/home/agent/.npm-global/bin/chrome-devtools-mcp',
-            'args': ['--headless', '--no-sandbox']
+            'args': ['--headless', '--no-sandbox', '--executable-path', '/usr/bin/chromium', '--disable-dev-shm-usage', '--disable-gpu']
         },
         'sequential-thinking': {
             'command': '/home/agent/.npm-global/bin/mcp-server-sequential-thinking',
@@ -236,8 +226,6 @@ try:
             except json.JSONDecodeError:
                 current = {}
         
-        # Helper for deep merge could go here, but shallow merge of top keys is safer for now
-        # We specifically want to ensure mcpServers are added
         if 'mcpServers' not in current:
             current['mcpServers'] = {}
         
@@ -246,7 +234,6 @@ try:
         if 'security' not in current:
             current['security'] = {}
         
-        # Only set security defaults if not present? No, we want to enforce defaults for new installs.
         if 'approvalMode' not in current['security']:
             current['security']['approvalMode'] = 'yolo'
         if 'enablePermanentToolApproval' not in current['security']:
