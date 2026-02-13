@@ -184,8 +184,12 @@ mcp_config = {
                 '--disable-dev-shm-usage', 
                 '--disable-gpu',
                 '--disable-software-rasterizer',
-                '--disable-setuid-sandbox'
-            ]
+                '--disable-setuid-sandbox',
+                '--isolated'
+            ],
+            'env': {
+                'DEBUG': '*'
+            }
         },
         'sequential-thinking': {
             'command': 'node',
@@ -236,8 +240,12 @@ default_config = {
                 '--disable-dev-shm-usage', 
                 '--disable-gpu',
                 '--disable-software-rasterizer',
-                '--disable-setuid-sandbox'
-            ]
+                '--disable-setuid-sandbox',
+                '--isolated'
+            ],
+            'env': {
+                'DEBUG': '*'
+            }
         },
         'sequential-thinking': {
             'command': 'node',

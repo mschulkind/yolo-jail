@@ -26,11 +26,26 @@ sudo ln -s $(pwd)/yolo-enter.sh /usr/local/bin/yolo
 ### 2. Enter any Project
 Navigate to any repository and type:
 ```bash
+# Start an interactive shell
 yolo
+
+# Run a command directly
+yolo -- gemini prompt "Explain this code"
+yolo -- copilot
 ```
 The jail will launch, mounting your current directory to `/workspace`. It will share your global `gh` and `gemini-cli` authentication, and tools will be persistent across sessions.
 
-> **Note:** If you see a warning about `mise.toml` not being trusted on your host, you can run `mise trust` in the `yolo_jail` directory to silence it.
+### 3. Automatic Updates
+The `yolo` command is self-updating. If you modify `flake.nix` or the jail configuration, it will automatically rebuild and reload the Docker image on the next run.
+
+## Agent Capabilities
+
+YOLO Jail is pre-configured with:
+- **MCP Servers**: Chrome DevTools, Sequential Thinking.
+- **LSP Servers**: Python (Pyright), TypeScript.
+- **Modern CLI**: `rg`, `fd`, `bat`, `eza`, `jq`, `delta`, `fzf`.
+- **Debugging**: `strace`, `lsof`, `file`, `htop`, `ping`, `dig`.
+- **Agent Hygiene**: Pagers are disabled (`PAGER=cat`), and `bat` is aliased for non-interactive output.
 
 ## Tool Management (Mise)
 
