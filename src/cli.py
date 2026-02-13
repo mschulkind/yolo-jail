@@ -18,6 +18,39 @@ def ensure_global_storage():
     GLOBAL_HOME.mkdir(parents=True, exist_ok=True)
     GLOBAL_MISE.mkdir(parents=True, exist_ok=True)
 
+def auto_load_image(repo_root: Path):
+    """Cheaply check if the nix image needs to be reloaded into docker."""
+    sentinel = repo_root / ".last-load"
+    
+    # 1. Build the image (cheap if no changes)
+    try:
+        # Use a temporary result link
+        subprocess.run(
+            ["nix", "--extra-experimental-features", "nix-command flakes", "build", ".#dockerImage", "--out-link", ".run-result"],
+            cwd=repo_root, check=True, capture_output=True
+        )
+    except subprocess.CalledProcessError as e:
+        typer.echo(f"Warning: Automatic nix build failed: {e.stderr.decode()}", err=True)
+        return
+
+    # 2. Check if the store path has changed
+    current_path = (repo_root / ".run-result").resolve()
+    last_path = None
+    if sentinel.exists():
+        last_path = sentinel.read_text().strip()
+
+    if str(current_path) != last_path:
+        typer.echo("Detected changes in jail config. Loading new image...", err=True)
+        try:
+            with open(repo_root / ".run-result", "rb") as f:
+                subprocess.run(["docker", "load"], stdin=f, check=True, capture_output=True)
+            sentinel.write_text(str(current_path))
+        except subprocess.CalledProcessError as e:
+            typer.echo(f"Error loading docker image: {e.stderr.decode()}", err=True)
+    
+    # Cleanup temp link
+    (repo_root / ".run-result").unlink(missing_ok=True)
+
 def load_config() -> Dict[str, Any]:
     # Only support JSONC
     jsonc_path = Path.cwd() / "yolo-jail.jsonc"
@@ -75,6 +108,10 @@ def run(
     network: str = typer.Option("bridge", help="Docker network mode (bridge/host)"),
 ):
     """Run the YOLO jail in the current directory."""
+    # Find repo root to locate sentinel file
+    repo_root = Path(__file__).parent.parent.resolve()
+    auto_load_image(repo_root)
+    
     ensure_global_storage()
     config = load_config()
     
