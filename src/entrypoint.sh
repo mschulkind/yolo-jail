@@ -184,18 +184,18 @@ exec node /home/agent/.npm-global/bin/chrome-devtools-mcp \
 WRAPPER
 chmod +x "$CHROME_WRAPPER"
 
-# Consolidate Copilot Config to ~/.config/.copilot
-# and symlink ~/.copilot to it for absolute compatibility.
-if [ -d "$AGENT_HOME/.copilot" ] && [ ! -L "$AGENT_HOME/.copilot" ]; then
-    # Real directory exists, move contents to the XDG path
-    mkdir -p "$AGENT_HOME/.config/.copilot"
-    cp -r "$AGENT_HOME/.copilot/." "$AGENT_HOME/.config/.copilot/"
-    rm -rf "$AGENT_HOME/.copilot"
-fi
-ln -sf "$AGENT_HOME/.config/.copilot" "$AGENT_HOME/.copilot"
+# Copilot Config — use ~/.copilot directly (no XDG indirection)
+COPILOT_CONFIG_DIR="$AGENT_HOME/.copilot"
 
-# Ensure config.json exists (YOLO mode)
-COPILOT_CONFIG_DIR="$AGENT_HOME/.config/.copilot"
+# Clean up legacy XDG layout: migrate .config/.copilot -> .copilot
+if [ -L "$COPILOT_CONFIG_DIR" ]; then
+    # Remove stale symlink from previous entrypoint
+    rm -f "$COPILOT_CONFIG_DIR"
+fi
+if [ -d "$AGENT_HOME/.config/.copilot" ] && [ ! -d "$COPILOT_CONFIG_DIR" ]; then
+    mv "$AGENT_HOME/.config/.copilot" "$COPILOT_CONFIG_DIR"
+fi
+
 mkdir -p "$COPILOT_CONFIG_DIR"
 if [ ! -f "$COPILOT_CONFIG_DIR/config.json" ]; then
     echo '{"yolo": true}' > "$COPILOT_CONFIG_DIR/config.json"

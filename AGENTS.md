@@ -1,16 +1,40 @@
-# YOLO Jail: Agent Developer Guide
+<!-- YOLO-JAIL-START (auto-generated, do not edit above YOLO-JAIL-END) -->
+# YOLO Jail Environment
 
-This project provides a secure, isolated Docker environment for AI agents (Gemini CLI, Copilot) to execute commands on local repositories without compromising host security or identity.
+You are running inside a YOLO Jail — a sandboxed Docker container.
 
-## Architectural Specs
+## Environment
 
-### 1. Configuration (`yolo-jail.jsonc`)
-- **Format**: JSON with comments (JSONC). **TOML is deprecated**.
-- **Location**: Project root.
-- **Dynamic Shims**: Blocked tools (grep, find, etc.) are generated dynamically based on this config. 
-- **Smart Shims**: `grep` and `find` shims allow background scripts but block interactive TTY usage to prevent agents from wasting tokens on huge recursive searches.
-- **Extra Mounts**: The `mounts` array brings additional host paths into the jail read-only at `/ctx/<basename>` (or a custom container path via `"host:container"` syntax).
-- **Dynamic AGENTS.md**: On every jail start, the entrypoint generates/updates `/workspace/AGENTS.md` with jail environment info (host IP, blocked tools, mounts, limitations). Existing project AGENTS.md content is preserved below a `<!-- YOLO-JAIL-END -->` marker.
+- **Workspace**: `/workspace` (mounted from host `/home/matt/code/yolo_jail`)
+- **Host IP** (from container): `172.17.0.1`
+- **Home Directory**: `/home/agent` (persistent across sessions)
+- **OS**: NixOS-based minimal container (no systemd, no sudo)
+- **Network**: Bridge mode by default. Use host IP above to reach host services.
+
+## Available Tools
+
+Standard CLI tools: git, rg (ripgrep), fd, bat, jq, nvim, curl, wget, strace, gh
+Runtimes: Node.js 22, Python 3.13, Go (managed by mise)
+MCP Servers: chrome-devtools (headless Chromium), sequential-thinking
+
+## Blocked Tools
+
+The following tools are blocked or shimmed in this project:
+
+- `grep`
+- `find`
+
+## Limitations
+
+- **No internet restrictions** but no host credentials (no ~/.ssh, no ~/.gitconfig).
+- **No pagers**: PAGER=cat, GIT_PAGER=cat. Do not pipe to less/more.
+- **Read-only mounts**: Context mounts under `/ctx/` are read-only.
+- **No sudo/root**: You run as a mapped host user with no privilege escalation.
+- Authenticate with `gh auth login` if you need GitHub access.
+
+<!-- YOLO-JAIL-END -->
+
+` marker.
 
 ### 2. Isolation & Identity
 - **Strict Isolation**: The jail MUST NOT access host `~/.ssh/`, `~/.gitconfig`, or any cloud credentials.
@@ -28,14 +52,15 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
 ## Developer Runbook
 
 ### Debugging MCP & LSP
-- **Logs**: Copilot logs are in `~/.config/.copilot/logs/`.
+- **Logs**: Copilot logs are in `~/.copilot/logs/`.
+- **Config**: Copilot config lives at `~/.copilot/` (not XDG). Contains `config.json`, `mcp-config.json`, `lsp-config.json`.
 - **Chromium Stability**: Headless Chromium in Docker is brittle. 
     - **Connect Mode**: Chrome DevTools MCP uses a wrapper script (`~/.local/bin/chrome-devtools-mcp-wrapper`) that pre-launches Chromium with `--remote-debugging-port` and connects via `--browser-url`. This avoids pipe-mode fd conflicts when MCP servers are spawned by agents.
     - **Required Chrome Flags**: `--no-sandbox`, `--disable-setuid-sandbox`, `--disable-dev-shm-usage`, `--disable-gpu`, `--disable-software-rasterizer`.
     - **Docker**: Use `--shm-size=2g` in the Docker run command for adequate shared memory.
     - **Binary Discovery**: Always use absolute paths (e.g., `/usr/bin/chromium`) in MCP configs.
 - **LSP Schemas**:
-    - **Copilot**: Requires `mcpServers` (plural) key in `mcp-config.json` and a separate `lsp-config.json` with `fileExtensions`.
+    - **Copilot**: Requires `mcpServers` (plural) key in `~/.copilot/mcp-config.json` and a separate `lsp-config.json` with `fileExtensions`.
     - **Gemini**: Uses `mcpServers` key in `settings.json`.
 
 ### Tool Management

@@ -209,7 +209,6 @@ def run(
         "--tmpfs", "/tmp",
         "--shm-size=2g",
         "-e", "HOME=/home/agent",
-        "-e", "XDG_CONFIG_HOME=/home/agent/.config",
         "-e", "MISE_DATA_DIR=/mise",
         "-e", "MISE_TRUST=1",
         "-e", "MISE_YES=1",
