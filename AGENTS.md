@@ -34,7 +34,17 @@ The following tools are blocked or shimmed in this project:
 
 <!-- YOLO-JAIL-END -->
 
-` marker.
+# YOLO Jail: Agent Developer Guide
+
+This project provides a secure, isolated Docker environment for AI agents (Gemini CLI, Copilot) to execute commands on local repositories without compromising host security or identity.
+
+## Architectural Specs
+
+### 1. Configuration (`yolo-jail.jsonc`)
+- **Format**: JSON with comments (JSONC). **TOML is deprecated**.
+- **Location**: Project root.
+- **Dynamic Shims**: Blocked tools are generated dynamically based on this config. All blocked tools are unconditionally blocked unless `YOLO_BYPASS_SHIMS=1` is set.
+- **Custom Packages**: The `packages` array specifies additional nix packages to bake into the jail image. Names must match nixpkgs attribute names. The image only rebuilds when this list changes. Uses `--impure` nix build with `builtins.getEnv`.
 
 ### 2. Isolation & Identity
 - **Strict Isolation**: The jail MUST NOT access host `~/.ssh/`, `~/.gitconfig`, or any cloud credentials.
@@ -47,7 +57,7 @@ The following tools are blocked or shimmed in this project:
 - **Direct Execution**: Commands are run via `yolo -- <command>`. 
 - **Auto-YOLO**: The CLI automatically injects `--yolo` for `gemini` and `copilot` commands.
 - **Quoting**: Use `shlex.join` in Python to pass quoted arguments correctly to the container's `bash -c`.
-- **Self-Updating Build**: The CLI runs `nix build` on every start but only executes `docker load` if the resulting image hash differs from `.last-load`. This makes updates cheap and automatic.
+- **Self-Updating Build**: The CLI runs `nix build --impure` on every start but only executes `docker load` if the resulting image hash differs from `.last-load`. The `--impure` flag allows reading the `YOLO_EXTRA_PACKAGES` env var for per-project package customization.
 
 ## Developer Runbook
 

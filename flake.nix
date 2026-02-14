@@ -11,6 +11,14 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
+        # Extra packages from project config (passed via YOLO_EXTRA_PACKAGES env var)
+        extraPackageNames = let
+          raw = builtins.getEnv "YOLO_EXTRA_PACKAGES";
+        in
+          if raw == "" then [] else builtins.fromJSON raw;
+
+        extraPackages = map (name: pkgs.${name}) extraPackageNames;
+
         # Derivation for the shim scripts
         shims = pkgs.stdenv.mkDerivation {
           name = "yolo-shims";
@@ -112,7 +120,7 @@
             pkgs.eza
             pkgs.delta
             pkgs.fzf
-          ];
+          ] ++ extraPackages;
 
           config = {
             Cmd = [ "/bin/bash" ];

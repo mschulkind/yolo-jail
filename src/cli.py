@@ -24,17 +24,21 @@ def ensure_global_storage():
     GLOBAL_HOME.mkdir(parents=True, exist_ok=True)
     GLOBAL_MISE.mkdir(parents=True, exist_ok=True)
 
-def auto_load_image(repo_root: Path):
+def auto_load_image(repo_root: Path, extra_packages: List[str] = None):
     """Cheaply check if the nix image needs to be reloaded into docker."""
     sentinel = repo_root / ".last-load"
     
     # 1. Build the image (cheap if no changes)
+    build_env = os.environ.copy()
+    if extra_packages:
+        build_env["YOLO_EXTRA_PACKAGES"] = json.dumps(extra_packages)
+    
     with console.status("[bold blue]Checking jail image...", spinner="dots"):
         try:
-            # Use a temporary result link
             subprocess.run(
-                ["nix", "--extra-experimental-features", "nix-command flakes", "build", ".#dockerImage", "--out-link", ".run-result"],
-                cwd=repo_root, check=True, capture_output=True
+                ["nix", "--extra-experimental-features", "nix-command flakes", "build", ".#dockerImage", "--impure", "--out-link", ".run-result"],
+                cwd=repo_root, check=True, capture_output=True,
+                env=build_env,
             )
         except subprocess.CalledProcessError as e:
             console.print(f"[yellow]Warning: Automatic nix build failed: {e.stderr.decode()}[/yellow]")
@@ -103,6 +107,11 @@ def init():
         return
 
     content = """{
+  // Extra nix packages to include in the jail image.
+  // Names must match nixpkgs attribute names (search at https://search.nixos.org/packages).
+  // The image rebuilds only when this list changes.
+  // "packages": ["postgresql", "redis", "awscli2"],
+
   "security": {
     // Tools to block. Can be a simple string or an object with custom messages.
     "blocked_tools": [
@@ -120,16 +129,16 @@ def init():
     ]
   },
   "network": {
-    // \"bridge\" (default) or \"host\"
+    // "bridge" (default) or "host"
     "mode": "bridge",
-    // Ports to publish in bridge mode [\"Host:Container\"]
-    // \"ports\": [\"8000:8000\"]
+    // Ports to publish in bridge mode ["Host:Container"]
+    // "ports": ["8000:8000"]
   },
   // Extra host paths to mount read-only into the jail for context.
   // Each entry is a host path (mounted at /ctx/<basename>) or "host:container".
-  // \"mounts\": [
-  //   \"~/code/other-repo\",
-  //   \"/home/matt/code/shared-lib:/ctx/shared-lib\"
+  // "mounts": [
+  //   "~/code/other-repo",
+  //   "/home/matt/code/shared-lib:/ctx/shared-lib"
   // ]
 }
 """
@@ -145,10 +154,13 @@ def run(
     """Run the YOLO jail in the current directory."""
     # Find repo root to locate sentinel file
     repo_root = Path(__file__).parent.parent.resolve()
-    auto_load_image(repo_root)
     
     ensure_global_storage()
     config = load_config()
+    
+    # Build image with any extra packages from config
+    extra_packages = config.get("packages", [])
+    auto_load_image(repo_root, extra_packages=extra_packages or None)
     
     # Determine Network Mode
     net_mode = network
