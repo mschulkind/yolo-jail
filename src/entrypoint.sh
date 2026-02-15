@@ -165,8 +165,10 @@ CHROME_WRAPPER="$AGENT_HOME/.local/bin/chrome-devtools-mcp-wrapper"
 mkdir -p "$(dirname "$CHROME_WRAPPER")"
 cat >"$CHROME_WRAPPER" <<'WRAPPER'
 #!/bin/bash
-CHROME_PORT=9222
-CHROME_URL="http://127.0.0.1:$CHROME_PORT"
+# Internal Chrome debugging defaults (isolated to container)
+CHROME_PORT="${CHROME_DEBUG_PORT:-9222}"
+CHROME_ADDR="${CHROME_DEBUG_ADDR:-127.0.0.1}"
+CHROME_URL="http://$CHROME_ADDR:$CHROME_PORT"
 
 # Compute npm global bin dir (respects user overrides)
 NPM_BIN="$(npm config get prefix)/bin"
@@ -181,7 +183,7 @@ if ! curl -s "$CHROME_URL/json/version" >/dev/null 2>&1; then
         --disable-gpu \
         --disable-software-rasterizer \
         --disable-setuid-sandbox \
-        --remote-debugging-address=127.0.0.1 \
+        --remote-debugging-address=$CHROME_ADDR \
         --remote-debugging-port=$CHROME_PORT \
         &>/dev/null &
 
