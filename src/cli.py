@@ -313,6 +313,19 @@ def run(
     if host_mise.exists():
         docker_cmd.extend(["-v", f"{host_mise}:{host_mise}:ro"])
 
+    # Mount host user-level copilot skills so they're available in the jail
+    # These will be symlinked into /home/agent/.copilot/skills/ during entrypoint
+    host_copilot_skills = Path.home() / ".copilot" / "skills"
+    host_dotfiles_skills = Path.home() / ".dotfiles" / "gemini" / "skills"
+    
+    if host_copilot_skills.exists() and host_copilot_skills.is_dir():
+        docker_cmd.extend(["-v", f"{host_copilot_skills}:/ctx/host-copilot-skills:ro"])
+        docker_cmd.extend(["-e", "YOLO_HOST_COPILOT_SKILLS=/ctx/host-copilot-skills"])
+        
+        # Also mount the dotfiles skills directory if it exists (for symlink resolution)
+        if host_dotfiles_skills.exists() and host_dotfiles_skills.is_dir():
+            docker_cmd.extend(["-v", f"{host_dotfiles_skills}:{host_dotfiles_skills}:ro"])
+
     if "TERM" in os.environ:
         docker_cmd.extend(["-e", f"TERM={os.environ['TERM']}"])
 
