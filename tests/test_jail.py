@@ -88,7 +88,7 @@ def test_shim_persistence(tmp_path):
     result = run_yolo(project_dir, "curl --version")
     assert result.returncode == 0
 
-@pytest.mark.skip(reason="Agents must be installed via mise in temp project; skipping until bootstrap runs full install")
+@pytest.mark.skip(reason="Agents (gemini/copilot) must be installed via mise in target project. Bootstrap script is optional; agents only install if user manually runs bootstrap or includes them in project mise.toml.")
 def test_agent_tools_available(temp_project):
     """Test that gemini and copilot are available."""
     # We can't rely on them being installed in the temp_project context unless we force it

@@ -228,11 +228,27 @@ def run(
     if raw_blocked is None:
         raw_blocked = ["grep", "find"]
 
+    # Default messages and suggestions for standard tools
+    default_messages = {
+        "grep": {
+            "message": "grep is blocked to prevent unintended recursive searches. Use ripgrep (rg) or other targeted tools.",
+            "suggestion": "Try: rg <pattern> [file]"
+        },
+        "find": {
+            "message": "find is blocked to prevent unintended recursive searches. Use fd for a faster, more intuitive alternative.",
+            "suggestion": "Try: fd <pattern>"
+        }
+    }
+
     normalized_blocked = []
     
     for tool in raw_blocked:
         if isinstance(tool, str):
-            normalized_blocked.append({"name": tool})
+            tool_dict = {"name": tool}
+            # Add default message if available
+            if tool in default_messages:
+                tool_dict.update(default_messages[tool])
+            normalized_blocked.append(tool_dict)
         elif isinstance(tool, dict) and "name" in tool:
             normalized_blocked.append(tool)
             
