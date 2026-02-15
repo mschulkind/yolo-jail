@@ -1,8 +1,3 @@
-<!-- YOLO-JAIL-START (auto-generated, do not edit above YOLO-JAIL-END) -->
-<!-- This section is dynamically generated inside the jail at runtime. -->
-<!-- See src/entrypoint.sh for the generation logic. -->
-<!-- YOLO-JAIL-END -->
-
 # YOLO Jail: Agent Developer Guide
 
 This project provides a secure, isolated Docker environment for AI agents (Gemini CLI, Copilot) to execute commands on local repositories without compromising host security or identity.
@@ -16,6 +11,7 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
 - **Merge Rules**: Workspace config is merged over user config. Lists are merged+deduped; scalar/object values in workspace override user defaults.
 - **Dynamic Shims**: Blocked tools are generated dynamically based on this config. All blocked tools are unconditionally blocked unless `YOLO_BYPASS_SHIMS=1` is set.
 - **Custom Packages**: The `packages` array specifies additional nix packages to bake into the jail image. Names must match nixpkgs attribute names. The image only rebuilds when this list changes. Uses `--impure` nix build with `builtins.getEnv`.
+- **Extra Mounts**: The `mounts` array brings additional host paths into the jail read-only at `/ctx/<basename>` (or a custom container path via `"host:container"` syntax).
 
 ### 2. Isolation & Identity
 - **Strict Isolation**: The jail MUST NOT access host `~/.ssh/`, `~/.gitconfig`, or any cloud credentials.
@@ -29,13 +25,16 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
 - **Auto-YOLO**: The CLI automatically injects `--yolo` for `gemini` and `copilot` commands.
 - **Quoting**: Use `shlex.join` in Python to pass quoted arguments correctly to the container's `bash -c`.
 - **Self-Updating Build**: The CLI runs `nix build --impure` on every start but only executes `docker load` if the resulting image hash differs from `.last-load`. The `--impure` flag allows reading the `YOLO_EXTRA_PACKAGES` env var for per-project package customization.
-- **AGENTS Injection**: Runtime AGENTS context is written to `~/.copilot/AGENTS.md` and `~/.gemini/AGENTS.md` inside the jail. `/workspace/AGENTS.md` is not modified.
+- **AGENTS Injection**: Runtime AGENTS context is written to `~/.copilot/AGENTS.md` and `~/.gemini/AGENTS.md` inside the jail. `/workspace/AGENTS.md` is never modified.
 
 ## Developer Runbook
 
 ### Debugging MCP & LSP
-- **Logs**: Copilot logs are in `~/.copilot/logs/`.
-- **Config**: Copilot config lives at `~/.copilot/` (not XDG). Contains `config.json`, `mcp-config.json`, `lsp-config.json`.
+- **Logs**: Copilot logs are in `~/.copilot/logs/`. Gemini logs are in `~/.cache/gemini-cli/logs/`.
+- **Config Locations**:
+  - **Copilot**: `~/.copilot/config.json` (main), `~/.copilot/mcp-config.json` (MCP servers), `~/.copilot/lsp-config.json` (LSP servers).
+  - **Gemini**: `~/.gemini/settings.json` (all config including MCP/LSP).
+- **Workspace MCP Shadowing**: The CLI shadows any workspace `.vscode/mcp.json` with `/dev/null` inside the jail so agents only use the jail's MCP config. Host VS Code MCP configs won't interfere.
 - **Chromium Stability**: Headless Chromium in Docker is brittle. 
     - **Connect Mode**: Chrome DevTools MCP uses a wrapper script (`~/.local/bin/chrome-devtools-mcp-wrapper`) that pre-launches Chromium with `--remote-debugging-port` and connects via `--browser-url`. This avoids pipe-mode fd conflicts when MCP servers are spawned by agents.
     - **Required Chrome Flags**: `--no-sandbox`, `--disable-setuid-sandbox`, `--disable-dev-shm-usage`, `--disable-gpu`, `--disable-software-rasterizer`.
@@ -44,15 +43,17 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
 - **LSP Schemas**:
     - **Copilot**: Requires `mcpServers` (plural) key in `~/.copilot/mcp-config.json` and a separate `lsp-config.json` with `fileExtensions`.
     - **Gemini**: Uses `mcpServers` key in `settings.json`.
+- **Node Wrappers**: `~/.local/bin/mcp-wrappers/node` and `npx` are wrapper scripts that set `LD_LIBRARY_PATH` before calling the mise-installed binary. MCP configs use absolute paths to these wrappers. Required because agents may sanitize the environment when spawning MCP child processes, stripping `LD_LIBRARY_PATH` which mise-installed node needs to find `libstdc++.so.6`.
 
 ### Tool Management
-- **Mise**: All runtimes (Node@22, Python@3.13, Go) are managed by `mise`. 
+- **Mise**: All runtimes (Node, Python, Go) are managed by `mise`. 
 - **Bootstrapping**: MCP servers are installed via `npm install -g` or `go install` into the persistent `/home/agent` partition during the container's startup (`~/.yolo-bootstrap.sh`).
 - **Binary Locations**:
     - NPM Globals: `/home/agent/.npm-global/bin/`
     - Go Binaries: `/home/agent/go/bin/`
+    - MCP Node Wrappers: `/home/agent/.local/bin/mcp-wrappers/`
+    - Chrome Wrapper: `/home/agent/.local/bin/chrome-devtools-mcp-wrapper`
 - **PATH Order**: `${SHIM_DIR}:/home/agent/.npm-global/bin:/home/agent/go/bin:/mise/shims:/bin:/usr/bin`.
-- **Node Wrappers**: `~/.local/bin/mcp-wrappers/node` and `npx` are wrapper scripts that set `LD_LIBRARY_PATH` before calling the mise-installed binary. MCP configs use absolute paths to these wrappers. This is required because agents (Copilot) may sanitize the environment when spawning MCP child processes, stripping `LD_LIBRARY_PATH` which mise-installed node needs to find `libstdc++.so.6`.
 
 ### Environment Hygiene
 - **No Pagers**: Agents cannot handle interactive pagers.
@@ -60,6 +61,7 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
     - `alias bat='bat --style=plain --paging=never'`.
 - **Terminal**: `TERM=xterm-256color` should be passed to maintain color support for agent parsing.
 - **Permissions**: Map host UID/GID to the container user to ensure file ownership on the host is preserved.
+- **No LD_LIBRARY_PATH Stripping**: `LD_LIBRARY_PATH=/lib:/usr/lib` is baked into the Docker image Env to survive agent environment sanitization.
 
 ## Workflow for Modification
 1. **Change Image**: Edit `flake.nix` (e.g., add `pkgs.strace`).
@@ -67,9 +69,9 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
 3. **Automatic Test**: Run `uv run pytest tests/test_jail.py`.
 4. **Manual Test**: Run `yolo -- bash -c "my-new-tool --version"`.
 5. **Enforce YOLO**: Always ensure `YOLO_BYPASS_SHIMS=1` is set when running installers inside the jail.
-6. **Commit & Push**: Always commit and push after every change. The Nix image is built from the working tree, and other users need the latest code.
+6. **Commit & Push**: Always commit and push after every change. The Nix image is built from the working tree.
 
 ## Testing Guidelines
-- **Model**: When testing Copilot interactively or in scripts, always use the `gpt-4.1` model (e.g., `copilot --model gpt-4.1`). Do not use expensive models for testing.
-- **No Agent Tests**: Automated tests (`uv run pytest`) must NOT run `copilot` or `gemini` interactively. Tests may check that they are installed (`--version`) but must never start interactive sessions or make API calls.
-- **Workspace MCP Shadowing**: The CLI shadows any workspace `.vscode/mcp.json` with `/dev/null` inside the jail so agents only use the jail's MCP config. Host MCP configs designed for VS Code won't interfere.
+- **Model**: When testing Copilot interactively, always use the `gpt-4.1` model (e.g., `copilot --model gpt-4.1`). Do not use expensive models.
+- **No Agent Tests**: Automated tests (`uv run pytest`) must NOT run `copilot` or `gemini` interactively. Tests may check they are installed (`--version`) but must never start interactive sessions or make API calls.
+- **Manual Agent Testing**: Always test agent functionality manually before committing. Use `yolo -- copilot --yolo` or `yolo -- gemini --yolo` from a test project.
