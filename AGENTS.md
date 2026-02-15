@@ -26,7 +26,7 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
 - **Quoting**: Use `shlex.join` in Python to pass quoted arguments correctly to the container's `bash -c`.
 - **Self-Updating Build**: The CLI runs `nix build --impure` on every start but only executes `docker load` if the resulting image hash differs from `.last-load`. The `--impure` flag allows reading the `YOLO_EXTRA_PACKAGES` env var for per-project package customization.
 - **AGENTS Injection**: Runtime AGENTS context is written to `~/.copilot/AGENTS.md` and `~/.gemini/AGENTS.md` inside the jail. `/workspace/AGENTS.md` is never modified.
-- **Skills Auto-Mount**: Host user-level skills from `~/.copilot/skills/` are automatically mounted and synced into the jail at `/home/agent/.copilot/skills/`. Workspace skills from `/workspace/.copilot/skills/` are also synced. Workspace skills take precedence over user-level skills with the same name. Symlinks in skill directories are followed automatically.
+- **Skills Auto-Mount**: Host user-level skills from `~/.gemini/skills/` (which `~/.copilot/skills` typically symlinks to) are automatically mounted and synced into the jail at `/home/agent/.copilot/skills/`. If a workspace has `.copilot/skills/`, those skills are also synced and take precedence. Symlinks in skill directories are followed automatically.
 
 ## Developer Runbook
 

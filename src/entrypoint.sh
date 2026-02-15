@@ -242,15 +242,15 @@ if [ ! -f "$COPILOT_CONFIG_DIR/config.json" ]; then
     echo '{"yolo": true}' > "$COPILOT_CONFIG_DIR/config.json"
 fi
 
-# Merge host user-level copilot skills into jail (if mounted)
-# Skills from host ~/.copilot/skills/ are made available alongside workspace skills
-if [ -n "$YOLO_HOST_COPILOT_SKILLS" ] && [ -d "$YOLO_HOST_COPILOT_SKILLS" ]; then
+# Merge host user-level gemini skills into jail (if mounted)
+# Skills from host ~/.gemini/skills/ are made available inside the jail
+if [ -n "$YOLO_HOST_GEMINI_SKILLS" ] && [ -d "$YOLO_HOST_GEMINI_SKILLS" ]; then
     JAIL_SKILLS_DIR="$COPILOT_CONFIG_DIR/skills"
     mkdir -p "$JAIL_SKILLS_DIR"
     
     # Sync host skills into jail (preserving structure, following symlinks)
     # Always sync to ensure host changes are reflected
-    for skill_dir in "$YOLO_HOST_COPILOT_SKILLS"/*; do
+    for skill_dir in "$YOLO_HOST_GEMINI_SKILLS"/*; do
         if [ -d "$skill_dir" ]; then
             skill_name=$(basename "$skill_dir")
             # Remove existing and copy fresh (follows symlinks with -L)
@@ -260,8 +260,8 @@ if [ -n "$YOLO_HOST_COPILOT_SKILLS" ] && [ -d "$YOLO_HOST_COPILOT_SKILLS" ]; the
     done
 fi
 
-# Also copy workspace skills if they exist
-# Workspace skills at /workspace/.copilot/skills/ are merged into jail agent skills
+# Workspace skills at /workspace/.copilot/skills/ are also synced if they exist
+# Workspace skills take precedence over user-level skills
 if [ -d "/workspace/.copilot/skills" ]; then
     JAIL_SKILLS_DIR="$COPILOT_CONFIG_DIR/skills"
     mkdir -p "$JAIL_SKILLS_DIR"
@@ -269,7 +269,6 @@ if [ -d "/workspace/.copilot/skills" ]; then
     for skill_dir in /workspace/.copilot/skills/*; do
         if [ -d "$skill_dir" ]; then
             skill_name=$(basename "$skill_dir")
-            # Workspace skills take precedence (overwrite host user-level skills)
             rm -rf "$JAIL_SKILLS_DIR/$skill_name"
             cp -rL "$skill_dir" "$JAIL_SKILLS_DIR/"
         fi

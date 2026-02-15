@@ -313,14 +313,15 @@ def run(
     if host_mise.exists():
         docker_cmd.extend(["-v", f"{host_mise}:{host_mise}:ro"])
 
-    # Mount host user-level copilot skills so they're available in the jail
-    # These will be symlinked into /home/agent/.copilot/skills/ during entrypoint
-    host_copilot_skills = Path.home() / ".copilot" / "skills"
+    # Mount host user-level copilot/gemini skills so they're available in the jail
+    # ~/.copilot/skills is typically a symlink to ~/.gemini/skills
+    # Skills will be synced into /home/agent/.copilot/skills/ during entrypoint
+    host_gemini_skills = Path.home() / ".gemini" / "skills"
     host_dotfiles_skills = Path.home() / ".dotfiles" / "gemini" / "skills"
     
-    if host_copilot_skills.exists() and host_copilot_skills.is_dir():
-        docker_cmd.extend(["-v", f"{host_copilot_skills}:/ctx/host-copilot-skills:ro"])
-        docker_cmd.extend(["-e", "YOLO_HOST_COPILOT_SKILLS=/ctx/host-copilot-skills"])
+    if host_gemini_skills.exists() and host_gemini_skills.is_dir():
+        docker_cmd.extend(["-v", f"{host_gemini_skills}:/ctx/host-gemini-skills:ro"])
+        docker_cmd.extend(["-e", "YOLO_HOST_GEMINI_SKILLS=/ctx/host-gemini-skills"])
         
         # Also mount the dotfiles skills directory if it exists (for symlink resolution)
         if host_dotfiles_skills.exists() and host_dotfiles_skills.is_dir():
