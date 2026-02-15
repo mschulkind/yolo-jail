@@ -453,5 +453,8 @@ for path in (
         f.write(content)
 PYAGENTS
 
-# 9. Run the startup command passed from Justfile
+# 9. Auto-provision tools and language servers (cached in persistent storage)
+source "$BOOTSTRAP_SCRIPT" 2>&1 | grep -v "^Installing\|^Error: Manual\|^To add\|^Provisioning" || true
+
+# 10. Run the startup command passed from Justfile
 exec bash --rcfile "$BASHRC" -c "$@"

@@ -29,6 +29,18 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
 
 ## Developer Runbook
 
+### First Run vs Subsequent Runs
+- **First Run**: When you run `yolo -- <command>`, the jail entrypoint automatically provisions all tools:
+  1. Builds the Docker image via `nix build --impure` (if config changed)
+  2. Loads the image into Docker (if hash differs from `.last-load`)
+  3. Runs the bootstrap script to install MCP servers, language servers, and utilities
+  4. Executes your command
+  - This takes longer (npm/go installs + potential image rebuild)
+- **Subsequent Runs**: Tools are cached in persistent storage (`~/.local/share/yolo-jail/home`), so:
+  1. Bootstrap script runs but skips installation (tools already exist)
+  2. Your command executes immediately
+  - Much faster than first run
+
 ### Debugging MCP & LSP
 - **Logs**: 
   - **Copilot**: Inside jail: `~/.copilot/logs/`. On host: `~/.local/share/yolo-jail/home/.copilot/logs/`.
@@ -68,7 +80,11 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
 
 ### Tool Management
 - **Mise**: All runtimes (Node, Python, Go) are managed by `mise`. 
-- **Bootstrapping**: MCP servers are installed via `npm install -g` or `go install` into the persistent `/home/agent` partition during the container's startup (`~/.yolo-bootstrap.sh`).
+- **Auto-Provisioning**: On every jail start, `~/.yolo-bootstrap.sh` runs automatically to provision MCP servers, language servers, and utilities. Tools are installed only if missing (idempotent), so subsequent runs skip installation and rely on cached binaries in persistent storage.
+  - **NPM Globals**: `chrome-devtools-mcp`, `@modelcontextprotocol/server-sequential-thinking`, `pyright`, `typescript-language-server`, `typescript`
+  - **Go Binaries**: `mcp-language-server` (used by Gemini LSP)
+  - **Python**: `showboat` (if pip is available)
+- **Persistent Storage**: All installed binaries live in `~/.local/share/yolo-jail/home/` on the host, so they survive jail restarts and are reused without reinstalling.
 - **Binary Locations**:
     - NPM Globals: `/home/agent/.npm-global/bin/`
     - Go Binaries: `/home/agent/go/bin/`
