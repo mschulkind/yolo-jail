@@ -6,11 +6,7 @@ SHIM_DIR="$HOME/.yolo-shims"
 rm -rf "$SHIM_DIR"
 mkdir -p "$SHIM_DIR"
 
-# 2. Default blocked tools
-DEFAULT_BLOCKED="grep find"
-BLOCKED_TOOLS="$DEFAULT_BLOCKED"
-
-# 3. Read blocked tools from environment variable (injected by Python CLI)
+# 2. Read blocked tools from environment variable (injected by Python CLI)
 if [ -n "$YOLO_BLOCK_CONFIG" ]; then
     SHIM_DIR="$SHIM_DIR" python3 <<'PYSHIMS'
 import json, os, sys, stat
@@ -101,7 +97,6 @@ export PATH="$SHIM_DIR:$NPM_CONFIG_PREFIX/bin:$GOPATH/bin:/mise/shims:/bin:/usr/
 # Aliases
 alias ls='ls --color=auto'
 alias ll='ls -alF'
-alias grep='grep --color=auto'
 alias gemini='gemini --yolo'
 alias copilot='copilot --yolo'
 alias vi='nvim'
@@ -119,13 +114,10 @@ export NPM_CONFIG_PREFIX="$AGENT_HOME/.npm-global"
 BOOTSTRAP_SCRIPT="$AGENT_HOME/.yolo-bootstrap.sh"
 cat <<'EOF' > "$BOOTSTRAP_SCRIPT"
 #!/bin/bash
-export NPM_CONFIG_PREFIX="$HOME/.npm-global"
-export GOPATH="$HOME/go"
+export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.npm-global}"
+export GOPATH="${GOPATH:-$HOME/go}"
 export GOBIN="$GOPATH/bin"
-
-# Compute npm global bin dir from npm config (respects user overrides)
-NPM_BIN="$(npm config get prefix)/bin"
-export PATH="$NPM_BIN:$GOBIN:$PATH"
+export PATH="$NPM_CONFIG_PREFIX/bin:$GOBIN:$PATH"
 
 # Install binaries if missing.
 if ! command -v chrome-devtools-mcp >/dev/null; then
@@ -171,13 +163,15 @@ CHROME_WRAPPER="$AGENT_HOME/.local/bin/chrome-devtools-mcp-wrapper"
 mkdir -p "$(dirname "$CHROME_WRAPPER")"
 cat >"$CHROME_WRAPPER" <<'WRAPPER'
 #!/bin/bash
+# Self-contained wrapper: sets its own env since agents sanitize child processes.
+export LD_LIBRARY_PATH="/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
 # Internal Chrome debugging defaults (isolated to container)
 CHROME_PORT="${CHROME_DEBUG_PORT:-9222}"
 CHROME_ADDR="${CHROME_DEBUG_ADDR:-127.0.0.1}"
 CHROME_URL="http://$CHROME_ADDR:$CHROME_PORT"
 
-# Compute npm global bin dir (respects user overrides)
-NPM_BIN="$(npm config get prefix)/bin"
+NPM_BIN="${NPM_CONFIG_PREFIX:-$HOME/.npm-global}/bin"
 MCP_WRAPPERS_BIN="$HOME/.local/bin/mcp-wrappers"
 
 # Start Chromium if not already running
@@ -249,25 +243,19 @@ if [ ! -f "$COPILOT_CONFIG_DIR/config.json" ]; then
 fi
 
 python3 -c "
-import json, os, subprocess
+import json, os
 
 config_dir = '$COPILOT_CONFIG_DIR'
-
-# Compute npm global bin dir (respects user overrides)
-try:
-    npm_prefix = subprocess.check_output(['npm', 'config', 'get', 'prefix'], text=True).strip()
-    npm_bin = os.path.join(npm_prefix, 'bin')
-except:
-    npm_bin = os.path.expanduser('~/.npm-global/bin')
-
-mcp_wrappers_bin = os.path.expanduser('~/.local/bin/mcp-wrappers')
+home = os.environ['HOME']
+npm_bin = os.path.join(os.environ.get('NPM_CONFIG_PREFIX', os.path.join(home, '.npm-global')), 'bin')
+mcp_wrappers_bin = os.path.join(home, '.local/bin/mcp-wrappers')
 
 # Write MCP Config
 mcp_path = os.path.join(config_dir, 'mcp-config.json')
 mcp_config = {
     'mcpServers': {
         'chrome-devtools': {
-            'command': os.path.expanduser('~/.local/bin/chrome-devtools-mcp-wrapper'),
+            'command': os.path.join(home, '.local/bin/chrome-devtools-mcp-wrapper'),
             'args': []
         },
         'sequential-thinking': {
@@ -303,25 +291,20 @@ with open(lsp_path, 'w') as f:
 GEMINI_CONFIG_DIR="$AGENT_HOME/.gemini"
 mkdir -p "$GEMINI_CONFIG_DIR"
 python3 -c "
-import json, os, sys, subprocess
+import json, os, sys
 
 config_path = '$GEMINI_CONFIG_DIR/settings.json'
 
-# Compute npm global bin dir (respects user overrides)
-try:
-    npm_prefix = subprocess.check_output(['npm', 'config', 'get', 'prefix'], text=True).strip()
-    npm_bin = os.path.join(npm_prefix, 'bin')
-except:
-    npm_bin = os.path.expanduser('~/.npm-global/bin')
-
-go_bin = os.path.expanduser('~/go/bin')
-mcp_wrappers_bin = os.path.expanduser('~/.local/bin/mcp-wrappers')
+home = os.environ['HOME']
+npm_bin = os.path.join(os.environ.get('NPM_CONFIG_PREFIX', os.path.join(home, '.npm-global')), 'bin')
+go_bin = os.path.join(os.environ.get('GOPATH', os.path.join(home, 'go')), 'bin')
+mcp_wrappers_bin = os.path.join(home, '.local/bin/mcp-wrappers')
 
 default_config = {
     'security': {'approvalMode': 'yolo', 'enablePermanentToolApproval': True},
     'mcpServers': {
         'chrome-devtools': {
-            'command': os.path.expanduser('~/.local/bin/chrome-devtools-mcp-wrapper'),
+            'command': os.path.join(home, '.local/bin/chrome-devtools-mcp-wrapper'),
             'args': []
         },
         'sequential-thinking': {
@@ -459,8 +442,6 @@ for path in (
         f.write(content)
 PYAGENTS
 
-# 9. Auto-provision tools and language servers (cached in persistent storage)
-source "$BOOTSTRAP_SCRIPT" 2>&1 | grep -v "^Installing\|^Error: Manual\|^To add\|^Provisioning" || true
-
-# 10. Run the startup command passed from Justfile
+# 9. Run the startup command passed from Justfile
+# Bootstrap is handled by cli.py's setup_script (with YOLO_BYPASS_SHIMS=1)
 exec bash --rcfile "$BASHRC" -c "$@"

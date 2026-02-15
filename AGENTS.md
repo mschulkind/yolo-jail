@@ -60,7 +60,8 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
   yolo -- bash -lc 'grep -i "MCP\|Failed\|Error" ~/.copilot/logs/$(ls -1t ~/.copilot/logs | head -1)'
   ```
 - **Common MCP Errors**:
-  - `libstdc++.so.6: cannot open shared object file`: Node wrapper not used or `LD_LIBRARY_PATH` stripped. Check MCP config uses `/home/agent/.local/bin/mcp-wrappers/node`.
+  - `libstdc++.so.6: cannot open shared object file`: Node wrapper not used or `LD_LIBRARY_PATH` stripped. Check MCP config uses `/home/agent/.local/bin/mcp-wrappers/node`. The chrome-devtools wrapper sets its own `LD_LIBRARY_PATH` to be self-contained.
+  - `Cannot find module '/bin/chrome-devtools-mcp'`: The chrome wrapper failed to resolve NPM_CONFIG_PREFIX. This means `$HOME` or `$NPM_CONFIG_PREFIX` wasn't set in the spawned environment.
   - `Protocol error (Target.setDiscoverTargets): Target closed`: Chrome DevTools MCP failed to connect to Chromium. Check Chromium is running, port 9222 is accessible, and wrapper flags are correct.
   - `Connection closed`: MCP server crashed or failed to start. Check server binary is installed (`npm list -g` inside jail).
   - `argument list too long`: Shim conflict or PATH issue. Check `.local/bin/` is not in PATH (should only be used by absolute MCP paths).
@@ -77,10 +78,11 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
     - **Copilot**: Requires `mcpServers` (plural) key in `~/.copilot/mcp-config.json` and a separate `lsp-config.json` with `fileExtensions`.
     - **Gemini**: Uses `mcpServers` key in `settings.json`.
 - **Node Wrappers**: `~/.local/bin/mcp-wrappers/node` and `npx` are wrapper scripts that set `LD_LIBRARY_PATH` before calling the mise-installed binary. MCP configs use absolute paths to these wrappers. Required because agents may sanitize the environment when spawning MCP child processes, stripping `LD_LIBRARY_PATH` which mise-installed node needs to find `libstdc++.so.6`.
+- **Self-Contained Wrappers**: All MCP wrapper scripts (chrome-devtools, node, npx) set their own `LD_LIBRARY_PATH` and use `$HOME`-relative paths instead of calling `npm config` at runtime. This ensures they work even when agents sanitize the environment. Never use `subprocess` or `npm config get` in wrapper scripts.
 
 ### Tool Management
 - **Mise**: All runtimes (Node, Python, Go) are managed by `mise`. 
-- **Auto-Provisioning**: On every jail start, `~/.yolo-bootstrap.sh` runs automatically to provision MCP servers, language servers, and utilities. Tools are installed only if missing (idempotent), so subsequent runs skip installation and rely on cached binaries in persistent storage.
+- **Auto-Provisioning**: On every jail start, the CLI runs `~/.yolo-bootstrap.sh` with `YOLO_BYPASS_SHIMS=1` (to avoid shim interference) before executing the user's command. Tools are installed only if missing (idempotent), so subsequent runs skip installation and rely on cached binaries in persistent storage.
   - **NPM Globals**: `chrome-devtools-mcp`, `@modelcontextprotocol/server-sequential-thinking`, `pyright`, `typescript-language-server`, `typescript`
   - **Go Binaries**: `mcp-language-server` (used by Gemini LSP)
   - **Python**: `showboat` (if pip is available)
