@@ -14,38 +14,31 @@ REPO_ROOT=$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )
 # If inside tmux, set visual jail indicators and restore on exit
 if [ -n "$TMUX" ]; then
     _JAIL_DIR="$(basename "$PWD")"
-    _OLD_BORDER=$(tmux show-option -pqv pane-border-style 2>/dev/null)
-    _OLD_ACTIVE=$(tmux show-option -pqv pane-active-border-style 2>/dev/null)
-    _OLD_BSTATUS=$(tmux show-option -pqv pane-border-status 2>/dev/null)
-    _OLD_BFORMAT=$(tmux show-option -pqv pane-border-format 2>/dev/null)
-    _OLD_WINNAME=$(tmux display-message -p '#W' 2>/dev/null)
-    tmux rename-window "JAIL $_JAIL_DIR" >/dev/null 2>&1
-    tmux set-option -p pane-border-style "fg=red,bold" >/dev/null 2>&1
-    tmux set-option -p pane-active-border-style "fg=red,bold" >/dev/null 2>&1
-    tmux set-option -p pane-border-status bottom >/dev/null 2>&1
-    tmux set-option -p pane-border-format " 🔒 JAIL $_JAIL_DIR " >/dev/null 2>&1
+    _TMUX_PANE="$TMUX_PANE"  # Save current pane ID for targeted cleanup
+
+    # Save old state
+    _OLD_BORDER=$(tmux show-option -pt "$_TMUX_PANE" pane-border-style 2>/dev/null | sed 's/^pane-border-style //')
+    _OLD_ACTIVE=$(tmux show-option -pt "$_TMUX_PANE" pane-active-border-style 2>/dev/null | sed 's/^pane-active-border-style //')
+    _OLD_BSTATUS=$(tmux show-option -pt "$_TMUX_PANE" pane-border-status 2>/dev/null | sed 's/^pane-border-status //')
+    _OLD_BFORMAT=$(tmux show-option -pt "$_TMUX_PANE" pane-border-format 2>/dev/null | sed 's/^pane-border-format //')
+
+    # Set jail indicators — pane-level options target only this pane
+    tmux set-option -pt "$_TMUX_PANE" pane-border-style "fg=red,bold" 2>/dev/null
+    tmux set-option -pt "$_TMUX_PANE" pane-active-border-style "fg=red,bold" 2>/dev/null
+    tmux set-option -pt "$_TMUX_PANE" pane-border-status bottom 2>/dev/null
+    tmux set-option -pt "$_TMUX_PANE" pane-border-format " 🔒 JAIL $_JAIL_DIR " 2>/dev/null
+
+    # Set window name — disable auto-rename so it sticks
+    tmux set-option -w automatic-rename off 2>/dev/null
+    tmux rename-window "JAIL $_JAIL_DIR" 2>/dev/null
+
     _restore_border() {
-        if [ -n "$_OLD_BORDER" ]; then
-            tmux set-option -p pane-border-style "$_OLD_BORDER" >/dev/null 2>&1
-        else
-            tmux set-option -pu pane-border-style >/dev/null 2>&1
-        fi
-        if [ -n "$_OLD_ACTIVE" ]; then
-            tmux set-option -p pane-active-border-style "$_OLD_ACTIVE" >/dev/null 2>&1
-        else
-            tmux set-option -pu pane-active-border-style >/dev/null 2>&1
-        fi
-        if [ -n "$_OLD_BSTATUS" ]; then
-            tmux set-option -p pane-border-status "$_OLD_BSTATUS" >/dev/null 2>&1
-        else
-            tmux set-option -pu pane-border-status >/dev/null 2>&1
-        fi
-        if [ -n "$_OLD_BFORMAT" ]; then
-            tmux set-option -p pane-border-format "$_OLD_BFORMAT" >/dev/null 2>&1
-        else
-            tmux set-option -pu pane-border-format >/dev/null 2>&1
-        fi
-        tmux rename-window "$_OLD_WINNAME" >/dev/null 2>&1
+        # Restore pane options
+        for opt in pane-border-style pane-active-border-style pane-border-status pane-border-format; do
+            tmux set-option -put "$_TMUX_PANE" "$opt" 2>/dev/null
+        done
+        # Re-enable auto-rename so tmux names the window based on the running process
+        tmux set-option -w automatic-rename on 2>/dev/null
     }
     trap _restore_border EXIT
 fi

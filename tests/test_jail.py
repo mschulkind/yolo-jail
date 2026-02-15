@@ -137,3 +137,48 @@ def test_workspace_agents_untouched_and_home_agents_present(temp_project):
     )
     assert result.returncode == 0
     assert workspace_agents.read_text() == original
+
+
+def test_venv_symlinks_resolve(temp_project):
+    """Test that host .venv python symlinks resolve inside the jail."""
+    import sysconfig
+    host_mise = os.environ.get("MISE_DATA_DIR", str(Path.home() / ".local/share/mise"))
+
+    # Find any existing python install in the host mise
+    installs = Path(host_mise) / "installs" / "python"
+    if not installs.exists():
+        pytest.skip("No host mise python installs found")
+
+    versions = [d for d in installs.iterdir() if d.is_dir() and (d / "bin").exists()]
+    if not versions:
+        pytest.skip("No host mise python installs found")
+
+    # Pick the first version and create a fake .venv symlink pointing to it
+    version_dir = versions[0]
+    # Find a real python interpreter (not python*-config)
+    python_bin = None
+    for candidate in sorted(version_dir.glob("bin/python3.*")):
+        if "-config" not in candidate.name:
+            python_bin = candidate
+            break
+    if not python_bin:
+        pytest.skip("No python binary in mise install")
+
+    venv_dir = temp_project / ".venv" / "bin"
+    venv_dir.mkdir(parents=True)
+    (venv_dir / "python").symlink_to(python_bin)
+
+    result = run_yolo(temp_project, "/workspace/.venv/bin/python --version")
+    assert result.returncode == 0
+    assert "Python" in result.stdout
+
+
+def test_vscode_mcp_shadowed(temp_project):
+    """Test that workspace .vscode/mcp.json is shadowed with /dev/null inside jail."""
+    vscode_dir = temp_project / ".vscode"
+    vscode_dir.mkdir()
+    (vscode_dir / "mcp.json").write_text('{"servers": {"bad": {"command": "false"}}}')
+
+    result = run_yolo(temp_project, "cat /workspace/.vscode/mcp.json")
+    # /dev/null is empty, so cat should output nothing
+    assert result.stdout.strip() == ""

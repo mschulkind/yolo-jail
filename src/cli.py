@@ -289,6 +289,12 @@ def run(
     if vscode_mcp.exists():
         docker_cmd.extend(["-v", "/dev/null:/workspace/.vscode/mcp.json:ro"])
 
+    # Mount host mise at its original path so .venv symlinks created on host resolve inside jail
+    # Host .venv/bin/python -> /home/user/.local/share/mise/installs/python/X.Y.Z/bin/python
+    host_mise = Path(os.environ.get("MISE_DATA_DIR", str(Path.home() / ".local/share/mise")))
+    if host_mise.exists():
+        docker_cmd.extend(["-v", f"{host_mise}:{host_mise}:ro"])
+
     if "TERM" in os.environ:
         docker_cmd.extend(["-e", f"TERM={os.environ['TERM']}"])
 
