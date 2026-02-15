@@ -271,7 +271,7 @@ def run(
         mount_descriptions.append(f"{host_path}:{container_path}")
 
     # Construct Docker Command
-    docker_flags = ["--rm", "-i"]
+    docker_flags = ["--rm", "-i", "--init"]
     if sys.stdout.isatty():
         docker_flags.append("-t")
 
