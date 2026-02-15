@@ -16,6 +16,7 @@ GLOBAL_STORAGE = Path.home() / ".local/share/yolo-jail"
 GLOBAL_HOME = GLOBAL_STORAGE / "home"
 GLOBAL_MISE = GLOBAL_STORAGE / "mise"
 CONTAINER_DIR = GLOBAL_STORAGE / "containers"
+AGENTS_DIR = GLOBAL_STORAGE / "agents"
 USER_CONFIG_PATH = Path.home() / ".config" / "yolo-jail" / "config.jsonc"
 
 from rich.console import Console
@@ -27,6 +28,7 @@ def ensure_global_storage():
     GLOBAL_HOME.mkdir(parents=True, exist_ok=True)
     GLOBAL_MISE.mkdir(parents=True, exist_ok=True)
     CONTAINER_DIR.mkdir(parents=True, exist_ok=True)
+    AGENTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def container_name_for_workspace(workspace: Path) -> str:
@@ -55,6 +57,77 @@ def cleanup_container_tracking(name: str):
     """Remove tracking file for a container."""
     tracking_file = CONTAINER_DIR / name
     tracking_file.unlink(missing_ok=True)
+
+
+def generate_agents_md(
+    cname: str,
+    workspace: Path,
+    blocked_tools: List[Dict[str, str]],
+    mount_descriptions: List[str],
+) -> Path:
+    """Generate per-workspace AGENTS.md and return the directory containing it."""
+    agents_dir = AGENTS_DIR / cname
+    agents_dir.mkdir(parents=True, exist_ok=True)
+
+    lines = [
+        "# YOLO Jail Environment",
+        "",
+        "You are running inside a YOLO Jail — a sandboxed Docker container.",
+        "",
+        "## Environment",
+        "",
+        f"- **Workspace**: `/workspace` (mounted from host `{workspace}`)",
+        "- **Home Directory**: `/home/agent` (persistent across sessions)",
+        "- **OS**: NixOS-based minimal container (no systemd, no sudo)",
+        "- **Network**: Bridge mode by default. Run `ip route | awk '/default/ {print $3}'` to find host IP.",
+        "",
+        "## Available Tools",
+        "",
+        "Standard CLI tools: git, rg (ripgrep), fd, bat, jq, nvim, curl, wget, strace, gh",
+        "Runtimes: Node.js 22, Python 3.13, Go (managed by mise)",
+        "MCP Servers: chrome-devtools (headless Chromium), sequential-thinking",
+        "",
+    ]
+
+    if blocked_tools:
+        lines.append("## Blocked Tools")
+        lines.append("")
+        lines.append("The following tools are blocked or shimmed in this project:")
+        lines.append("")
+        for tool in blocked_tools:
+            name = tool.get("name", str(tool))
+            msg = tool.get("message", "")
+            sug = tool.get("suggestion", "")
+            entry = f"- `{name}`"
+            if msg:
+                entry += f": {msg}"
+            if sug:
+                entry += f" Use `{sug}` instead."
+            lines.append(entry)
+        lines.append("")
+
+    if mount_descriptions:
+        lines.append("## Additional Context Mounts (read-only)")
+        lines.append("")
+        for m in mount_descriptions:
+            host_path, container_path = m.split(":", 1) if ":" in m else (m, m)
+            lines.append(f"- `{container_path}` (from host `{host_path}`)")
+        lines.append("")
+
+    lines.extend([
+        "## Limitations",
+        "",
+        "- **No internet restrictions** but no host credentials (no ~/.ssh, no ~/.gitconfig).",
+        "- **No pagers**: PAGER=cat, GIT_PAGER=cat. Do not pipe to less/more.",
+        "- **Read-only mounts**: Context mounts under `/ctx/` are read-only.",
+        "- **No sudo/root**: You run as a mapped host user with no privilege escalation.",
+        "- Authenticate with `gh auth login` if you need GitHub access.",
+        "",
+    ])
+
+    content = "\n".join(lines) + "\n"
+    (agents_dir / "AGENTS.md").write_text(content)
+    return agents_dir
 
 def auto_load_image(repo_root: Path, extra_packages: List[str] = None):
     """Cheaply check if the nix image needs to be reloaded into docker."""
@@ -361,7 +434,6 @@ def run(
         "-e", "HOME=/home/agent",
         "-e", f"YOLO_BLOCK_CONFIG={blocked_config_json}",
         "-e", f"YOLO_HOST_DIR={workspace}",
-        "-e", f"YOLO_MOUNTS={json.dumps(mount_descriptions)}",
         "-u", f"{os.getuid()}:{os.getgid()}",
         "--workdir", "/workspace",
         f"--net={net_mode}",
@@ -390,6 +462,12 @@ def run(
         
         if host_dotfiles_skills.exists() and host_dotfiles_skills.is_dir():
             docker_cmd.extend(["-v", f"{host_dotfiles_skills}:{host_dotfiles_skills}:ro"])
+
+    # Generate per-workspace AGENTS.md and mount it over the shared home copies
+    agents_path = generate_agents_md(cname, workspace, normalized_blocked, mount_descriptions)
+    agents_file = str(agents_path / "AGENTS.md")
+    docker_cmd.extend(["-v", f"{agents_file}:/home/agent/.copilot/AGENTS.md:ro"])
+    docker_cmd.extend(["-v", f"{agents_file}:/home/agent/.gemini/AGENTS.md:ro"])
 
     if "TERM" in os.environ:
         docker_cmd.extend(["-e", f"TERM={os.environ['TERM']}"])
