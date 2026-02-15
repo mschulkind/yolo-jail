@@ -45,9 +45,18 @@ _run_jail() { uv run --project "$REPO_ROOT" "$REPO_ROOT/src/cli.py" "$@"; }
 if [ -z "$1" ]; then
     # No arguments: start an interactive shell
     _run_jail run
-elif [ "$1" == "init" ] || [ "$1" == "init-user-config" ] || [ "$1" == "run" ] || [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
+elif [ "$1" == "init" ] || [ "$1" == "init-user-config" ] || [ "$1" == "run" ] || [ "$1" == "ps" ] || [ "$1" == "--help" ] || [ "$1" == "-h" ]; then
     # Explicit subcommands or help
     _run_jail "$@"
+elif [ "$1" == "--new" ]; then
+    # Force new container: yolo --new -- <command>
+    shift
+    if [ "$1" == "--" ]; then
+        shift
+        _run_jail run --new -- "$@"
+    else
+        _run_jail run --new "$@"
+    fi
 elif [ "$1" == "--" ]; then
     # Treat everything after -- as the command to run in the jail
     shift

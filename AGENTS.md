@@ -23,6 +23,7 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
 ### 3. Execution Engine (`src/cli.py` & `src/entrypoint.sh`)
 - **Direct Execution**: Commands are run via `yolo -- <command>`. 
 - **Auto-YOLO**: The CLI automatically injects `--yolo` for `gemini` and `copilot` commands.
+- **Container Reuse**: By default, running `yolo` in the same workspace reuses the existing container via `docker exec` instead of creating a new one. Containers are named deterministically (`yolo-<hash>`) based on the workspace path. Use `yolo --new -- <command>` to force a new container. Use `yolo ps` to list active jails with their workspace mappings. Tracking files are stored in `~/.local/share/yolo-jail/containers/`.
 - **Quoting**: Use `shlex.join` in Python to pass quoted arguments correctly to the container's `bash -c`.
 - **Self-Updating Build**: The CLI runs `nix build --impure` on every start but only executes `docker load` if the resulting image hash differs from `.last-load`. The `--impure` flag allows reading the `YOLO_EXTRA_PACKAGES` env var for per-project package customization.
 - **AGENTS Injection**: Runtime AGENTS context is written to `~/.copilot/AGENTS.md` and `~/.gemini/AGENTS.md` inside the jail. `/workspace/AGENTS.md` is never modified.
