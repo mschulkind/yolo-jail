@@ -165,6 +165,8 @@ cat >"$CHROME_WRAPPER" <<'WRAPPER'
 #!/bin/bash
 # Self-contained wrapper: sets its own env since agents sanitize child processes.
 export LD_LIBRARY_PATH="/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export FONTCONFIG_FILE="${FONTCONFIG_FILE:-/etc/fonts/fonts.conf}"
+export FONTCONFIG_PATH="${FONTCONFIG_PATH:-/etc/fonts}"
 
 # Internal Chrome debugging defaults (isolated to container)
 CHROME_PORT="${CHROME_DEBUG_PORT:-9222}"
@@ -217,6 +219,8 @@ NODE_WRAPPER="$MCP_BIN/node"
 cat <<'NODEW' > "$NODE_WRAPPER"
 #!/bin/bash
 export LD_LIBRARY_PATH="/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export FONTCONFIG_FILE="${FONTCONFIG_FILE:-/etc/fonts/fonts.conf}"
+export FONTCONFIG_PATH="${FONTCONFIG_PATH:-/etc/fonts}"
 exec /mise/shims/node "$@"
 NODEW
 chmod +x "$NODE_WRAPPER"
@@ -225,6 +229,8 @@ NPX_WRAPPER="$MCP_BIN/npx"
 cat <<'NPXW' > "$NPX_WRAPPER"
 #!/bin/bash
 export LD_LIBRARY_PATH="/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export FONTCONFIG_FILE="${FONTCONFIG_FILE:-/etc/fonts/fonts.conf}"
+export FONTCONFIG_PATH="${FONTCONFIG_PATH:-/etc/fonts}"
 exec /mise/shims/npx "$@"
 NPXW
 chmod +x "$NPX_WRAPPER"
@@ -296,6 +302,7 @@ mcp_config = {
             'args': [
                 os.path.join(npm_bin, 'chrome-devtools-mcp'),
                 '--headless',
+                '--isolated',
                 '--executablePath', '/usr/bin/chromium',
                 '--chrome-arg=--no-sandbox',
                 '--chrome-arg=--disable-dev-shm-usage',
@@ -362,6 +369,7 @@ default_config = {
             'args': [
                 os.path.join(npm_bin, 'chrome-devtools-mcp'),
                 '--headless',
+                '--isolated',
                 '--executablePath', '/usr/bin/chromium',
                 '--chrome-arg=--no-sandbox',
                 '--chrome-arg=--disable-dev-shm-usage',

@@ -32,7 +32,7 @@
 
         # Derivation to provide /usr/bin/env and other standard paths
         binPathLinks = pkgs.runCommand "bin-path-links" {} ''
-          mkdir -p $out/usr/bin $out/bin $out/lib64 $out/lib $out/usr/lib
+          mkdir -p $out/usr/bin $out/bin $out/lib64 $out/lib $out/usr/lib $out/etc
           ln -s ${pkgs.coreutils}/bin/env $out/usr/bin/env
           ln -s ${pkgs.bashInteractive}/bin/bash $out/bin/bash
           ln -s ${pkgs.bashInteractive}/bin/sh $out/bin/sh
@@ -46,6 +46,7 @@
           
           # Link the dynamic linker for x86_64
           ln -s ${pkgs.stdenv.cc.bintools.dynamicLinker} $out/lib64/ld-linux-x86-64.so.2
+          ln -s ${pkgs.fontconfig.out}/etc/fonts $out/etc/fonts
           
           # Link standard libraries to both /lib and /usr/lib
           for dir in $out/lib $out/usr/lib; do
@@ -129,6 +130,8 @@
               "PATH=${shims}/bin:/bin:/usr/bin" 
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
               "LD_LIBRARY_PATH=/lib:/usr/lib"
+              "FONTCONFIG_FILE=/etc/fonts/fonts.conf"
+              "FONTCONFIG_PATH=/etc/fonts"
             ];
             WorkingDir = "/workspace";
           };
