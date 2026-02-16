@@ -65,7 +65,12 @@ def generate_agents_md(
     blocked_tools: List[Dict[str, str]],
     mount_descriptions: List[str],
 ) -> Path:
-    """Generate per-workspace AGENTS.md and return the directory containing it."""
+    """Generate per-workspace AGENTS.md files and return the directory.
+
+    Produces separate files for Copilot and Gemini so that user-level
+    AGENTS.md content from ~/.copilot/AGENTS.md and ~/.gemini/AGENTS.md
+    can differ between the two agents.
+    """
     agents_dir = AGENTS_DIR / cname
     agents_dir.mkdir(parents=True, exist_ok=True)
 
@@ -125,8 +130,18 @@ def generate_agents_md(
         "",
     ])
 
-    content = "\n".join(lines) + "\n"
-    (agents_dir / "AGENTS.md").write_text(content)
+    jail_content = "\n".join(lines) + "\n"
+
+    home = Path.home()
+    for agent, dotdir in [("copilot", ".copilot"), ("gemini", ".gemini")]:
+        user_agents = home / dotdir / "AGENTS.md"
+        if user_agents.exists():
+            user_content = user_agents.read_text()
+            content = user_content + "\n---\n\n" + jail_content
+        else:
+            content = jail_content
+        (agents_dir / f"AGENTS-{agent}.md").write_text(content)
+
     return agents_dir
 
 def auto_load_image(repo_root: Path, extra_packages: List[str] = None):
@@ -487,11 +502,11 @@ def run(
         if host_dotfiles_skills.exists() and host_dotfiles_skills.is_dir():
             docker_cmd.extend(["-v", f"{host_dotfiles_skills}:{host_dotfiles_skills}:ro"])
 
-    # Generate per-workspace AGENTS.md and mount it over the shared home copies
+    # Generate per-workspace AGENTS.md (separate for Copilot and Gemini to
+    # respect user-level ~/.copilot/AGENTS.md vs ~/.gemini/AGENTS.md)
     agents_path = generate_agents_md(cname, workspace, normalized_blocked, mount_descriptions)
-    agents_file = str(agents_path / "AGENTS.md")
-    docker_cmd.extend(["-v", f"{agents_file}:/home/agent/.copilot/AGENTS.md:ro"])
-    docker_cmd.extend(["-v", f"{agents_file}:/home/agent/.gemini/AGENTS.md:ro"])
+    docker_cmd.extend(["-v", f"{agents_path / 'AGENTS-copilot.md'}:/home/agent/.copilot/AGENTS.md:ro"])
+    docker_cmd.extend(["-v", f"{agents_path / 'AGENTS-gemini.md'}:/home/agent/.gemini/AGENTS.md:ro"])
 
     if "TERM" in os.environ:
         docker_cmd.extend(["-e", f"TERM={os.environ['TERM']}"])
