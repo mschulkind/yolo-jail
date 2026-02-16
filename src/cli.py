@@ -434,6 +434,8 @@ def run(
         "-e", "MISE_YES=1",
         "-e", "COPILOT_ALLOW_ALL=true",
         "-e", "LD_LIBRARY_PATH=/lib:/usr/lib:/usr/lib64",
+        "-e", "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json",
+        "-e", "__EGL_VENDOR_LIBRARY_DIRS=/usr/share/glvnd/egl_vendor.d",
         "-e", "HOME=/home/agent",
         "-e", f"YOLO_BLOCK_CONFIG={blocked_config_json}",
         "-e", f"YOLO_HOST_DIR={workspace}",
