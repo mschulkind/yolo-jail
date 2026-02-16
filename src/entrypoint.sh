@@ -186,11 +186,12 @@ if ! curl -s "$CHROME_URL/json/version" >/dev/null 2>&1; then
         --disable-breakpad \
         --noerrdialogs \
         --enable-gpu \
-        --use-gl=egl \
+        --use-angle=vulkan \
+        --enable-features=Vulkan \
+        --disable-vulkan-surface \
         --enable-gpu-rasterization \
         --enable-zero-copy \
         --ignore-gpu-blocklist \
-        --use-angle=vulkan \
         --user-agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36" \
         --remote-debugging-address=$CHROME_ADDR \
         --remote-debugging-port=$CHROME_PORT \

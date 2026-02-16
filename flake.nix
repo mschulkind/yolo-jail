@@ -86,6 +86,18 @@
               }
           }
           EOF
+
+          # Vulkan ICD for NVIDIA (needed for ANGLE Vulkan backend in Chrome)
+          mkdir -p $out/usr/share/vulkan/icd.d
+          cat > $out/usr/share/vulkan/icd.d/nvidia_icd.json <<EOF
+          {
+              "file_format_version" : "1.0.1",
+              "ICD" : {
+                  "library_path" : "libGLX_nvidia.so.0",
+                  "api_version" : "1.4.312"
+              }
+          }
+          EOF
         '';
 
         # Derivation for the entrypoint
@@ -167,6 +179,8 @@
               "PATH=${shims}/bin:/bin:/usr/bin" 
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
               "LD_LIBRARY_PATH=/lib:/usr/lib:/usr/lib64"
+              "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json"
+              "__EGL_VENDOR_LIBRARY_DIRS=/usr/share/glvnd/egl_vendor.d"
             ];
             WorkingDir = "/workspace";
           };
