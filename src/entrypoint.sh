@@ -164,7 +164,7 @@ mkdir -p "$(dirname "$CHROME_WRAPPER")"
 cat >"$CHROME_WRAPPER" <<'WRAPPER'
 #!/bin/bash
 # Self-contained wrapper: sets its own env since agents sanitize child processes.
-export LD_LIBRARY_PATH="/lib:/usr/lib:/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Internal Chrome debugging defaults (isolated to container)
 CHROME_PORT="${CHROME_DEBUG_PORT:-9222}"
@@ -179,19 +179,13 @@ if ! curl -s "$CHROME_URL/json/version" >/dev/null 2>&1; then
     /usr/bin/chromium \
         --headless=new \
         --no-sandbox \
-        --disable-gpu-sandbox \
         --disable-dev-shm-usage \
         --disable-setuid-sandbox \
+        --disable-gpu \
+        --disable-software-rasterizer \
         --disable-blink-features=AutomationControlled \
         --disable-breakpad \
         --noerrdialogs \
-        --enable-gpu \
-        --use-angle=vulkan \
-        --enable-features=Vulkan \
-        --disable-vulkan-surface \
-        --enable-gpu-rasterization \
-        --enable-zero-copy \
-        --ignore-gpu-blocklist \
         --user-agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36" \
         --remote-debugging-address=$CHROME_ADDR \
         --remote-debugging-port=$CHROME_PORT \
@@ -222,7 +216,7 @@ mkdir -p "$MCP_BIN"
 NODE_WRAPPER="$MCP_BIN/node"
 cat <<'NODEW' > "$NODE_WRAPPER"
 #!/bin/bash
-export LD_LIBRARY_PATH="/lib:/usr/lib:/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec /mise/shims/node "$@"
 NODEW
 chmod +x "$NODE_WRAPPER"
@@ -230,7 +224,7 @@ chmod +x "$NODE_WRAPPER"
 NPX_WRAPPER="$MCP_BIN/npx"
 cat <<'NPXW' > "$NPX_WRAPPER"
 #!/bin/bash
-export LD_LIBRARY_PATH="/lib:/usr/lib:/usr/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LD_LIBRARY_PATH="/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 exec /mise/shims/npx "$@"
 NPXW
 chmod +x "$NPX_WRAPPER"

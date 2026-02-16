@@ -415,9 +415,6 @@ def run(
     docker_flags = ["--rm", "-i", "--init", "--name", cname]
     if sys.stdout.isatty():
         docker_flags.append("-t")
-    
-    # Add GPU support
-    docker_flags.extend(["--gpus", "all"])
 
     docker_cmd = [
         "docker", "run", *docker_flags,
@@ -433,14 +430,10 @@ def run(
         "-e", "MISE_TRUST=1",
         "-e", "MISE_YES=1",
         "-e", "COPILOT_ALLOW_ALL=true",
-        "-e", "LD_LIBRARY_PATH=/lib:/usr/lib:/usr/lib64",
-        "-e", "VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json",
-        "-e", "__EGL_VENDOR_LIBRARY_DIRS=/usr/share/glvnd/egl_vendor.d",
+        "-e", "LD_LIBRARY_PATH=/lib:/usr/lib",
         "-e", "HOME=/home/agent",
         "-e", f"YOLO_BLOCK_CONFIG={blocked_config_json}",
         "-e", f"YOLO_HOST_DIR={workspace}",
-        "-e", "NVIDIA_VISIBLE_DEVICES=all",
-        "-e", "NVIDIA_DRIVER_CAPABILITIES=all",
         "-u", f"{os.getuid()}:{os.getgid()}",
         "--workdir", "/workspace",
         f"--net={net_mode}",
