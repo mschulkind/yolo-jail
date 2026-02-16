@@ -52,13 +52,40 @@
             ln -s ${pkgs.glibc}/lib/* $dir/
             ln -s ${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6 $dir/libstdc++.so.6
             ln -s ${pkgs.zlib}/lib/libz.so.1 $dir/libz.so.1
-            # GPU libraries
-            ln -s ${pkgs.mesa}/lib/libEGL*.so* $dir/ 2>/dev/null || true
-            ln -s ${pkgs.mesa}/lib/libGL*.so* $dir/ 2>/dev/null || true
+            # GLVND dispatcher libraries (load vendor-specific GL/EGL at runtime)
+            ln -s ${pkgs.libglvnd}/lib/libEGL.so* $dir/ 2>/dev/null || true
+            ln -s ${pkgs.libglvnd}/lib/libGL.so* $dir/ 2>/dev/null || true
+            ln -s ${pkgs.libglvnd}/lib/libGLESv2.so* $dir/ 2>/dev/null || true
+            ln -s ${pkgs.libglvnd}/lib/libGLX.so* $dir/ 2>/dev/null || true
+            ln -s ${pkgs.libglvnd}/lib/libGLdispatch.so* $dir/ 2>/dev/null || true
+            ln -s ${pkgs.libglvnd}/lib/libOpenGL.so* $dir/ 2>/dev/null || true
+            # Mesa vendor drivers (fallback when no NVIDIA GPU)
+            ln -s ${pkgs.mesa}/lib/libEGL_mesa.so* $dir/ 2>/dev/null || true
+            ln -s ${pkgs.mesa}/lib/libGLX_mesa.so* $dir/ 2>/dev/null || true
             ln -s ${pkgs.mesa}/lib/libgbm*.so* $dir/ 2>/dev/null || true
             ln -s ${pkgs.libdrm}/lib/libdrm*.so* $dir/ 2>/dev/null || true
             ln -s ${pkgs.vulkan-loader}/lib/libvulkan*.so* $dir/ 2>/dev/null || true
           done
+
+          # EGL vendor config for NVIDIA (GLVND uses this to find libEGL_nvidia.so)
+          mkdir -p $out/usr/share/glvnd/egl_vendor.d
+          cat > $out/usr/share/glvnd/egl_vendor.d/10_nvidia.json <<EOF
+          {
+              "file_format_version" : "1.0.0",
+              "ICD" : {
+                  "library_path" : "libEGL_nvidia.so.0"
+              }
+          }
+          EOF
+          # Mesa EGL vendor (lower priority fallback)
+          cat > $out/usr/share/glvnd/egl_vendor.d/50_mesa.json <<EOF
+          {
+              "file_format_version" : "1.0.0",
+              "ICD" : {
+                  "library_path" : "libEGL_mesa.so.0"
+              }
+          }
+          EOF
         '';
 
         # Derivation for the entrypoint
@@ -127,10 +154,10 @@
             pkgs.delta
             pkgs.fzf
             # GPU acceleration libraries
+            pkgs.libglvnd   # GL Vendor-Neutral Dispatch (libEGL.so.1, libGL.so.1)
             pkgs.mesa
             pkgs.libdrm
             pkgs.vulkan-loader
-            pkgs.vulkan-headers
           ] ++ extraPackages;
 
           config = {
@@ -139,7 +166,7 @@
             Env = [ 
               "PATH=${shims}/bin:/bin:/usr/bin" 
               "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-              "LD_LIBRARY_PATH=/lib:/usr/lib"
+              "LD_LIBRARY_PATH=/lib:/usr/lib:/usr/lib64"
             ];
             WorkingDir = "/workspace";
           };
