@@ -439,6 +439,30 @@ def run(
         f"--net={net_mode}",
     ]
     
+    # Pass git name/email from host for clean commits inside jail
+    # (We don't mount ~/.gitconfig to avoid exposing credentials/tokens)
+    try:
+        import subprocess
+        git_name = subprocess.check_output(
+            ["git", "config", "--get", "user.name"],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        if git_name:
+            docker_cmd.extend(["-e", f"YOLO_GIT_NAME={git_name}"])
+    except Exception:
+        pass
+    
+    try:
+        import subprocess
+        git_email = subprocess.check_output(
+            ["git", "config", "--get", "user.email"],
+            stderr=subprocess.DEVNULL
+        ).decode().strip()
+        if git_email:
+            docker_cmd.extend(["-e", f"YOLO_GIT_EMAIL={git_email}"])
+    except Exception:
+        pass
+    
     docker_cmd.extend(publish_args)
     docker_cmd.extend(mount_args)
 

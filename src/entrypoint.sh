@@ -235,6 +235,19 @@ exec /mise/shims/npx "$@"
 NPXW
 chmod +x "$NPX_WRAPPER"
 
+# Git Config — set name/email from host if available (for clean commits)
+# We don't mount ~/.gitconfig to avoid exposing credentials/tokens,
+# but we still want basic git identity for commits made inside the jail
+if command -v git &>/dev/null; then
+    # Extract name and email from host git config (passed via env from cli.py)
+    if [ -n "$YOLO_GIT_NAME" ]; then
+        git config --global user.name "$YOLO_GIT_NAME"
+    fi
+    if [ -n "$YOLO_GIT_EMAIL" ]; then
+        git config --global user.email "$YOLO_GIT_EMAIL"
+    fi
+fi
+
 # Copilot Config — use ~/.copilot directly (no XDG indirection)
 COPILOT_CONFIG_DIR="$AGENT_HOME/.copilot"
 
