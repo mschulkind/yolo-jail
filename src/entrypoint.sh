@@ -292,8 +292,17 @@ mcp_path = os.path.join(config_dir, 'mcp-config.json')
 mcp_config = {
     'mcpServers': {
         'chrome-devtools': {
-            'command': os.path.join(home, '.local/bin/chrome-devtools-mcp-wrapper'),
-            'args': []
+            'command': os.path.join(mcp_wrappers_bin, 'node'),
+            'args': [
+                os.path.join(npm_bin, 'chrome-devtools-mcp'),
+                '--headless',
+                '--executablePath', '/usr/bin/chromium',
+                '--chrome-arg=--no-sandbox',
+                '--chrome-arg=--disable-dev-shm-usage',
+                '--chrome-arg=--disable-setuid-sandbox',
+                '--chrome-arg=--disable-gpu',
+                '--chrome-arg=--disable-software-rasterizer',
+            ]
         },
         'sequential-thinking': {
             'command': os.path.join(mcp_wrappers_bin, 'node'),
@@ -349,8 +358,17 @@ default_config = {
     'security': {'approvalMode': 'yolo', 'enablePermanentToolApproval': True},
     'mcpServers': {
         'chrome-devtools': {
-            'command': os.path.join(home, '.local/bin/chrome-devtools-mcp-wrapper'),
-            'args': []
+            'command': os.path.join(mcp_wrappers_bin, 'node'),
+            'args': [
+                os.path.join(npm_bin, 'chrome-devtools-mcp'),
+                '--headless',
+                '--executablePath', '/usr/bin/chromium',
+                '--chrome-arg=--no-sandbox',
+                '--chrome-arg=--disable-dev-shm-usage',
+                '--chrome-arg=--disable-setuid-sandbox',
+                '--chrome-arg=--disable-gpu',
+                '--chrome-arg=--disable-software-rasterizer',
+            ]
         },
         'sequential-thinking': {
             'command': os.path.join(mcp_wrappers_bin, 'node'),

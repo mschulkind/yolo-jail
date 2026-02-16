@@ -64,7 +64,7 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
 - **Common MCP Errors**:
   - `libstdc++.so.6: cannot open shared object file`: Node wrapper not used or `LD_LIBRARY_PATH` stripped. Check MCP config uses `/home/agent/.local/bin/mcp-wrappers/node`. The chrome-devtools wrapper sets its own `LD_LIBRARY_PATH` to be self-contained.
   - `Cannot find module '/bin/chrome-devtools-mcp'`: The chrome wrapper failed to resolve NPM_CONFIG_PREFIX. This means `$HOME` or `$NPM_CONFIG_PREFIX` wasn't set in the spawned environment.
-  - `Protocol error (Target.setDiscoverTargets): Target closed`: Chrome DevTools MCP failed to connect to Chromium. Check Chromium is running, port 9222 is accessible, and wrapper flags are correct.
+  - `Protocol error (Target.setDiscoverTargets): Target closed`: Chrome DevTools MCP failed to launch Chromium. Check `/usr/bin/chromium` exists and Docker has `--shm-size=2g`.
   - `Connection closed`: MCP server crashed or failed to start. Check server binary is installed (`npm list -g` inside jail).
   - `argument list too long`: Shim conflict or PATH issue. Check `.local/bin/` is not in PATH (should only be used by absolute MCP paths).
 - **Config Locations**:
@@ -72,7 +72,7 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
   - **Gemini**: `~/.gemini/settings.json` (all config including MCP/LSP).
 - **Workspace MCP Shadowing**: The CLI shadows any workspace `.vscode/mcp.json` with `/dev/null` inside the jail so agents only use the jail's MCP config. Host VS Code MCP configs won't interfere.
 - **Chromium Stability**: Headless Chromium in Docker is brittle. 
-    - **Connect Mode**: Chrome DevTools MCP uses a wrapper script (`~/.local/bin/chrome-devtools-mcp-wrapper`) that pre-launches Chromium with `--remote-debugging-port` and connects via `--browser-url`. This avoids pipe-mode fd conflicts when MCP servers are spawned by agents.
+    - **Launch Mode**: Chrome DevTools MCP launches Chromium directly via Puppeteer's `pipe: true` mode with `--headless --executablePath /usr/bin/chromium`. Docker-required flags (`--no-sandbox`, `--disable-dev-shm-usage`, etc.) are passed via `--chrome-arg=...`.
     - **Required Chrome Flags**: `--no-sandbox`, `--disable-setuid-sandbox`, `--disable-dev-shm-usage`, `--disable-gpu`, `--disable-software-rasterizer`.
     - **Docker**: Use `--shm-size=2g` in the Docker run command for adequate shared memory.
     - **Binary Discovery**: Always use absolute paths (e.g., `/usr/bin/chromium`) in MCP configs.
@@ -84,7 +84,7 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
     - **Testing**: To verify LSP works, ask the agent to analyze a file with type errors: `@file.py check for type errors`.
     - **TypeScript Requirements**: TypeScript LSP requires a `tsconfig.json` or `jsconfig.json` in the workspace root. Without it, typescript-language-server throws `ThrowNoProject` errors. Python LSP (pyright) works without configuration.
 - **Node Wrappers**: `~/.local/bin/mcp-wrappers/node` and `npx` are wrapper scripts that set `LD_LIBRARY_PATH` before calling the mise-installed binary. MCP configs use absolute paths to these wrappers. Required because agents may sanitize the environment when spawning MCP child processes, stripping `LD_LIBRARY_PATH` which mise-installed node needs to find `libstdc++.so.6`.
-- **Self-Contained Wrappers**: All MCP wrapper scripts (chrome-devtools, node, npx) set their own `LD_LIBRARY_PATH` and use `$HOME`-relative paths instead of calling `npm config` at runtime. This ensures they work even when agents sanitize the environment. Never use `subprocess` or `npm config get` in wrapper scripts.
+- **Self-Contained Wrappers**: MCP wrapper scripts (node, npx) set their own `LD_LIBRARY_PATH` and use `$HOME`-relative paths instead of calling `npm config` at runtime. This ensures they work even when agents sanitize the environment. Never use `subprocess` or `npm config get` in wrapper scripts.
 
 ### Tool Management
 - **Mise**: All runtimes (Node, Python, Go) are managed by `mise`. 
@@ -97,7 +97,6 @@ This project provides a secure, isolated Docker environment for AI agents (Gemin
     - NPM Globals: `/home/agent/.npm-global/bin/`
     - Go Binaries: `/home/agent/go/bin/`
     - MCP Node Wrappers: `/home/agent/.local/bin/mcp-wrappers/`
-    - Chrome Wrapper: `/home/agent/.local/bin/chrome-devtools-mcp-wrapper`
 - **PATH Order**: `${SHIM_DIR}:/home/agent/.npm-global/bin:/home/agent/go/bin:/mise/shims:/bin:/usr/bin`.
 
 ### Environment Hygiene
