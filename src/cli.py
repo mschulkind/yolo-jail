@@ -480,6 +480,16 @@ def run(
     if runtime == "docker":
         docker_cmd.extend(["-u", f"{os.getuid()}:{os.getgid()}"])
 
+    # Podman: enable nested container support (rootless podman-in-podman)
+    if runtime == "podman":
+        docker_cmd.extend([
+            "--security-opt", "label=disable",
+            "--device", "/dev/fuse",
+            "--uidmap", "0:0:1", "--uidmap", "1:1:65536",
+            "--gidmap", "0:0:1", "--gidmap", "1:1:65536",
+            "--cap-add", "SYS_ADMIN", "--cap-add", "MKNOD",
+        ])
+
     # Podman rootless uses pasta networking by default (no nftables needed).
     # Only pass --net explicitly for non-default modes like "host".
     if net_mode != "bridge" or runtime == "docker":

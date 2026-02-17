@@ -70,6 +70,8 @@
 
           cat > $out/etc/containers/containers.conf <<CONTAINERS
           [containers]
+          cgroups = "disabled"
+          default_sysctls = []
           [network]
           default_rootless_network_cmd = "slirp4netns"
           [engine]
