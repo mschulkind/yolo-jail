@@ -1,7 +1,0 @@
-#!/bin/sh
-if [ -z "$YOLO_BYPASS_SHIMS" ]; then
-  echo "find is blocked to prevent unintended recursive searches. Use fd for a faster, more intuitive alternative." >&2
-  [ -n "Try: fd <pattern>" ] && echo "Suggestion: Try: fd <pattern>" >&2
-  exit 127
-fi
-exec /bin/find "$@"

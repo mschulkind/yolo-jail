@@ -1,7 +1,0 @@
-#!/bin/sh
-if [ -z "$YOLO_BYPASS_SHIMS" ]; then
-  echo "grep is blocked to prevent unintended recursive searches. Use ripgrep (rg) or other targeted tools." >&2
-  [ -n "Try: rg <pattern> [file]" ] && echo "Suggestion: Try: rg <pattern> [file]" >&2
-  exit 127
-fi
-exec /bin/grep "$@"

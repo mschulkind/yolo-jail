@@ -6,3 +6,4 @@ result
 .venv/
 trash/
 tests/__pycache__/
+.yolo/
