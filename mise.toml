@@ -2,5 +2,6 @@
 node = "22"
 python = "3.13"
 go = "latest"
+uv = "latest"
 "npm:@google/gemini-cli" = "latest"
 "npm:@github/copilot" = "latest"
