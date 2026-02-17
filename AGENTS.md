@@ -35,6 +35,10 @@ This project provides a secure, isolated container environment for AI agents (Ge
 
 ## Developer Runbook
 
+### Testing
+- **Host**: `uv run pytest tests/` — all tests run (unit + integration).
+- **Inside Jail**: Tests marked `@pytest.mark.container` auto-skip because spawning containers inside a container (triply-nested) fails on `/proc` mount permissions. Unit tests (config merge, runtime logic) still pass. This is detected via `/run/.containerenv` (podman) or `/.dockerenv` (docker).
+
 ### First Run vs Subsequent Runs
 - **First Run**: When you run `yolo -- <command>`, the jail entrypoint automatically provisions all tools:
   1. Builds the Docker image via `nix build --impure` (if config changed)

@@ -481,14 +481,27 @@ def run(
         docker_cmd.extend(["-u", f"{os.getuid()}:{os.getgid()}"])
 
     # Podman: enable nested container support (rootless podman-in-podman)
+    # When running on the host, use UID/GID mapping to create a user namespace.
+    # When already inside a container, share the parent's user namespace instead
+    # to avoid kernel restrictions on doubly-nested user namespaces.
     if runtime == "podman":
-        docker_cmd.extend([
-            "--security-opt", "label=disable",
-            "--device", "/dev/fuse",
-            "--uidmap", "0:0:1", "--uidmap", "1:1:65536",
-            "--gidmap", "0:0:1", "--gidmap", "1:1:65536",
-            "--cap-add", "SYS_ADMIN", "--cap-add", "MKNOD",
-        ])
+        in_container = Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
+        
+        if in_container:
+            # Inside a container: share parent's user namespace
+            docker_cmd.extend([
+                "--security-opt", "label=disable",
+                "--userns", "host",
+            ])
+        else:
+            # On host: create user namespace with UID/GID mapping for nesting
+            docker_cmd.extend([
+                "--security-opt", "label=disable",
+                "--device", "/dev/fuse",
+                "--uidmap", "0:0:1", "--uidmap", "1:1:65536",
+                "--gidmap", "0:0:1", "--gidmap", "1:1:65536",
+                "--cap-add", "SYS_ADMIN", "--cap-add", "MKNOD",
+            ])
 
     # Mount host nix daemon socket + store so nix builds work inside the jail.
     # NIX_REMOTE=daemon forces nix to use the host daemon (which has nixbld users)

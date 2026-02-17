@@ -5,3 +5,4 @@ result
 .direnv/
 .venv/
 trash/
+tests/__pycache__/
