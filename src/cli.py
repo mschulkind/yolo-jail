@@ -163,7 +163,8 @@ def generate_agents_md(
 
 def auto_load_image(repo_root: Path, extra_packages: List[str] = None, runtime: str = "docker"):
     """Cheaply check if the nix image needs to be reloaded into the container runtime."""
-    sentinel = repo_root / ".last-load"
+    # Per-runtime sentinel so docker and podman each track their own loaded image
+    sentinel = repo_root / f".last-load-{runtime}"
     
     # 1. Build the image (cheap if no changes)
     build_env = os.environ.copy()

@@ -1,6 +1,7 @@
 result
 .run-result
 .last-load
+.last-load-*
 .direnv/
 .venv/
 trash/
