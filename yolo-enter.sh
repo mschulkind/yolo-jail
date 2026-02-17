@@ -29,12 +29,25 @@ if [ -n "$TMUX" ] && [ -t 0 ]; then
     tmux set-option -pt "$_TMUX_PANE" pane-border-status bottom 2>/dev/null
     tmux set-option -pt "$_TMUX_PANE" pane-border-format " 🔒 JAIL $_JAIL_DIR " 2>/dev/null
 
+    # Set tmux window name to show JAIL in status bar
+    _OLD_WINDOW_NAME=$(tmux display-message -p '#{window_name}' 2>/dev/null)
+    _OLD_AUTO_RENAME=$(tmux show-window-option -v automatic-rename 2>/dev/null)
+    tmux set-window-option automatic-rename off 2>/dev/null
+    tmux rename-window "JAIL $_JAIL_DIR" 2>/dev/null
+
     _restore_border() {
         # Restore all saved options
         [ -n "$_OLD_BORDER" ] && eval "tmux $_OLD_BORDER -pt '$_TMUX_PANE'" 2>/dev/null || tmux set-option -put "$_TMUX_PANE" pane-border-style 2>/dev/null
         [ -n "$_OLD_ACTIVE" ] && eval "tmux $_OLD_ACTIVE -pt '$_TMUX_PANE'" 2>/dev/null || tmux set-option -put "$_TMUX_PANE" pane-active-border-style 2>/dev/null
         [ -n "$_OLD_BSTATUS" ] && eval "tmux $_OLD_BSTATUS -pt '$_TMUX_PANE'" 2>/dev/null || tmux set-option -put "$_TMUX_PANE" pane-border-status 2>/dev/null
         [ -n "$_OLD_BFORMAT" ] && eval "tmux $_OLD_BFORMAT -pt '$_TMUX_PANE'" 2>/dev/null || tmux set-option -put "$_TMUX_PANE" pane-border-format 2>/dev/null
+        # Restore window name
+        if [ -n "$_OLD_WINDOW_NAME" ]; then
+            tmux rename-window "$_OLD_WINDOW_NAME" 2>/dev/null
+        fi
+        if [ "$_OLD_AUTO_RENAME" = "on" ]; then
+            tmux set-window-option automatic-rename on 2>/dev/null
+        fi
     }
     trap _restore_border EXIT
 fi

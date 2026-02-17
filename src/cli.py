@@ -14,7 +14,7 @@ app = typer.Typer()
 
 JAIL_IMAGE = "yolo-jail:latest"
 GLOBAL_STORAGE = Path.home() / ".local/share/yolo-jail"
-GLOBAL_HOME = GLOBAL_STORAGE / "home"
+GLOBAL_TOOLS = GLOBAL_STORAGE / "tools"
 GLOBAL_MISE = GLOBAL_STORAGE / "mise"
 CONTAINER_DIR = GLOBAL_STORAGE / "containers"
 AGENTS_DIR = GLOBAL_STORAGE / "agents"
@@ -26,10 +26,30 @@ from rich.status import Status
 console = Console()
 
 def ensure_global_storage():
-    GLOBAL_HOME.mkdir(parents=True, exist_ok=True)
+    GLOBAL_TOOLS.mkdir(parents=True, exist_ok=True)
     GLOBAL_MISE.mkdir(parents=True, exist_ok=True)
+    # Shared tool subdirectories
+    (GLOBAL_TOOLS / "npm-global").mkdir(exist_ok=True)
+    (GLOBAL_TOOLS / "go").mkdir(exist_ok=True)
+    (GLOBAL_TOOLS / "mcp-wrappers").mkdir(exist_ok=True)
     CONTAINER_DIR.mkdir(parents=True, exist_ok=True)
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Migrate from old shared home layout to new per-workspace layout
+    old_home = GLOBAL_STORAGE / "home"
+    if old_home.exists() and not (GLOBAL_TOOLS / "npm-global" / "bin").exists():
+        for subdir in [".npm-global", "go"]:
+            src = old_home / subdir
+            dst = GLOBAL_TOOLS / subdir.lstrip(".")
+            if src.exists() and not any(dst.iterdir()):
+                for item in src.iterdir():
+                    shutil.move(str(item), str(dst / item.name))
+        # Migrate mcp-wrappers
+        src = old_home / ".local" / "bin" / "mcp-wrappers"
+        dst = GLOBAL_TOOLS / "mcp-wrappers"
+        if src.exists() and not any(dst.iterdir()):
+            for item in src.iterdir():
+                shutil.move(str(item), str(dst / item.name))
 
 
 def _runtime(config: Dict[str, Any] = None) -> str:
@@ -311,6 +331,17 @@ def init():
         f.write(content)
     typer.echo("Created yolo-jail.jsonc")
 
+    # Add .yolo/ to .gitignore if not already present
+    gitignore = Path.cwd() / ".gitignore"
+    if gitignore.exists():
+        text = gitignore.read_text()
+        if ".yolo/" not in text:
+            with open(gitignore, "a") as f:
+                f.write("\n# YOLO Jail workspace state\n.yolo/\n")
+    else:
+        with open(gitignore, "w") as f:
+            f.write("# YOLO Jail workspace state\n.yolo/\n")
+
 @app.command("init-user-config")
 def init_user_config():
     """Initialize a user-level config at ~/.config/yolo-jail/config.jsonc."""
@@ -455,10 +486,18 @@ def run(
     if sys.stdout.isatty():
         docker_flags.append("-t")
 
+    # Per-workspace home directory (isolated state: history, configs, sessions)
+    workspace_home = workspace / ".yolo" / "home"
+    workspace_home.mkdir(parents=True, exist_ok=True)
+
     docker_cmd = [
         runtime, "run", *docker_flags,
         "-v", f"{workspace}:/workspace",
-        "-v", f"{GLOBAL_HOME}:/home/agent",
+        "-v", f"{workspace_home}:/home/agent",
+        # Shared tool directories overlaid into per-workspace home
+        "-v", f"{GLOBAL_TOOLS / 'npm-global'}:/home/agent/.npm-global",
+        "-v", f"{GLOBAL_TOOLS / 'go'}:/home/agent/go",
+        "-v", f"{GLOBAL_TOOLS / 'mcp-wrappers'}:/home/agent/.local/bin/mcp-wrappers",
         "-v", f"{GLOBAL_MISE}:/mise",
         "--tmpfs", "/tmp",
         "--shm-size=2g",
@@ -480,13 +519,14 @@ def run(
     if runtime == "docker":
         docker_cmd.extend(["-u", f"{os.getuid()}:{os.getgid()}"])
 
+    # Detect if we're already inside a container
+    in_container = Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
+
     # Podman: enable nested container support (rootless podman-in-podman)
     # When running on the host, use UID/GID mapping to create a user namespace.
     # When already inside a container, share the parent's user namespace instead
     # to avoid kernel restrictions on doubly-nested user namespaces.
     if runtime == "podman":
-        in_container = Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
-        
         if in_container:
             # Inside a container: share parent's user namespace
             docker_cmd.extend([
@@ -517,7 +557,11 @@ def run(
 
     # Podman rootless uses pasta networking by default (no nftables needed).
     # Only pass --net explicitly for non-default modes like "host".
-    if net_mode != "bridge" or runtime == "docker":
+    # Inside a container, always use host networking (netavark can't create
+    # network namespaces without NET_ADMIN).
+    if runtime == "podman" and in_container:
+        docker_cmd.append("--net=host")
+    elif net_mode != "bridge" or runtime == "docker":
         docker_cmd.append(f"--net={net_mode}")
     
     # Pass git name/email from host for clean commits inside jail
