@@ -54,6 +54,36 @@
             ln -s ${pkgs.stdenv.cc.cc.lib}/lib/libstdc++.so.6 $dir/libstdc++.so.6
             ln -s ${pkgs.zlib}/lib/libz.so.1 $dir/libz.so.1
           done
+
+          # Podman nested container support
+          echo "root:100000:65536" > $out/etc/subuid
+          echo "root:100000:65536" > $out/etc/subgid
+
+          # Podman storage config for rootless operation
+          mkdir -p $out/etc/containers
+          cat > $out/etc/containers/storage.conf <<STORAGE
+          [storage]
+          driver = "overlay"
+          [storage.options.overlay]
+          mount_program = "${pkgs.fuse-overlayfs}/bin/fuse-overlayfs"
+          STORAGE
+
+          cat > $out/etc/containers/containers.conf <<CONTAINERS
+          [containers]
+          [network]
+          default_rootless_network_cmd = "slirp4netns"
+          [engine]
+          cgroup_manager = "cgroupfs"
+          events_logger = "file"
+          CONTAINERS
+
+          cat > $out/etc/containers/policy.json <<POLICY
+          {"default":[{"type":"insecureAcceptAnything"}]}
+          POLICY
+
+          cat > $out/etc/containers/registries.conf <<REGISTRIES
+          unqualified-search-registries = ["docker.io"]
+          REGISTRIES
         '';
 
         # Derivation for the entrypoint
@@ -121,7 +151,22 @@
             pkgs.eza
             pkgs.delta
             pkgs.fzf
+            pkgs.nix          # For building nix images inside jail
+            pkgs.podman       # For nested container support
+            pkgs.fuse-overlayfs  # Storage driver for rootless podman
+            pkgs.slirp4netns  # Rootless networking for nested podman
+            pkgs.shadow       # newuidmap/newgidmap for user namespace mapping
           ] ++ extraPackages;
+
+          # Create directories needed by nested podman and general operation
+          fakeRootCommands = ''
+            mkdir -p ./var/tmp ./run ./var/lib/containers
+
+            # Podman needs /etc/passwd and /etc/group
+            echo 'root:x:0:0:root:/root:/bin/bash' > ./etc/passwd
+            echo 'root:x:0:' > ./etc/group
+            echo 'nixbld:x:30000:' >> ./etc/group
+          '';
 
           config = {
             Cmd = [ "/bin/bash" ];
