@@ -75,8 +75,7 @@ export PS1="\n${JAIL_BANNER} ${HOST_INFO}\n${GREEN}jail${NC}:${BLUE}\w${NC}\$ "
 
 # Set PROMPT_COMMAND to update tmux window title on every prompt
 # This overrides tmux's automatic-rename which shows process names
-_JAIL_DIR="$(basename "${YOLO_HOST_DIR:-/workspace}")"
-export PROMPT_COMMAND='printf "\033]0;JAIL '"$_JAIL_DIR"'\033\\"'
+export PROMPT_COMMAND='printf "\033]0;JAIL\033\\"'
 
 # Initialize font cache for Chromium
 fc-cache -f >/dev/null 2>&1
