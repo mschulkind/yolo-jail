@@ -153,11 +153,11 @@ def test_venv_symlinks_resolve(temp_project):
     if not installs.exists():
         pytest.skip("No mise python installs found")
 
-    versions = [d for d in installs.iterdir() if d.is_dir() and (d / "bin").exists()]
+    versions = [d for d in installs.iterdir() if d.is_dir() and not d.is_symlink() and (d / "bin").exists()]
     if not versions:
         pytest.skip("No mise python installs found")
 
-    # Pick the first version and create a fake .venv symlink pointing to it
+    # Pick the first concrete version dir (not a symlink like "3" → "3.13.12")
     version_dir = versions[0]
     # Find a real python interpreter (not python*-config)
     python_bin = None
@@ -191,7 +191,7 @@ def test_mise_venv_activation(tmp_path):
     assert ".venv" in result.stdout
 
 
-
+def test_vscode_mcp_shadowed(temp_project):
     """Test that workspace .vscode/mcp.json is shadowed with /dev/null inside jail."""
     vscode_dir = temp_project / ".vscode"
     vscode_dir.mkdir()
