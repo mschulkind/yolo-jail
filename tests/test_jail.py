@@ -172,8 +172,11 @@ def test_venv_symlinks_resolve(temp_project):
     venv_dir.mkdir(parents=True)
     (venv_dir / "python").symlink_to(python_bin)
 
+    # Debug: check what the inner jail sees
+    diag = run_yolo(temp_project, f"readlink /workspace/.venv/bin/python && ls -la {python_bin} && file {python_bin}")
+
     result = run_yolo(temp_project, "/workspace/.venv/bin/python --version")
-    assert result.returncode == 0
+    assert result.returncode == 0, f"symlink target: {python_bin}, diag stdout: {diag.stdout}, diag stderr: {diag.stderr}, stderr: {result.stderr}, stdout: {result.stdout}"
     assert "Python" in result.stdout
 
 
