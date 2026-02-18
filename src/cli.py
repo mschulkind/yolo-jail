@@ -511,12 +511,9 @@ def run(
             cname,
             "yolo-entrypoint", target_cmd,
         ]
-        try:
-            os.execvp(runtime, docker_cmd)
-        except FileNotFoundError:
-            typer.echo(f"Error: {runtime} command not found.", err=True)
-            sys.exit(1)
-        return
+        # Use subprocess.run (not execvp) so atexit handlers fire for tmux cleanup
+        result = subprocess.run(docker_cmd)
+        sys.exit(result.returncode)
 
     # No existing container — build/load the image then start a new one.
     extra_packages = config.get("packages", [])
@@ -759,19 +756,17 @@ def run(
     # If mise.toml exists in workspace, trust it.
     # Then ensure all tools (global + local) are ready.
     setup_script = "YOLO_BYPASS_SHIMS=1 sh -c '(if [ -f mise.toml ]; then mise trust; fi) && mise install && mise upgrade && ~/.yolo-bootstrap.sh'"
-    final_internal_cmd = f"{setup_script} >/dev/null 2>&1; {target_cmd}"
+    # After setup, activate mise so tool paths (copilot, gemini, etc.) are in PATH
+    final_internal_cmd = f"{setup_script} >/dev/null 2>&1; eval \"$(mise hook-env -s bash)\" 2>/dev/null; {target_cmd}"
     
     docker_cmd.append(final_internal_cmd)
 
-    # Write tracking file before exec (since execvp replaces our process)
     write_container_tracking(cname, workspace)
     _tmux_rename_window("JAIL")
 
-    try:
-        os.execvp(runtime, docker_cmd)
-    except FileNotFoundError:
-        typer.echo(f"Error: {runtime} command not found.", err=True)
-        sys.exit(1)
+    # Use subprocess.run (not execvp) so atexit handlers fire for tmux cleanup
+    result = subprocess.run(docker_cmd)
+    sys.exit(result.returncode)
 
 
 @app.command()
