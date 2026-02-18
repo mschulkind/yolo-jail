@@ -607,11 +607,14 @@ def run(
     if vscode_mcp.exists():
         docker_cmd.extend(["-v", "/dev/null:/workspace/.vscode/mcp.json:ro"])
 
-    # Mount host mise at its original path so .venv symlinks created on host resolve inside jail
-    # Skip if it's already mounted (e.g., when running from inside the jail)
-    host_mise = Path(os.environ.get("MISE_DATA_DIR", str(Path.home() / ".local/share/mise")))
+    # Mount host mise at its original path so .venv symlinks created on host resolve inside jail.
+    # When nested, pass the path as an env var so inner jails can re-mount it.
+    host_mise = Path(os.environ.get("YOLO_OUTER_MISE_PATH") or os.environ.get("MISE_DATA_DIR", str(Path.home() / ".local/share/mise")))
     if host_mise.exists() and str(host_mise) != "/mise":
-        docker_cmd.extend(["-v", f"{host_mise}:{host_mise}:ro"])
+        docker_cmd.extend([
+            "-v", f"{host_mise}:{host_mise}:ro",
+            "-e", f"YOLO_OUTER_MISE_PATH={host_mise}",
+        ])
 
     # Mount host user-level copilot/gemini skills so they're available in the jail
     host_gemini_skills = Path.home() / ".gemini" / "skills"
