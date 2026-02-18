@@ -91,7 +91,10 @@ export EDITOR=nvim
 export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.npm-global}"
 export GOPATH="${GOPATH:-$HOME/go}"
 SHIM_DIR="${HOME}/.yolo-shims"
-export PATH="$SHIM_DIR:$NPM_CONFIG_PREFIX/bin:$GOPATH/bin:/mise/shims:/bin:/usr/bin"
+export PATH="$SHIM_DIR:$NPM_CONFIG_PREFIX/bin:$GOPATH/bin:/bin:/usr/bin"
+
+# Activate mise with shell hooks so it can manage venvs, env vars, etc.
+eval "$(mise activate bash)"
 
 # Aliases
 alias ls='ls --color=auto'
@@ -433,7 +436,8 @@ except Exception as e:
 "
 
 # 7. Ensure PATH has shims, npm-global, go bins (already set by bashrc, but also here for safety)
-export PATH="$SHIM_DIR:$NPM_CONFIG_PREFIX/bin:$GOPATH/bin:/mise/shims:/bin:/usr/bin"
+export PATH="$SHIM_DIR:$NPM_CONFIG_PREFIX/bin:$GOPATH/bin:/bin:/usr/bin"
+eval "$(mise activate bash)"
 
 # 8. AGENTS.md is generated host-side by cli.py and mounted per-workspace
 #    (no longer generated here — avoids shared-home conflicts between jails)

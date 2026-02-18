@@ -174,7 +174,21 @@ def test_venv_symlinks_resolve(temp_project):
     assert "Python" in result.stdout
 
 
-def test_vscode_mcp_shadowed(temp_project):
+def test_mise_venv_activation(tmp_path):
+    """Test that mise.toml with _.python.venv activates the venv automatically."""
+    project_dir = tmp_path / "venv_test"
+    project_dir.mkdir()
+
+    with open(project_dir / "mise.toml", "w") as f:
+        f.write('[tools]\npython = "3"\n\n[env]\n_.python.venv = { path = ".venv", create = true }\n')
+
+    # python should be the venv python, with VIRTUAL_ENV set
+    result = run_yolo(project_dir, "echo $VIRTUAL_ENV")
+    assert result.returncode == 0
+    assert ".venv" in result.stdout
+
+
+
     """Test that workspace .vscode/mcp.json is shadowed with /dev/null inside jail."""
     vscode_dir = temp_project / ".vscode"
     vscode_dir.mkdir()
