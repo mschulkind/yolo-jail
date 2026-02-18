@@ -73,13 +73,11 @@ HOST_INFO="${CYAN}(host: ${YOLO_HOST_DIR:-unknown})${NC}"
 
 export PS1="\n${JAIL_BANNER} ${HOST_INFO}\n${GREEN}jail${NC}:${BLUE}\w${NC}\$ "
 
-# Set tmux window title to JAIL and disable automatic-rename so tmux doesn't
-# append the process/directory name after our title.
-if [ -n "$TMUX" ]; then
-    tmux set-window-option automatic-rename off
-    tmux rename-window "JAIL"
-fi
-export PROMPT_COMMAND='printf "\033]0;JAIL\033\\"'
+# Set tmux window name via both the standard xterm title sequence and the
+# tmux/screen-specific window-name sequence (\033k...\033\\).
+# The screen sequence tells tmux to lock the window name and suppresses automatic-rename.
+# $TMUX is not set inside the container so we can't use tmux commands directly.
+export PROMPT_COMMAND='printf "\033]0;JAIL\033\\" && printf "\033kJAIL\033\\"'
 
 # Initialize font cache for Chromium
 fc-cache -f >/dev/null 2>&1
