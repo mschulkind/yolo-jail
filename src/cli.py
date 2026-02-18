@@ -162,7 +162,7 @@ def generate_agents_md(
         "- **No pagers**: PAGER=cat, GIT_PAGER=cat. Do not pipe to less/more.",
         "- **Read-only mounts**: Context mounts under `/ctx/` are read-only.",
         "- **No sudo/root**: You run as a mapped host user with no privilege escalation.",
-        "- Authenticate with `gh auth login` if you need GitHub access.",
+        "- **No git push/pull**: No GitHub credentials are available. Do not attempt `gh auth login` or SSH-based git operations.",
         "",
     ])
 
