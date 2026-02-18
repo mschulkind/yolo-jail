@@ -674,7 +674,6 @@ def run(
     # Pass git name/email from host for clean commits inside jail
     # (We don't mount ~/.gitconfig to avoid exposing credentials/tokens)
     try:
-        import subprocess
         git_name = subprocess.check_output(
             ["git", "config", "--get", "user.name"],
             stderr=subprocess.DEVNULL
@@ -685,7 +684,6 @@ def run(
         pass
     
     try:
-        import subprocess
         git_email = subprocess.check_output(
             ["git", "config", "--get", "user.email"],
             stderr=subprocess.DEVNULL
@@ -698,7 +696,6 @@ def run(
     # Propagate host global gitignore into the jail
     # (We don't mount ~/.gitconfig to avoid credential leaks, but gitignore is safe)
     try:
-        import subprocess
         excludes_file = subprocess.check_output(
             ["git", "config", "--global", "--get", "core.excludesFile"],
             stderr=subprocess.DEVNULL

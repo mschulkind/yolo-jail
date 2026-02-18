@@ -62,10 +62,12 @@ def test_skip_image_load_when_container_running(tmp_path, monkeypatch):
     import sys
     sys.path.insert(0, str(REPO_ROOT / "src"))
     import cli
-    from unittest.mock import patch
+    from unittest.mock import patch, MagicMock
 
     monkeypatch.chdir(tmp_path)
     image_load_called = []
+    fake_proc = MagicMock()
+    fake_proc.returncode = 0
 
     with patch.object(cli, "auto_load_image", side_effect=lambda *a, **k: image_load_called.append(True)), \
          patch.object(cli, "find_running_container", return_value="abc123def456"), \
@@ -73,11 +75,51 @@ def test_skip_image_load_when_container_running(tmp_path, monkeypatch):
          patch.object(cli, "ensure_global_storage"), \
          patch.object(cli, "_runtime", return_value="docker"), \
          patch.object(cli, "_tmux_rename_window"), \
-         patch("os.execvp", side_effect=SystemExit(0)):
+         patch.object(cli.subprocess, "run", return_value=fake_proc):
         from typer.testing import CliRunner
-        CliRunner().invoke(cli.app, ["run"])
+        try:
+            CliRunner().invoke(cli.app, ["run"], catch_exceptions=False)
+        except SystemExit:
+            pass
 
     assert not image_load_called, "auto_load_image must not be called when a container is already running"
+
+
+def test_exec_path_no_unbound_errors(tmp_path, monkeypatch):
+    """The exec-into-existing-container path must not raise UnboundLocalError.
+
+    Regression test: local `import subprocess` inside run() caused
+    subprocess to be treated as a local variable, making it unbound
+    when accessed before the import statement.
+    """
+    import sys
+    sys.path.insert(0, str(REPO_ROOT / "src"))
+    import cli
+    from unittest.mock import patch, MagicMock
+
+    monkeypatch.chdir(tmp_path)
+    fake_proc = MagicMock()
+    fake_proc.returncode = 0
+    exec_args = []
+
+    def capture_run(cmd, **kwargs):
+        exec_args.append(cmd)
+        return fake_proc
+
+    with patch.object(cli, "find_running_container", return_value="abc123def456"), \
+         patch.object(cli, "load_config", return_value={}), \
+         patch.object(cli, "ensure_global_storage"), \
+         patch.object(cli, "_runtime", return_value="docker"), \
+         patch.object(cli, "_tmux_rename_window"), \
+         patch.object(cli.subprocess, "run", side_effect=capture_run):
+        from typer.testing import CliRunner
+        try:
+            result = CliRunner().invoke(cli.app, ["run", "--", "echo", "hi"], catch_exceptions=False)
+        except SystemExit:
+            pass
+
+    assert exec_args, "subprocess.run should have been called with the docker exec command"
+    assert any("exec" in str(a) for a in exec_args[0]), "should have called docker exec"
 
 AVAILABLE_RUNTIMES = []
 if shutil.which("docker"):
