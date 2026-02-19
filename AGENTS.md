@@ -122,6 +122,68 @@ This project is developed **from inside the jail itself**. The source code is bi
     - MCP Node Wrappers: `/home/agent/.local/bin/mcp-wrappers/`
 - **PATH Order**: `${SHIM_DIR}:/home/agent/.npm-global/bin:/home/agent/go/bin:/mise/shims:/bin:/usr/bin`.
 
+### Agent Package Management
+
+Agents inside the jail can install and manage additional tools via **`mise`**, which persists across jail restarts and isolates tools per workspace.
+
+**Key Concept**: Add tools to your workspace's `mise.toml` file. On next jail start, `mise install` automatically fetches and makes them available.
+
+#### How It Works
+1. **Workspace Declaration**: Tools declared in `/workspace/mise.toml` are workspace-specific.
+2. **Installation**: At jail startup, `cli.py` runs `mise install` from the workspace, downloading all declared tools into `/mise/installs/`.
+3. **Persistence**: Tools are stored in `~/.local/share/yolo-jail/mise/` on the host, surviving jail restarts.
+4. **PATH Resolution**: `mise hook-env` resolves tool directories into PATH at startup. Interactive shells also use `mise activate` with PROMPT_COMMAND hooks to keep tools available.
+
+#### Installing a Tool (Example: Typst)
+
+**Step 1**: Add to your workspace's `mise.toml`:
+```toml
+[tools]
+typst = "latest"
+```
+
+**Step 2**: On next jail startup (or manually inside jail):
+```bash
+mise install typst
+```
+
+**Step 3**: Use it:
+```bash
+typst compile myfile.typ output.pdf
+```
+
+The tool is now available to the agent and all its subprocesses, and will persist across jail restarts.
+
+#### Available Tools via Mise
+
+Mise supports thousands of tools from registries like **aqua**, **asdf**, and **cargo**. Examples:
+- **Build tools**: `typst`, `just`, `protoc`, `cmake`
+- **Languages**: `rust`, `zig`, `nim`, `kotlin`
+- **CLI tools**: `fd`, `ripgrep`, `bat`, `jq`, `yq`
+- **Database**: `postgresql`, `redis`, `sqlite`
+- **DevOps**: `terraform`, `ansible`, `kubectl`, `helm`
+
+Search available tools:
+```bash
+mise registry  # List all available tools
+```
+
+#### Workspace vs Global Tools
+
+| Scope | Location | Syntax | Persistence | Visibility |
+|-------|----------|--------|-------------|------------|
+| **Workspace** | `/workspace/mise.toml` | `[tools] typst = "latest"` | ✅ Survives restarts | ✅ Workspace-specific |
+| **Global** | `~/.config/mise/config.toml` | `[tools] typst = "latest"` | ✅ Shared across workspaces | ⚠️ Cross-workspace |
+
+**Recommendation**: Use workspace-level tools in `mise.toml` for project-specific dependencies. This keeps each workspace isolated and reproducible.
+
+#### Troubleshooting
+
+- **Tool not found after installation**: Restart jail or run `eval "$(mise hook-env -s bash)"` in current shell to refresh PATH.
+- **Version conflicts**: Each workspace has its own `mise.toml` — edit it to change versions. Multiple versions of same tool can coexist (mise manages them separately).
+- **Check installed tools**: `mise ls` (shows all), `mise ls typst` (shows typst versions), `mise which typst` (shows path).
+- **Remove a tool**: Delete from `mise.toml` and run `mise uninstall typst@VERSION`, or just leave it — unused tools take no space in PATH.
+
 ### Environment Hygiene
 - **No Pagers**: Agents cannot handle interactive pagers.
     - `PAGER=cat`, `GIT_PAGER=cat`, `BAT_PAGER=""`.
