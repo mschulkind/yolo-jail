@@ -209,9 +209,9 @@ def generate_agents_md(
     if net_mode == "host":
         network_line = "- **Network**: Host networking — the container shares the host network stack. `localhost` / `127.0.0.1` resolves directly to the host. No port mapping needed."
     elif runtime == "podman":
-        network_line = "- **Network**: Bridge mode. Use `host.containers.internal` (169.254.1.2) to reach the host."
+        network_line = "- **Network**: Bridge mode. Use `host.containers.internal` (resolves to 169.254.1.2) to reach the host."
     else:  # docker bridge
-        network_line = "- **Network**: Bridge mode. Use `172.17.0.1` (default docker bridge gateway) to reach the host."
+        network_line = "- **Network**: Bridge mode (Docker). Discover gateway IP: `ip route | awk '/default/ {print $3}'` (typically 172.17.0.1). Use that IP to reach the host."
 
     lines = [
         "# YOLO Jail Environment",
