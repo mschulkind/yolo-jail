@@ -194,6 +194,8 @@ def generate_agents_md(
     workspace: Path,
     blocked_tools: List[Dict[str, str]],
     mount_descriptions: List[str],
+    net_mode: str = "bridge",
+    runtime: str = "podman",
 ) -> Path:
     """Generate per-workspace AGENTS.md files and return the directory.
 
@@ -203,6 +205,13 @@ def generate_agents_md(
     """
     agents_dir = AGENTS_DIR / cname
     agents_dir.mkdir(parents=True, exist_ok=True)
+
+    if net_mode == "host":
+        network_line = "- **Network**: Host networking — the container shares the host network stack. `localhost` / `127.0.0.1` resolves directly to the host. No port mapping needed."
+    elif runtime == "podman":
+        network_line = "- **Network**: Bridge mode. Use `host.containers.internal` (169.254.1.2) to reach the host."
+    else:  # docker bridge
+        network_line = "- **Network**: Bridge mode. Use `172.17.0.1` (default docker bridge gateway) to reach the host."
 
     lines = [
         "# YOLO Jail Environment",
@@ -214,7 +223,7 @@ def generate_agents_md(
         f"- **Workspace**: `/workspace` (mounted from host `{workspace}`)",
         "- **Home Directory**: `/home/agent` (persistent across sessions)",
         "- **OS**: NixOS-based minimal container (no systemd, no sudo)",
-        "- **Network**: Bridge mode by default. Run `ip route | awk '/default/ {print $3}'` to find host IP.",
+        network_line,
         "",
         "## Available Tools",
         "",
@@ -738,7 +747,7 @@ def run(
 
     # Generate per-workspace AGENTS.md (separate for Copilot and Gemini to
     # respect user-level ~/.copilot/AGENTS.md vs ~/.gemini/AGENTS.md)
-    agents_path = generate_agents_md(cname, workspace, normalized_blocked, mount_descriptions)
+    agents_path = generate_agents_md(cname, workspace, normalized_blocked, mount_descriptions, net_mode=net_mode, runtime=runtime)
     docker_cmd.extend(["-v", f"{agents_path / 'AGENTS-copilot.md'}:/home/agent/.copilot/AGENTS.md:ro"])
     docker_cmd.extend(["-v", f"{agents_path / 'AGENTS-gemini.md'}:/home/agent/.gemini/AGENTS.md:ro"])
 
