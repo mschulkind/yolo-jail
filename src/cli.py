@@ -725,6 +725,11 @@ def run(
     if vscode_mcp.exists():
         docker_cmd.extend(["-v", "/dev/null:/workspace/.vscode/mcp.json:ro"])
 
+    # Shadow workspace .overmind.sock so host overmind doesn't leak into the jail
+    overmind_sock = workspace / ".overmind.sock"
+    if overmind_sock.exists():
+        docker_cmd.extend(["-v", "/dev/null:/workspace/.overmind.sock:ro"])
+
     # Mount host mise at its original path so .venv symlinks created on host resolve inside jail.
     # When nested, pass the path as an env var so inner jails can re-mount it.
     host_mise = Path(os.environ.get("YOLO_OUTER_MISE_PATH") or os.environ.get("MISE_DATA_DIR", str(Path.home() / ".local/share/mise")))

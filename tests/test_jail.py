@@ -236,3 +236,25 @@ def test_vscode_mcp_shadowed(temp_project):
     result = run_yolo(temp_project, "cat /workspace/.vscode/mcp.json")
     # /dev/null is empty, so cat should output nothing
     assert result.stdout.strip() == ""
+
+
+def test_overmind_socket_isolated(temp_project):
+    """Test that OVERMIND_SOCKET points outside /workspace so host/jail don't conflict."""
+    result = run_yolo(temp_project, "echo $OVERMIND_SOCKET")
+    socket_path = result.stdout.strip()
+    assert socket_path, "OVERMIND_SOCKET should be set"
+    assert not socket_path.startswith("/workspace"), \
+        f"OVERMIND_SOCKET must not be inside /workspace (got {socket_path})"
+
+
+def test_overmind_host_sock_not_visible(temp_project):
+    """Test that a host-side .overmind.sock is not visible inside the jail."""
+    # Create a fake .overmind.sock file in the workspace (simulates host overmind)
+    sock_file = temp_project / ".overmind.sock"
+    sock_file.write_text("fake-host-socket")
+
+    result = run_yolo(temp_project, "cat /workspace/.overmind.sock 2>&1; echo EXIT=$?")
+    output = result.stdout.strip()
+    # The file should either not exist or be empty (shadowed)
+    assert "fake-host-socket" not in output, \
+        f"Host .overmind.sock leaked into jail: {output}"
