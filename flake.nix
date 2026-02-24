@@ -51,6 +51,8 @@
           # Link shared libraries to /lib and /usr/lib for LD_LIBRARY_PATH discovery.
           # Iterates over all packages with lib outputs, including split-output packages
           # (e.g., fontconfig.lib has .so files separate from fontconfig.out which has etc/).
+          # Note: glib and pango define outputs=["bin" "out" ...] so their DEFAULT output
+          # is "bin" (no lib/). Must use .out explicitly to get the libraries.
           # Non-nix binaries (node, npm/pip packages) rely on LD_LIBRARY_PATH=/lib:/usr/lib
           # since they lack RPATH entries pointing into the nix store.
           for dir in $out/lib $out/usr/lib; do
@@ -58,8 +60,8 @@
                        ${pkgs.stdenv.cc.cc.lib} \
                        ${pkgs.zlib} \
                        ${pkgs.fontconfig.lib} \
-                       ${pkgs.glib} \
-                       ${pkgs.pango} \
+                       ${pkgs.glib.out} \
+                       ${pkgs.pango.out} \
                        ${pkgs.cairo} \
                        ${pkgs.harfbuzz} \
                        ${pkgs.freetype} \
