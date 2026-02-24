@@ -1,5 +1,6 @@
 import difflib
 import os
+import re
 import subprocess
 import sys
 import json
@@ -352,36 +353,82 @@ def generate_agents_md(
 
     return agents_dir
 
+def _summarize_nix_line(line: str) -> str:
+    """Extract a short human-readable summary from nix build stderr."""
+    # "copying path '/nix/store/hash-name-1.0' from ..."
+    m = re.search(r"copying path '/nix/store/[a-z0-9]+-(.+?)'", line)
+    if m:
+        return f"Fetching {m.group(1)}"
+    # "building '/nix/store/hash-name.drv'..."
+    m = re.search(r"building '/nix/store/[a-z0-9]+-(.+?)\.drv'", line)
+    if m:
+        return f"Building {m.group(1)}"
+    # "evaluating derivation ..." or just "evaluating"
+    if "evaluating" in line.lower():
+        return "Evaluating flake..."
+    # Progress counters like "[3/5 built, 2 copied (10.2 MiB)]"
+    m = re.match(r'\[[\d/]+ (?:built|copied|fetched).*\]', line.strip())
+    if m:
+        return line.strip()
+    return ""
+
+
 def auto_load_image(repo_root: Path, extra_packages: List[str] = None, runtime: str = "docker"):
     """Cheaply check if the nix image needs to be reloaded into the container runtime."""
     # Per-runtime sentinel so docker and podman each track their own loaded image
     sentinel = repo_root / f".last-load-{runtime}"
     
-    # 1. Build the image (cheap if no changes)
+    # 1. Build the image (fast if no changes, streams progress otherwise)
     build_env = os.environ.copy()
     if extra_packages:
         build_env["YOLO_EXTRA_PACKAGES"] = json.dumps(extra_packages)
     
-    with console.status("[bold blue]Checking jail image...", spinner="dots"):
-        try:
-            subprocess.run(
-                ["nix", "--extra-experimental-features", "nix-command flakes", "build", ".#dockerImage", "--impure", "--out-link", ".run-result"],
-                cwd=repo_root, check=True, capture_output=True,
-                env=build_env,
-            )
-        except subprocess.CalledProcessError as e:
-            console.print(f"[yellow]Warning: Automatic nix build failed: {e.stderr.decode()}[/yellow]")
-            # If the image already exists in the runtime (e.g. pre-loaded inside a jail),
-            # we can still proceed — just skip the load step.
-            check = subprocess.run(
-                [runtime, "image", "inspect", JAIL_IMAGE],
-                capture_output=True,
-            )
-            if check.returncode == 0:
-                console.print(f"[yellow]Using existing {JAIL_IMAGE} image.[/yellow]")
-                return
-            console.print(f"[bold red]No existing {JAIL_IMAGE} image found. Cannot start jail.[/bold red]")
+    build_stderr_tail: list[str] = []  # Keep last N lines for error display
+    build_ok = True
+    try:
+        process = subprocess.Popen(
+            ["nix", "--extra-experimental-features", "nix-command flakes",
+             "build", ".#dockerImage", "--impure", "--out-link", ".run-result",
+             "--print-build-logs"],
+            cwd=repo_root, env=build_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        
+        with console.status("[bold blue]Checking jail image...", spinner="dots") as status:
+            if process.stderr:
+                for line in iter(process.stderr.readline, ""):
+                    clean = line.rstrip()
+                    if clean:
+                        build_stderr_tail.append(clean)
+                        if len(build_stderr_tail) > 30:
+                            build_stderr_tail.pop(0)
+                        summary = _summarize_nix_line(clean)
+                        if summary:
+                            status.update(f"[bold blue]{summary}[/bold blue]")
+        
+        process.wait()
+        if process.returncode != 0:
+            build_ok = False
+    except FileNotFoundError:
+        build_ok = False
+        build_stderr_tail.append("nix command not found")
+    
+    if not build_ok:
+        err_summary = "\n".join(build_stderr_tail[-10:]) if build_stderr_tail else "unknown error"
+        console.print(f"[yellow]Warning: nix build failed:[/yellow]\n[dim]{err_summary}[/dim]")
+        # If the image already exists in the runtime (e.g. pre-loaded inside a jail),
+        # we can still proceed — just skip the load step.
+        check = subprocess.run(
+            [runtime, "image", "inspect", JAIL_IMAGE],
+            capture_output=True,
+        )
+        if check.returncode == 0:
+            console.print(f"[yellow]Using existing {JAIL_IMAGE} image.[/yellow]")
             return
+        console.print(f"[bold red]No existing {JAIL_IMAGE} image found. Cannot start jail.[/bold red]")
+        return
 
     # 2. Check if the store path has changed
     current_path = (repo_root / ".run-result").resolve()
