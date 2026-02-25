@@ -484,6 +484,7 @@ def auto_load_image(repo_root: Path, extra_packages: List[str] = None, runtime: 
             stream_proc = subprocess.Popen(
                 [stream_script],
                 stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,  # Suppress "Creating layer N..." noise
             )
             load_proc = subprocess.Popen(
                 [runtime, "load"],
