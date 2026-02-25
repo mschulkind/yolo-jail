@@ -295,26 +295,29 @@ def configure_git():
 # ---------------------------------------------------------------------------
 
 def merge_skills():
-    """Sync host + workspace skills into the jail's Copilot skills dir (read-only)."""
-    jail_skills = COPILOT_DIR / "skills"
-    if jail_skills.exists():
-        # Restore write permission before rmtree (we chmod -w on previous runs)
-        _make_writable(jail_skills)
-        shutil.rmtree(jail_skills)
-    jail_skills.mkdir(parents=True, exist_ok=True)
+    """Sync host + workspace skills into Copilot and Gemini skills dirs (read-only)."""
+    host_skills_path = os.environ.get("YOLO_HOST_GEMINI_SKILLS", "")
 
-    # Host user-level skills
-    host_skills = os.environ.get("YOLO_HOST_GEMINI_SKILLS", "")
-    if host_skills:
-        _copy_skill_dirs(Path(host_skills), jail_skills)
+    for agent_dir in [COPILOT_DIR, GEMINI_DIR]:
+        jail_skills = agent_dir / "skills"
+        if jail_skills.exists():
+            # Restore write permission before rmtree (we chmod -w on previous runs)
+            _make_writable(jail_skills)
+            shutil.rmtree(jail_skills)
+        jail_skills.mkdir(parents=True, exist_ok=True)
 
-    # Workspace skills (take precedence)
-    ws_skills = Path("/workspace/.copilot/skills")
-    if ws_skills.is_dir():
-        _copy_skill_dirs(ws_skills, jail_skills)
+        # Host user-level skills
+        if host_skills_path:
+            _copy_skill_dirs(Path(host_skills_path), jail_skills)
 
-    # Make skills read-only so agents can't modify them
-    _make_readonly(jail_skills)
+        # Workspace skills (take precedence) — check both .copilot and .gemini
+        for ws_dir in ["/workspace/.copilot/skills", "/workspace/.gemini/skills"]:
+            ws_skills = Path(ws_dir)
+            if ws_skills.is_dir():
+                _copy_skill_dirs(ws_skills, jail_skills)
+
+        # Make skills read-only so agents can't modify them
+        _make_readonly(jail_skills)
 
 
 def _copy_skill_dirs(src: Path, dst: Path):
