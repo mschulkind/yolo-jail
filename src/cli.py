@@ -387,7 +387,7 @@ def _estimate_image_size(store_path: str, sentinel: Path) -> int:
         r = subprocess.run(
             ["nix", "--extra-experimental-features", "nix-command flakes",
              "path-info", "--closure-size", store_path],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, text=True, timeout=5,
         )
         if r.returncode == 0:
             # Output format: "/nix/store/...\t<size>" or just the path with -S flag
@@ -474,29 +474,30 @@ def auto_load_image(repo_root: Path, extra_packages: List[str] = None, runtime: 
         last_path = sentinel.read_text().strip()
 
     if str(current_path) != last_path:
-        estimated_size = _estimate_image_size(str(current_path), sentinel)
-        console.print("[bold green]Image changed. Streaming to {runtime}...[/bold green]".format(runtime=runtime))
-        
         try:
-            # streamLayeredImage produces a script that outputs the image tar to stdout.
-            # Pipe it directly to `runtime load` — generation and loading run in parallel.
-            stream_script = str(current_path)
-            stream_proc = subprocess.Popen(
-                [stream_script],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,  # Suppress "Creating layer N..." noise
-            )
-            load_proc = subprocess.Popen(
-                [runtime, "load"],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=False,
-            )
-            
-            total_bytes = 0
-            chunk_size = 1024 * 1024  # 1 MB
-            with console.status(f"[bold cyan]Streaming to {runtime}... 0 MB", spinner="bouncingBar") as status:
+            with console.status(f"[bold cyan]Preparing image for {runtime}...", spinner="bouncingBar") as status:
+                # Estimate size (uses saved size from last stream, or nix closure size)
+                estimated_size = _estimate_image_size(str(current_path), sentinel)
+                
+                # streamLayeredImage produces a script that outputs the image tar to stdout.
+                # Pipe it directly to `runtime load` — generation and loading run in parallel.
+                stream_script = str(current_path)
+                status.update(f"[bold cyan]Starting image stream to {runtime}...")
+                stream_proc = subprocess.Popen(
+                    [stream_script],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,  # Suppress "Creating layer N..." noise
+                )
+                load_proc = subprocess.Popen(
+                    [runtime, "load"],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=False,
+                )
+                
+                total_bytes = 0
+                chunk_size = 1024 * 1024  # 1 MB
                 while True:
                     chunk = stream_proc.stdout.read(chunk_size)
                     if not chunk:
