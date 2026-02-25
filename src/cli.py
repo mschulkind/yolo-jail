@@ -373,6 +373,43 @@ def _summarize_nix_line(line: str) -> str:
     return ""
 
 
+def _estimate_image_size(store_path: str, sentinel: Path) -> int:
+    """Estimate the image stream size in bytes. Returns 0 if unknown."""
+    # First, check if we saved a size from a previous stream
+    size_file = sentinel.parent / f"{sentinel.name}-size"
+    if size_file.exists():
+        try:
+            return int(size_file.read_text().strip())
+        except (ValueError, OSError):
+            pass
+    # Fall back to nix closure size (approximates uncompressed image)
+    try:
+        r = subprocess.run(
+            ["nix", "--extra-experimental-features", "nix-command flakes",
+             "path-info", "--closure-size", store_path],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0:
+            # Output format: "/nix/store/...\t<size>" or just the path with -S flag
+            parts = r.stdout.strip().split()
+            for p in reversed(parts):
+                if p.isdigit():
+                    return int(p)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    return 0
+
+
+def _format_progress(current: int, estimate: int) -> str:
+    """Format byte progress with optional percentage."""
+    mb = current / (1024 * 1024)
+    cur_str = f"{mb/1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+    if estimate > 0:
+        pct = min(int(current * 100 / estimate), 99)  # Cap at 99% until done
+        return f"{cur_str} ({pct}%)"
+    return cur_str
+
+
 def auto_load_image(repo_root: Path, extra_packages: List[str] = None, runtime: str = "docker"):
     """Cheaply check if the nix image needs to be reloaded into the container runtime."""
     # Per-runtime sentinel so docker and podman each track their own loaded image
@@ -437,6 +474,7 @@ def auto_load_image(repo_root: Path, extra_packages: List[str] = None, runtime: 
         last_path = sentinel.read_text().strip()
 
     if str(current_path) != last_path:
+        estimated_size = _estimate_image_size(str(current_path), sentinel)
         console.print("[bold green]Image changed. Streaming to {runtime}...[/bold green]".format(runtime=runtime))
         
         try:
@@ -464,11 +502,8 @@ def auto_load_image(repo_root: Path, extra_packages: List[str] = None, runtime: 
                         break
                     load_proc.stdin.write(chunk)
                     total_bytes += len(chunk)
-                    mb = total_bytes / (1024 * 1024)
-                    if mb >= 1024:
-                        status.update(f"[bold cyan]Streaming to {runtime}... {mb/1024:.1f} GB")
-                    else:
-                        status.update(f"[bold cyan]Streaming to {runtime}... {mb:.0f} MB")
+                    progress = _format_progress(total_bytes, estimated_size)
+                    status.update(f"[bold cyan]Streaming to {runtime}... {progress}")
                 load_proc.stdin.close()
             
             stream_proc.wait()
@@ -489,6 +524,9 @@ def auto_load_image(repo_root: Path, extra_packages: List[str] = None, runtime: 
                 msg = load_output if load_output else f"loaded image ({size_str})"
                 console.print(f"[bold green]Done: {msg}[/bold green]")
                 sentinel.write_text(str(current_path))
+                # Save actual size for accurate future estimates
+                size_file = sentinel.parent / f"{sentinel.name}-size"
+                size_file.write_text(str(total_bytes))
         except Exception as e:
             console.print(f"[bold red]Error streaming image: {e}[/bold red]")
     
