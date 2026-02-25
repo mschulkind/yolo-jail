@@ -295,9 +295,11 @@ def configure_git():
 # ---------------------------------------------------------------------------
 
 def merge_skills():
-    """Sync host + workspace skills into the jail's Copilot skills dir."""
+    """Sync host + workspace skills into the jail's Copilot skills dir (read-only)."""
     jail_skills = COPILOT_DIR / "skills"
     if jail_skills.exists():
+        # Restore write permission before rmtree (we chmod -w on previous runs)
+        _make_writable(jail_skills)
         shutil.rmtree(jail_skills)
     jail_skills.mkdir(parents=True, exist_ok=True)
 
@@ -311,6 +313,9 @@ def merge_skills():
     if ws_skills.is_dir():
         _copy_skill_dirs(ws_skills, jail_skills)
 
+    # Make skills read-only so agents can't modify them
+    _make_readonly(jail_skills)
+
 
 def _copy_skill_dirs(src: Path, dst: Path):
     """Copy skill subdirectories from src to dst, following symlinks."""
@@ -322,6 +327,32 @@ def _copy_skill_dirs(src: Path, dst: Path):
             if target.exists():
                 shutil.rmtree(target)
             shutil.copytree(item, target, symlinks=False)
+
+
+def _make_readonly(path: Path):
+    """Recursively remove write permission from a directory tree."""
+    import stat
+    for root, dirs, files in os.walk(path):
+        for f in files:
+            fp = Path(root) / f
+            fp.chmod(fp.stat().st_mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+        for d in dirs:
+            dp = Path(root) / d
+            dp.chmod(dp.stat().st_mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+    path.chmod(path.stat().st_mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+
+
+def _make_writable(path: Path):
+    """Recursively restore write permission on a directory tree."""
+    import stat
+    path.chmod(path.stat().st_mode | stat.S_IWUSR)
+    for root, dirs, files in os.walk(path):
+        for d in dirs:
+            dp = Path(root) / d
+            dp.chmod(dp.stat().st_mode | stat.S_IWUSR)
+        for f in files:
+            fp = Path(root) / f
+            fp.chmod(fp.stat().st_mode | stat.S_IWUSR)
 
 
 # ---------------------------------------------------------------------------
