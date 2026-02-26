@@ -33,6 +33,7 @@ def _default(ctx: typer.Context):
         yolo -- copilot           Run Copilot in jail (--yolo auto-injected)
         yolo -- gemini            Run Gemini in jail (--yolo auto-injected)
         yolo --new -- bash        Force new container (ignore running one)
+        yolo --profile -- echo hi Profile startup performance
         yolo ps                   List running jails
         yolo config-ref           Full configuration reference
 
@@ -878,6 +879,7 @@ def run(
     ctx: typer.Context,
     network: str = typer.Option("bridge", help="Container network mode (bridge/host)"),
     new: bool = typer.Option(False, "--new", help="Force a new container even if one already exists for this workspace"),
+    profile: bool = typer.Option(False, "--profile", help="Show detailed startup performance timing after command exits"),
 ):
     """Run the YOLO jail in the current directory."""
     # Find repo root — use YOLO_REPO_ROOT env var inside jails, otherwise resolve from source
@@ -925,8 +927,16 @@ def run(
     if not _check_config_changes(workspace, config):
         sys.exit(1)
 
+    import time as _time
+    _profile_times = {}
+    if profile:
+        _profile_times["start"] = _time.monotonic()
+
     extra_packages = config.get("packages", [])
     auto_load_image(repo_root, extra_packages=extra_packages or None, runtime=runtime)
+
+    if profile:
+        _profile_times["image_loaded"] = _time.monotonic()
 
     # Determine Network Mode
     net_mode = network
@@ -1164,6 +1174,9 @@ def run(
     if "TERM" in os.environ:
         docker_cmd.extend(["-e", f"TERM={os.environ['TERM']}"])
 
+    if profile:
+        docker_cmd.extend(["-e", "YOLO_PROFILE=1"])
+
     docker_cmd.append(JAIL_IMAGE)
     docker_cmd.append("yolo-entrypoint")
 
@@ -1172,7 +1185,37 @@ def run(
     setup_script = "YOLO_BYPASS_SHIMS=1 sh -c '(if [ -f mise.toml ]; then mise trust; fi) && mise install && ~/.yolo-bootstrap.sh'"
     # After setup, activate mise so tool paths (copilot, gemini, etc.) are in PATH
     # Use && for fail-fast: if provisioning fails, don't proceed with broken env
-    final_internal_cmd = f"{setup_script} >/dev/null 2>&1 && eval \"$(mise hook-env -s bash)\" 2>/dev/null; {target_cmd}"
+    if profile:
+        # Wrap each phase with timing output for profiling
+        final_internal_cmd = (
+            "exec 3>&2; "  # save stderr
+            f"_t0=$(date +%s%N); {setup_script} >/dev/null 2>&1; "
+            "_t1=$(date +%s%N); "
+            "eval \"$(mise hook-env -s bash)\" 2>/dev/null; "
+            "_t2=$(date +%s%N); "
+            f"{target_cmd}; _rc=$?; "
+            "_t3=$(date +%s%N); "
+            # Print profile report to stderr
+            "echo '' >&3; echo '=== YOLO Jail Profile ===' >&3; "
+            "echo '' >&3; echo '--- Entrypoint (config generation) ---' >&3; "
+            "tail -20 ~/.yolo-perf.log >&3 2>/dev/null; "
+            "echo '' >&3; echo '--- Container setup ---' >&3; "
+            "printf '  mise install + bootstrap: %s\\n' \"$(( (_t1 - _t0) / 1000000 ))ms\" >&3; "
+            "printf '  mise hook-env:            %s\\n' \"$(( (_t2 - _t1) / 1000000 ))ms\" >&3; "
+            "printf '  command execution:        %s\\n' \"$(( (_t3 - _t2) / 1000000 ))ms\" >&3; "
+            "printf '  total in-container:       %s\\n' \"$(( (_t3 - _t0) / 1000000 ))ms\" >&3; "
+            "echo '' >&3; "
+            # Also show mise shim vs direct node timing
+            "echo '--- Node path comparison ---' >&3; "
+            "_n0=$(date +%s%N); /bin/node --version >/dev/null 2>&1; _n1=$(date +%s%N); "
+            "printf '  /bin/node:        %sms\\n' \"$(( (_n1 - _n0) / 1000000 ))\" >&3; "
+            "_n2=$(date +%s%N); /mise/shims/node --version >/dev/null 2>&1; _n3=$(date +%s%N); "
+            "printf '  /mise/shims/node: %sms\\n' \"$(( (_n3 - _n2) / 1000000 ))\" >&3; "
+            "echo '' >&3; "
+            "exit $_rc"
+        )
+    else:
+        final_internal_cmd = f"{setup_script} >/dev/null 2>&1 && eval \"$(mise hook-env -s bash)\" 2>/dev/null; {target_cmd}"
     
     docker_cmd.append(final_internal_cmd)
 
@@ -1181,6 +1224,14 @@ def run(
 
     # Use subprocess.run (not execvp) so atexit handlers fire for tmux cleanup
     result = subprocess.run(docker_cmd)
+
+    if profile and _profile_times:
+        _profile_times["container_exited"] = _time.monotonic()
+        start = _profile_times["start"]
+        console.print("\n[bold cyan]--- Host-side timing ---[/bold cyan]", file=sys.stderr)
+        console.print(f"  Image build/load:   {_profile_times.get('image_loaded', start) - start:.3f}s", file=sys.stderr)
+        console.print(f"  Total (host-side):  {_profile_times['container_exited'] - start:.3f}s\n", file=sys.stderr)
+
     sys.exit(result.returncode)
 
 
