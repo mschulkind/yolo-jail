@@ -5,4 +5,5 @@ result
 .direnv/
 .venv/
 __pycache__/
+*.pyc
 .yolo/
