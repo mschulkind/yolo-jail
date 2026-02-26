@@ -1228,9 +1228,10 @@ def run(
     if profile and _profile_times:
         _profile_times["container_exited"] = _time.monotonic()
         start = _profile_times["start"]
-        console.print("\n[bold cyan]--- Host-side timing ---[/bold cyan]", file=sys.stderr)
-        console.print(f"  Image build/load:   {_profile_times.get('image_loaded', start) - start:.3f}s", file=sys.stderr)
-        console.print(f"  Total (host-side):  {_profile_times['container_exited'] - start:.3f}s\n", file=sys.stderr)
+        err = Console(stderr=True)
+        err.print("\n[bold cyan]--- Host-side timing ---[/bold cyan]")
+        err.print(f"  Image build/load:   {_profile_times.get('image_loaded', start) - start:.3f}s")
+        err.print(f"  Total (host-side):  {_profile_times['container_exited'] - start:.3f}s\n")
 
     sys.exit(result.returncode)
 
