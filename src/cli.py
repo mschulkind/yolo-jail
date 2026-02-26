@@ -123,7 +123,11 @@ def _tmux_setup_jail_pane():
                 ["tmux", "show-option", "-pt", pane, opt],
                 capture_output=True, text=True,
             )
-            return r.stdout.strip() if r.returncode == 0 else None
+            if r.returncode == 0 and r.stdout.strip():
+                # Output is "option-name value" — extract value after first space
+                parts = r.stdout.strip().split(None, 1)
+                return parts[1] if len(parts) > 1 else ""
+            return None
         except Exception:
             return None
 
@@ -176,28 +180,27 @@ def _tmux_setup_jail_pane():
         pass
 
     def restore():
+        # Batch all tmux restores into a single command to minimize shutdown delay
+        cmds = []
         for opt, val in old.items():
-            if val:
-                # val is like "pane-border-style fg=red,bold" — use eval-style restore
-                try:
-                    subprocess.run(
-                        ["tmux", f"set-option", "-pt", pane, opt, val.split()[-1]],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    )
-                except Exception:
-                    _tmux_unset(opt)
+            if val is not None:
+                cmds.append(f"set-option -pt {pane} {opt} {val}")
             else:
-                _tmux_unset(opt)
+                cmds.append(f"set-option -put {pane} {opt}")
         if old_window:
-            try:
-                subprocess.run(["tmux", "rename-window", old_window],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
+            cmds.append(f"rename-window {old_window}")
         if old_auto_rename == "on":
+            cmds.append("set-window-option automatic-rename on")
+        if cmds:
             try:
-                subprocess.run(["tmux", "set-window-option", "automatic-rename", "on"],
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                # Execute all restores in one tmux invocation using \;
+                full_cmd = ["tmux"]
+                for i, cmd in enumerate(cmds):
+                    if i > 0:
+                        full_cmd.append(";")
+                    full_cmd.extend(cmd.split())
+                subprocess.run(full_cmd, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
             except Exception:
                 pass
 
