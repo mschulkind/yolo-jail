@@ -1198,7 +1198,8 @@ def run(
             # Print profile report to stderr
             "echo '' >&3; echo '=== YOLO Jail Profile ===' >&3; "
             "echo '' >&3; echo '--- Entrypoint (config generation) ---' >&3; "
-            "tail -20 ~/.yolo-perf.log >&3 2>/dev/null; "
+            # Extract only the LAST run from the perf log (separated by === markers)
+            "awk '/^=== YOLO/{buf=\"\"} {buf=buf $0 \"\\n\"} END{printf \"%s\", buf}' ~/.yolo-perf.log >&3 2>/dev/null; "
             "echo '' >&3; echo '--- Container setup ---' >&3; "
             "printf '  mise install + bootstrap: %s\\n' \"$(( (_t1 - _t0) / 1000000 ))ms\" >&3; "
             "printf '  mise hook-env:            %s\\n' \"$(( (_t2 - _t1) / 1000000 ))ms\" >&3; "
