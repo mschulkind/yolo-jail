@@ -136,8 +136,8 @@ HOST_INFO="${CYAN}(host: """ + host_dir + r""")${NC}"
 
 export PS1="\n${JAIL_BANNER} ${HOST_INFO}\n${GREEN}jail${NC}:${BLUE}\w${NC}\$ "
 
-# Set tmux window name via escape sequences
-export PROMPT_COMMAND='printf "\033]0;JAIL\033\\" && printf "\033kJAIL\033\\"'
+# Set terminal/tmux title (only when inside tmux to avoid literal "JAIL" output)
+export PROMPT_COMMAND='[ -n "$TMUX" ] && printf "\033]0;JAIL\033\\"'
 
 # Agent-friendly defaults (no pagers, no line numbers)
 export PAGER=cat
