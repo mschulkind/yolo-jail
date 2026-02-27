@@ -375,10 +375,14 @@ def _copy_skill_dirs(src: Path, dst: Path):
     """Copy skill subdirectories from src to dst, following symlinks."""
     if not src.is_dir():
         return
+    import stat
     for item in src.iterdir():
         if item.is_dir():
             target = dst / item.name
             if target.exists():
+                # Restore write permissions (may have been made read-only)
+                dst.chmod(dst.stat().st_mode | stat.S_IWUSR)
+                _make_writable(target)
                 shutil.rmtree(target)
             shutil.copytree(item, target, symlinks=False)
 
