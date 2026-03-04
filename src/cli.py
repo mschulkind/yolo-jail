@@ -1087,8 +1087,13 @@ def run(
     mount_args = []
     mount_descriptions = []
     for mount in config.get("mounts", []):
-        if ":" in mount and not mount.startswith("~") and not mount.startswith("/"):
-            host_path, container_path = mount.split(":", 1)
+        # Support "host:container" syntax — split on the LAST colon that precedes
+        # an absolute container path (starts with /).  Plain host-only paths like
+        # "/home/user/.copilot" or "~/data" fall through to the else branch.
+        colon_idx = mount.rfind(":")
+        if colon_idx > 0 and mount[colon_idx + 1 : colon_idx + 2] == "/":
+            host_path = mount[:colon_idx]
+            container_path = mount[colon_idx + 1 :]
         else:
             host_path = mount
             container_path = f"/ctx/{Path(host_path).expanduser().resolve().name}"
