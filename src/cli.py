@@ -1427,6 +1427,171 @@ def ps():
             for tracking_file in CONTAINER_DIR.iterdir():
                 cleanup_container_tracking(tracking_file.name)
 
+@app.command()
+def doctor():
+    """Check your YOLO Jail setup and diagnose common problems."""
+    passed = 0
+    failed = 0
+    warned = 0
+
+    def ok(msg: str):
+        nonlocal passed
+        passed += 1
+        console.print(f"  ✅ {msg}")
+
+    def fail(msg: str, fix: str = ""):
+        nonlocal failed
+        failed += 1
+        console.print(f"  ❌ {msg}")
+        if fix:
+            console.print(f"     → {fix}")
+
+    def warn(msg: str, note: str = ""):
+        nonlocal warned
+        warned += 1
+        console.print(f"  ⚠️  {msg}")
+        if note:
+            console.print(f"     → {note}")
+
+    console.print("\n[bold]YOLO Jail Doctor[/bold]\n")
+
+    # 1. Container runtime
+    console.print("[bold]Container Runtime[/bold]")
+    runtime = None
+    for rt in ("podman", "docker"):
+        path = shutil.which(rt)
+        if path:
+            try:
+                result = subprocess.run(
+                    [rt, "--version"], capture_output=True, text=True, timeout=5,
+                )
+                version = result.stdout.strip().split("\n")[0]
+                ok(f"{rt}: {version}")
+                if runtime is None:
+                    runtime = rt
+            except Exception as e:
+                fail(f"{rt} found but not working: {e}")
+        else:
+            if rt == "docker":
+                pass  # Only warn if neither found
+            else:
+                pass  # Check after loop
+    if runtime is None:
+        fail("No container runtime found", "Install podman or docker")
+    console.print()
+
+    # 2. Nix
+    console.print("[bold]Nix[/bold]")
+    nix_path = shutil.which("nix")
+    if nix_path:
+        try:
+            result = subprocess.run(
+                ["nix", "--version"], capture_output=True, text=True, timeout=5,
+            )
+            ok(f"nix: {result.stdout.strip()}")
+        except Exception as e:
+            fail(f"nix found but not working: {e}")
+    else:
+        fail("nix not found", "Install Nix: https://nixos.org/download/")
+
+    # Check flake.nix exists
+    flake = Path.cwd() / "flake.nix"
+    if not flake.exists():
+        # Try repo root
+        flake = Path(__file__).resolve().parent.parent / "flake.nix"
+    if flake.exists():
+        ok(f"flake.nix found: {flake}")
+    else:
+        warn("flake.nix not found in current directory")
+    console.print()
+
+    # 3. Global storage
+    console.print("[bold]Global Storage[/bold]")
+    for name, path in [
+        ("Home", GLOBAL_HOME),
+        ("Mise", GLOBAL_MISE),
+        ("Containers", CONTAINER_DIR),
+        ("Agents", AGENTS_DIR),
+    ]:
+        if path.exists():
+            ok(f"{name}: {path}")
+        else:
+            warn(f"{name} directory missing: {path}", "Will be created on first run")
+    console.print()
+
+    # 4. Configuration
+    console.print("[bold]Configuration[/bold]")
+    if USER_CONFIG_PATH.exists():
+        try:
+            with open(USER_CONFIG_PATH) as f:
+                pyjson5.load(f)
+            ok(f"User config: {USER_CONFIG_PATH}")
+        except Exception as e:
+            fail(f"User config invalid: {e}", f"Edit {USER_CONFIG_PATH}")
+    else:
+        warn("No user config", f"Run 'yolo init-user-config' to create {USER_CONFIG_PATH}")
+
+    workspace_config = Path.cwd() / "yolo-jail.jsonc"
+    if workspace_config.exists():
+        try:
+            with open(workspace_config) as f:
+                pyjson5.load(f)
+            ok(f"Workspace config: {workspace_config}")
+        except Exception as e:
+            fail(f"Workspace config invalid: {e}", f"Edit {workspace_config}")
+    else:
+        warn("No workspace config", "Run 'yolo init' to create yolo-jail.jsonc")
+    console.print()
+
+    # 5. Docker/Podman image
+    console.print("[bold]Container Image[/bold]")
+    if runtime:
+        try:
+            result = subprocess.run(
+                [runtime, "images", JAIL_IMAGE, "--format", "{{.Repository}}:{{.Tag}} ({{.Size}})"],
+                capture_output=True, text=True, timeout=10,
+            )
+            images = result.stdout.strip()
+            if images:
+                ok(f"Image loaded: {images.split(chr(10))[0]}")
+            else:
+                warn(f"Image '{JAIL_IMAGE}' not loaded", "Run 'yolo' once to build and load the image")
+        except Exception as e:
+            warn(f"Could not check image: {e}")
+    else:
+        warn("Skipped (no container runtime)")
+    console.print()
+
+    # 6. Running containers
+    console.print("[bold]Running Jails[/bold]")
+    if runtime:
+        try:
+            result = subprocess.run(
+                [runtime, "ps", "--filter", "name=^yolo-", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            containers = [c for c in result.stdout.strip().split("\n") if c]
+            if containers:
+                ok(f"{len(containers)} jail(s) running: {', '.join(containers)}")
+            else:
+                ok("No jails currently running")
+        except Exception:
+            warn("Could not check running containers")
+    console.print()
+
+    # Summary
+    console.print("[bold]Summary[/bold]")
+    parts = [f"[green]{passed} passed[/green]"]
+    if failed:
+        parts.append(f"[red]{failed} failed[/red]")
+    if warned:
+        parts.append(f"[yellow]{warned} warnings[/yellow]")
+    console.print(f"  {', '.join(parts)}\n")
+
+    if failed:
+        sys.exit(1)
+
+
 def main():
     """Entry point for the `yolo` console script.
 

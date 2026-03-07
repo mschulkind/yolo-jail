@@ -1,59 +1,115 @@
 # YOLO Jail
 
+[![CI](https://github.com/mschulkind/yolo-jail/actions/workflows/ci.yml/badge.svg)](https://github.com/mschulkind/yolo-jail/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 A secure, isolated container environment for AI agents (Copilot, Gemini CLI) to safely modify codebases without compromising host security or identity. Supports both Docker and Podman runtimes.
+
+## Why?
+
+AI coding agents like GitHub Copilot and Google Gemini CLI have a `--yolo` mode that lets them run shell commands without confirmation. This is powerful but dangerous — agents can access your SSH keys, cloud credentials, git identity, and anything else on your machine.
+
+**YOLO Jail** lets you run agents in YOLO mode safely by isolating them in a container with:
+- ❌ No access to `~/.ssh/`, `~/.gitconfig`, or cloud credentials
+- ✅ Separate auth (`gh auth login` and `gemini login` inside the jail)
+- ✅ Your codebase mounted read-write at `/workspace`
+- ✅ Persistent tool state across restarts
+- ✅ Pre-configured MCP servers, LSP servers, and modern CLI tools
 
 ## Features
 
-- **Isolated:** Runs in a Docker/Podman container with no access to host credentials.
-- **Optimized:** Pre-installed with modern, fast tools (`rg`, `fd`, `bat`, `eza`, `jq`, `delta`, `fzf`).
-- **Restricted:** Blocked tools return clear errors with suggestions (e.g., `rg` instead of `grep`).
-- **Reproducible:** Defined entirely via Nix Flakes.
-- **Agent-Ready:** Pre-configured MCP servers (Chrome DevTools, Sequential Thinking) and LSP servers (Pyright, TypeScript).
+- **Isolated:** Runs in a Docker/Podman container with no access to host credentials
+- **Optimized:** Pre-installed with modern, fast tools (`rg`, `fd`, `bat`, `eza`, `jq`, `delta`, `fzf`)
+- **Restricted:** Blocked tools return clear errors with suggestions (e.g., `rg` instead of `grep`)
+- **Reproducible:** Defined entirely via Nix Flakes
+- **Agent-Ready:** Pre-configured MCP servers (Chrome DevTools, Sequential Thinking) and LSP servers (Pyright, TypeScript)
+- **Configurable:** Per-project config via `yolo-jail.jsonc`, user defaults via `~/.config/yolo-jail/config.jsonc`
+- **Container Reuse:** Same workspace reuses the same container via `exec`
+- **Runtime Flexible:** Works with both Docker and Podman (prefers Podman)
+
+## Prerequisites
+
+- **Python 3.13+**
+- **[Nix](https://nixos.org/download/)** (with flakes enabled)
+- **[Docker](https://docs.docker.com/)** or **[Podman](https://podman.io/)**
 
 ## Installation
 
-Symlink the entry point to your PATH:
 ```bash
+# Clone the repository
+git clone https://github.com/mschulkind/yolo-jail.git
+cd yolo-jail
+
+# Install Python dependencies
+uv sync
+
+# Symlink the entry script to your PATH
 sudo ln -s $(pwd)/yolo-enter.sh /usr/local/bin/yolo
-```
 
-Optionally set user-level defaults:
-```bash
+# (Optional) Set user-level defaults
 yolo init-user-config
-# edits: ~/.config/yolo-jail/config.jsonc
+# Edit: ~/.config/yolo-jail/config.jsonc
 ```
 
-## Usage
+## Quick Start
 
-Navigate to any repository and run:
 ```bash
-# Start an interactive shell
+# Navigate to any repository
+cd ~/code/my-project
+
+# Start an interactive shell in the jail
 yolo
 
-# Run a command directly
-yolo -- gemini prompt "Explain this code"
-yolo -- copilot
+# Or run a command directly
+yolo -- copilot          # Copilot with --yolo auto-injected
+yolo -- gemini           # Gemini with --yolo auto-injected
 
-# Force a new container (instead of reusing existing)
+# Force a new container
 yolo --new -- bash
+
+# Check your setup
+yolo doctor
+
+# List running jails
+yolo ps
 
 # Show full configuration reference
 yolo config-ref
 ```
 
-The jail mounts your current directory to `/workspace`. Auth and tool state are persisted in `~/.local/share/yolo-jail/` and isolated from host credentials.
+### First Run
+
+On first run, YOLO Jail will:
+1. Build the Docker image via `nix build` (takes a few minutes)
+2. Load the image into your container runtime
+3. Install MCP servers, LSP servers, and utilities
+4. Start your command
+
+Subsequent runs are fast — tools are cached in persistent storage.
+
+### Auth Setup (One-Time)
+
+Inside the jail, authenticate with your tools:
+
+```bash
+gh auth login          # GitHub CLI
+gemini login           # Google Gemini CLI
+```
+
+These tokens are stored in `~/.local/share/yolo-jail/home/` and persist across jail restarts.
 
 ## Configuration
 
-Per-project config in `yolo-jail.jsonc`:
+Create a per-project config in `yolo-jail.jsonc`:
+
 ```jsonc
 {
   "runtime": "podman",              // or "docker"
   "packages": ["strace", "htop"],   // extra nix packages
   "mounts": ["/path/to/ref-repo"],  // extra read-only mounts
   "network": {
-    "mode": "bridge"                // or "host" for host networking
-    // "ports": ["8000:8000"]        // publish ports in bridge mode
+    "mode": "bridge",               // or "host" for host networking
+    "ports": ["8000:8000"]          // publish ports in bridge mode
   },
   "security": {
     "blocked_tools": ["curl", "wget"]
@@ -61,19 +117,33 @@ Per-project config in `yolo-jail.jsonc`:
 }
 ```
 
-Workspace config merges over user defaults (`~/.config/yolo-jail/config.jsonc`). Lists merge+dedupe, scalars override.
+Workspace config merges over user defaults (`~/.config/yolo-jail/config.jsonc`). Lists merge and dedupe, scalars override.
 
-## How It Works
-
-1. **Build**: `nix build` produces a layered Docker image with all tools.
-2. **Load**: Image is loaded into Docker/Podman (only when hash changes).
-3. **Run**: Container starts with workspace bind-mounted, persistent home, and tool provisioning.
-4. **Reuse**: Subsequent `yolo` invocations in the same workspace reuse the running container.
+Run `yolo config-ref` for the full configuration reference.
 
 ## Security
 
-- **Strict Isolation**: No access to host `~/.ssh/`, `~/.gitconfig`, or cloud credentials.
-- **Separate Auth**: Run `gh auth login` and `gemini login` inside the jail once.
-- **User Mapping**: Files created in the jail are owned by your host user (matching UID/GID).
-- **Blocked Tools**: Configurable list of tools that return clear error messages.
-- **Config Safety**: Changes to `yolo-jail.jsonc` require human confirmation at next startup. This prevents agents from silently modifying the jail environment. See `docs/config-safety.md`.
+- **Strict Isolation**: No access to host `~/.ssh/`, `~/.gitconfig`, or cloud credentials
+- **Separate Auth**: Run `gh auth login` and `gemini login` inside the jail once
+- **User Mapping**: Files created in the jail are owned by your host user (matching UID/GID)
+- **Blocked Tools**: Configurable list of tools that return clear error messages
+- **Config Safety**: Changes to `yolo-jail.jsonc` require human confirmation at next startup — agents cannot silently modify the jail environment. See [docs/config-safety.md](docs/config-safety.md).
+- **Read-Only Mounts**: Extra mounts are read-only by default
+
+## Troubleshooting
+
+Run `yolo doctor` to diagnose common setup issues:
+
+```bash
+yolo doctor
+```
+
+This checks your container runtime, Nix installation, configuration files, image status, and running containers.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+
+## License
+
+[Apache License 2.0](LICENSE)
