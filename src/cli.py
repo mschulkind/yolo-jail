@@ -1196,6 +1196,14 @@ def run(
         "-e", "COPILOT_ALLOW_ALL=true",
         "-e", "LD_LIBRARY_PATH=/lib:/usr/lib",
         "-e", "HOME=/home/agent",
+        # EDITOR=cat prevents agents from getting stuck in interactive editors.
+        # VISUAL=nvim is used by Copilot ctrl-g (checks COPILOT_EDITOR > VISUAL > EDITOR).
+        # These must be container-level env vars, not just in .bashrc, because
+        # Copilot runs as a non-interactive process that doesn't source .bashrc.
+        "-e", "EDITOR=cat",
+        "-e", "VISUAL=nvim",
+        "-e", "PAGER=cat",
+        "-e", "GIT_PAGER=cat",
         "-e", f"YOLO_BLOCK_CONFIG={blocked_config_json}",
         "-e", f"YOLO_HOST_DIR={workspace}",
         "-e", "OVERMIND_SOCKET=/tmp/overmind.sock",
