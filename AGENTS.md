@@ -194,7 +194,7 @@ mise registry  # List all available tools
 - **No Pagers**: Agents cannot handle interactive pagers.
     - `PAGER=cat`, `GIT_PAGER=cat`, `BAT_PAGER=""`.
     - `alias bat='bat --style=plain --paging=never'`.
-- **Editor Split**: `EDITOR=cat` prevents agents from getting stuck in interactive editors (e.g., `git commit` without `-m`). `VISUAL=nvim` enables human-interactive editing (e.g., Copilot's ctrl-g to edit prompt in editor). Standard Unix convention: programs check `VISUAL` first for full-screen terminals, `EDITOR` as fallback. Host `~/.config/nvim` is mounted read-only if present.
+- **Editor Split**: `EDITOR=cat` prevents agents from getting stuck in interactive editors (e.g., `git commit` without `-m`). `VISUAL=nvim` enables human-interactive editing (e.g., Copilot's ctrl-g to edit prompt in editor). Standard Unix convention: programs check `VISUAL` first for full-screen terminals, `EDITOR` as fallback. Host `~/.config/nvim` is copied (with symlinks resolved) into the persistent jail home on each startup.
 - **Terminal**: `TERM=xterm-256color` should be passed to maintain color support for agent parsing.
 - **Permissions**: Map host UID/GID to the container user to ensure file ownership on the host is preserved.
 - **No LD_LIBRARY_PATH Stripping**: `LD_LIBRARY_PATH=/lib:/usr/lib` is baked into the Docker image Env to survive agent environment sanitization.

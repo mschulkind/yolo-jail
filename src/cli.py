@@ -1285,10 +1285,18 @@ def run(
     docker_cmd.extend(publish_args)
     docker_cmd.extend(mount_args)
 
-    # Mount host nvim config so ctrl-g (edit prompt in editor) uses the user's config
+    # Copy host nvim config (resolving symlinks) so ctrl-g uses the user's config.
+    # We copy instead of bind-mounting because dotfile managers (stow, etc.) create
+    # symlinks like init.lua -> ~/.dotfiles/... which break inside the container.
     host_nvim_config = Path.home() / ".config" / "nvim"
-    if host_nvim_config.exists() and host_nvim_config.is_dir():
-        docker_cmd.extend(["-v", f"{host_nvim_config}:/home/agent/.config/nvim:ro"])
+    if host_nvim_config.is_dir():
+        jail_nvim_config = data_dir / "home" / ".config" / "nvim"
+        try:
+            if jail_nvim_config.exists():
+                shutil.rmtree(jail_nvim_config)
+            shutil.copytree(host_nvim_config, jail_nvim_config, symlinks=False)
+        except OSError as e:
+            console.print(f"[yellow]Warning: could not copy nvim config: {e}[/yellow]")
 
     # Shadow workspace .vscode/mcp.json so agents use only our jail MCP config
     vscode_mcp = workspace / ".vscode" / "mcp.json"
