@@ -34,7 +34,9 @@ def _perf_dump():
     log_path = HOME / ".yolo-perf.log"
     try:
         prev = None
-        lines = [f"=== YOLO Jail Entrypoint Perf ({time.strftime('%Y-%m-%d %H:%M:%S')}) ===\n"]
+        lines = [
+            f"=== YOLO Jail Entrypoint Perf ({time.strftime('%Y-%m-%d %H:%M:%S')}) ===\n"
+        ]
         for elapsed, label in _PERF_LOG:
             delta = f"+{elapsed - prev:.3f}s" if prev is not None else "       "
             lines.append(f"  {elapsed:7.3f}s  {delta:>9s}  {label}\n")
@@ -69,10 +71,52 @@ COPILOT_DIR = HOME / ".copilot"
 GEMINI_DIR = HOME / ".gemini"
 MISE_CONFIG_DIR = HOME / ".config" / "mise"
 
+# Default LSP servers always available in the jail.
+# command: absolute path (for Copilot); basename extracted for Gemini's mcp-language-server.
+# args: passed to the LSP binary directly.
+# fileExtensions: extension → language ID map (required for Copilot).
+DEFAULT_LSP_SERVERS = {
+    "python": {
+        "command": str(NPM_BIN / "pyright-langserver"),
+        "args": ["--stdio"],
+        "fileExtensions": {".py": "python", ".pyi": "python"},
+    },
+    "typescript": {
+        "command": str(NPM_BIN / "typescript-language-server"),
+        "args": ["--stdio"],
+        "fileExtensions": {
+            ".ts": "typescript",
+            ".tsx": "typescriptreact",
+            ".js": "javascript",
+            ".jsx": "javascriptreact",
+        },
+    },
+    "go": {
+        "command": str(GO_BIN / "gopls"),
+        "args": [],
+        "fileExtensions": {".go": "go"},
+    },
+}
+
+
+def _load_lsp_servers():
+    """Load LSP server config: defaults merged with workspace overrides from YOLO_LSP_SERVERS."""
+    servers = dict(DEFAULT_LSP_SERVERS)
+    extra_json = os.environ.get("YOLO_LSP_SERVERS", "")
+    if extra_json:
+        try:
+            extra = json.loads(extra_json)
+            if isinstance(extra, dict):
+                servers.update(extra)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return servers
+
 
 # ---------------------------------------------------------------------------
 # 1. Generate shims for blocked tools
 # ---------------------------------------------------------------------------
+
 
 def generate_shims():
     """Create shell shims that block or redirect tools per YOLO_BLOCK_CONFIG."""
@@ -118,11 +162,13 @@ def generate_shims():
 # 2. Generate .bashrc
 # ---------------------------------------------------------------------------
 
+
 def generate_bashrc():
     """Write the jail .bashrc with prompt, PATH, aliases, and mise activation."""
     host_dir = os.environ.get("YOLO_HOST_DIR", "unknown")
 
-    content = r"""# YOLO Jail Prompt
+    content = (
+        r"""# YOLO Jail Prompt
 YELLOW='\[\033[1;33m\]'
 RED='\[\033[1;31m\]'
 GREEN='\[\033[1;32m\]'
@@ -132,7 +178,9 @@ CYAN='\[\033[1;36m\]'
 NC='\[\033[0m\]'
 
 JAIL_BANNER="${RED}🔒 YOLO-JAIL${NC}"
-HOST_INFO="${CYAN}(host: """ + host_dir + r""")${NC}"
+HOST_INFO="${CYAN}(host: """
+        + host_dir
+        + r""")${NC}"
 
 export PS1="\n${JAIL_BANNER} ${HOST_INFO}\n${GREEN}jail${NC}:${BLUE}\w${NC}\$ "
 
@@ -171,12 +219,14 @@ alias vi='nvim'
 alias vim='nvim'
 alias bat='bat --style=plain --paging=never'
 """
+    )
     BASHRC_PATH.write_text(content)
 
 
 # ---------------------------------------------------------------------------
 # 3. Bootstrap script (runs after mise is ready)
 # ---------------------------------------------------------------------------
+
 
 def generate_bootstrap_script():
     """Create the idempotent bootstrap script that installs MCP/LSP tools."""
@@ -196,13 +246,14 @@ if ! command -v chrome-devtools-mcp >/dev/null; then
     YOLO_BYPASS_SHIMS=1 npm install -g chrome-devtools-mcp @modelcontextprotocol/server-sequential-thinking pyright typescript-language-server typescript
 fi
 
-if [ ! -f "$GOBIN/mcp-language-server" ]; then
+if [ ! -f "$GOBIN/mcp-language-server" ] || [ ! -f "$GOBIN/gopls" ]; then
     if command -v go >/dev/null; then
-        echo "Installing mcp-language-server via go..."
+        echo "Installing Go tools..."
         mkdir -p "$GOBIN"
-        YOLO_BYPASS_SHIMS=1 go install github.com/isaacphi/mcp-language-server@latest
+        [ -f "$GOBIN/mcp-language-server" ] || YOLO_BYPASS_SHIMS=1 go install github.com/isaacphi/mcp-language-server@latest
+        [ -f "$GOBIN/gopls" ] || YOLO_BYPASS_SHIMS=1 go install golang.org/x/tools/gopls@latest
     else
-        echo "Warning: go not found, skipping mcp-language-server install"
+        echo "Warning: go not found, skipping Go tool installs"
     fi
 fi
 
@@ -219,12 +270,14 @@ fi
 # 4. Mise global config
 # ---------------------------------------------------------------------------
 
+
 def generate_mise_config():
     """Write global mise config, injecting tools from YOLO_MISE_TOOLS."""
     config_path = MISE_CONFIG_DIR / "config.toml"
 
     # Parse injected tools from env (set by cli.py from yolo-jail.jsonc)
     import json as _json
+
     try:
         injected_tools = _json.loads(os.environ.get("YOLO_MISE_TOOLS", "{}"))
     except (ValueError, TypeError):
@@ -252,11 +305,14 @@ def generate_mise_config():
     # Update existing config: add/update only injected tools
     if injected_tools:
         import re
+
         content = config_path.read_text()
         for tool, version in injected_tools.items():
             pattern = rf'^{re.escape(tool)}\s*=\s*"[^"]*"'
             if re.search(pattern, content, re.MULTILINE):
-                content = re.sub(pattern, f'{tool} = "{version}"', content, flags=re.MULTILINE)
+                content = re.sub(
+                    pattern, f'{tool} = "{version}"', content, flags=re.MULTILINE
+                )
             else:
                 content = content.rstrip("\n") + f'\n{tool} = "{version}"\n'
         config_path.write_text(content)
@@ -265,6 +321,7 @@ def generate_mise_config():
 # ---------------------------------------------------------------------------
 # 5. MCP wrappers (node, npx, chrome)
 # ---------------------------------------------------------------------------
+
 
 def _write_executable(path: Path, content: str):
     """Write content to path and make executable."""
@@ -276,7 +333,9 @@ def _write_executable(path: Path, content: str):
 def generate_mcp_wrappers():
     """Create wrapper scripts for node, npx, and chrome-devtools-mcp."""
     # Chrome wrapper
-    _write_executable(HOME / ".local" / "bin" / "chrome-devtools-mcp-wrapper", r"""#!/bin/bash
+    _write_executable(
+        HOME / ".local" / "bin" / "chrome-devtools-mcp-wrapper",
+        r"""#!/bin/bash
 # Self-contained wrapper: sets its own env since agents sanitize child processes.
 export LD_LIBRARY_PATH="/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export FONTCONFIG_FILE="${FONTCONFIG_FILE:-/etc/fonts/fonts.conf}"
@@ -319,28 +378,36 @@ fi
 exec "$MCP_WRAPPERS_BIN/node" "$NPM_BIN/chrome-devtools-mcp" \
     --browser-url "$CHROME_URL" \
     "$@"
-""")
+""",
+    )
 
     # Node wrapper — bypass mise shims to avoid workspace env overhead on MCP startup
-    _write_executable(MCP_WRAPPERS_BIN / "node", r"""#!/bin/bash
+    _write_executable(
+        MCP_WRAPPERS_BIN / "node",
+        r"""#!/bin/bash
 export LD_LIBRARY_PATH="/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export FONTCONFIG_FILE="${FONTCONFIG_FILE:-/etc/fonts/fonts.conf}"
 export FONTCONFIG_PATH="${FONTCONFIG_PATH:-/etc/fonts}"
 exec /bin/node "$@"
-""")
+""",
+    )
 
     # npx wrapper — bypass mise shims for same reason
-    _write_executable(MCP_WRAPPERS_BIN / "npx", r"""#!/bin/bash
+    _write_executable(
+        MCP_WRAPPERS_BIN / "npx",
+        r"""#!/bin/bash
 export LD_LIBRARY_PATH="/lib:/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export FONTCONFIG_FILE="${FONTCONFIG_FILE:-/etc/fonts/fonts.conf}"
 export FONTCONFIG_PATH="${FONTCONFIG_PATH:-/etc/fonts}"
 exec /bin/npx "$@"
-""")
+""",
+    )
 
 
 # ---------------------------------------------------------------------------
 # 6. Git config
 # ---------------------------------------------------------------------------
+
 
 def configure_git():
     """Set git name, email, and global gitignore from host env vars."""
@@ -348,15 +415,21 @@ def configure_git():
         return
     env = os.environ
     if env.get("YOLO_GIT_NAME"):
-        subprocess.run(["git", "config", "--global", "user.name", env["YOLO_GIT_NAME"]],
-                       capture_output=True)
+        subprocess.run(
+            ["git", "config", "--global", "user.name", env["YOLO_GIT_NAME"]],
+            capture_output=True,
+        )
     if env.get("YOLO_GIT_EMAIL"):
-        subprocess.run(["git", "config", "--global", "user.email", env["YOLO_GIT_EMAIL"]],
-                       capture_output=True)
+        subprocess.run(
+            ["git", "config", "--global", "user.email", env["YOLO_GIT_EMAIL"]],
+            capture_output=True,
+        )
     gitignore = env.get("YOLO_GLOBAL_GITIGNORE", "")
     if gitignore and Path(gitignore).is_file():
-        subprocess.run(["git", "config", "--global", "core.excludesFile", gitignore],
-                       capture_output=True)
+        subprocess.run(
+            ["git", "config", "--global", "core.excludesFile", gitignore],
+            capture_output=True,
+        )
 
 
 def configure_jj():
@@ -365,16 +438,21 @@ def configure_jj():
         return
     env = os.environ
     if env.get("YOLO_JJ_NAME"):
-        subprocess.run(["jj", "config", "set", "--user", "user.name", env["YOLO_JJ_NAME"]],
-                       capture_output=True)
+        subprocess.run(
+            ["jj", "config", "set", "--user", "user.name", env["YOLO_JJ_NAME"]],
+            capture_output=True,
+        )
     if env.get("YOLO_JJ_EMAIL"):
-        subprocess.run(["jj", "config", "set", "--user", "user.email", env["YOLO_JJ_EMAIL"]],
-                       capture_output=True)
+        subprocess.run(
+            ["jj", "config", "set", "--user", "user.email", env["YOLO_JJ_EMAIL"]],
+            capture_output=True,
+        )
 
 
 # ---------------------------------------------------------------------------
 # 7. Skills directory merging
 # ---------------------------------------------------------------------------
+
 
 def merge_skills():
     """Sync host + workspace skills into Copilot and Gemini skills dirs (read-only)."""
@@ -407,6 +485,7 @@ def _copy_skill_dirs(src: Path, dst: Path):
     if not src.is_dir():
         return
     import stat
+
     for item in src.iterdir():
         if item.is_dir():
             target = dst / item.name
@@ -421,6 +500,7 @@ def _copy_skill_dirs(src: Path, dst: Path):
 def _make_readonly(path: Path):
     """Recursively remove write permission from a directory tree."""
     import stat
+
     for root, dirs, files in os.walk(path):
         for f in files:
             fp = Path(root) / f
@@ -434,6 +514,7 @@ def _make_readonly(path: Path):
 def _make_writable(path: Path):
     """Recursively restore write permission on a directory tree."""
     import stat
+
     path.chmod(path.stat().st_mode | stat.S_IWUSR)
     for root, dirs, files in os.walk(path):
         for d in dirs:
@@ -448,12 +529,15 @@ def _make_writable(path: Path):
 # 8. Copilot config (MCP + LSP)
 # ---------------------------------------------------------------------------
 
+
 def _chrome_devtools_args() -> list:
     """Common chrome-devtools-mcp args."""
     return [
         str(NPM_BIN / "chrome-devtools-mcp"),
-        "--headless", "--isolated",
-        "--executablePath", "/usr/bin/chromium",
+        "--headless",
+        "--isolated",
+        "--executablePath",
+        "/usr/bin/chromium",
         "--chrome-arg=--no-sandbox",
         "--chrome-arg=--disable-dev-shm-usage",
         "--chrome-arg=--disable-setuid-sandbox",
@@ -483,32 +567,28 @@ def configure_copilot():
             },
         }
     }
-    (COPILOT_DIR / "mcp-config.json").write_text(json.dumps(mcp_config, indent=2) + "\n")
+    (COPILOT_DIR / "mcp-config.json").write_text(
+        json.dumps(mcp_config, indent=2) + "\n"
+    )
 
-    # LSP config
-    lsp_config = {
-        "lspServers": {
-            "python": {
-                "command": str(NPM_BIN / "pyright-langserver"),
-                "args": ["--stdio"],
-                "fileExtensions": {".py": "python", ".pyi": "python"},
-            },
-            "typescript": {
-                "command": str(NPM_BIN / "typescript-language-server"),
-                "args": ["--stdio"],
-                "fileExtensions": {
-                    ".ts": "typescript", ".tsx": "typescriptreact",
-                    ".js": "javascript", ".jsx": "javascriptreact",
-                },
-            },
+    # LSP config (defaults + workspace overrides from YOLO_LSP_SERVERS)
+    servers = _load_lsp_servers()
+    lsp_config = {"lspServers": {}}
+    for name, cfg in servers.items():
+        lsp_config["lspServers"][name] = {
+            "command": cfg["command"],
+            "args": cfg.get("args", []),
+            "fileExtensions": cfg.get("fileExtensions", {}),
         }
-    }
-    (COPILOT_DIR / "lsp-config.json").write_text(json.dumps(lsp_config, indent=2) + "\n")
+    (COPILOT_DIR / "lsp-config.json").write_text(
+        json.dumps(lsp_config, indent=2) + "\n"
+    )
 
 
 # ---------------------------------------------------------------------------
 # 9. Gemini config (MCP + LSP in settings.json)
 # ---------------------------------------------------------------------------
+
 
 def configure_gemini():
     """Set up Gemini settings with MCP servers, merging with existing config."""
@@ -524,15 +604,21 @@ def configure_gemini():
             "command": str(MCP_WRAPPERS_BIN / "node"),
             "args": [str(NPM_BIN / "mcp-server-sequential-thinking")],
         },
-        "python-lsp": {
-            "command": str(GO_BIN / "mcp-language-server"),
-            "args": ["-lsp", "pyright-langserver", "-workspace", "/workspace", "--", "--stdio"],
-        },
-        "typescript-lsp": {
-            "command": str(GO_BIN / "mcp-language-server"),
-            "args": ["-lsp", "typescript-language-server", "-workspace", "/workspace", "--", "--stdio"],
-        },
     }
+
+    # Add LSP servers wrapped as MCP via mcp-language-server
+    lsp_servers = _load_lsp_servers()
+    for name, cfg in lsp_servers.items():
+        cmd = cfg["command"]
+        bare_cmd = Path(cmd).name
+        lsp_args = cfg.get("args", [])
+        mcp_args = ["-lsp", bare_cmd, "-workspace", "/workspace"]
+        if lsp_args:
+            mcp_args.extend(["--"] + lsp_args)
+        default_servers[f"{name}-lsp"] = {
+            "command": str(GO_BIN / "mcp-language-server"),
+            "args": mcp_args,
+        }
 
     try:
         if config_path.exists():
@@ -557,19 +643,28 @@ def configure_gemini():
 # 10. Finalize PATH and exec bash
 # ---------------------------------------------------------------------------
 
+
 def exec_bash(command: str):
     """Set up final PATH, activate mise, and exec bash with the given command."""
     path = f"{SHIM_DIR}:{NPM_BIN}:{GO_BIN}:{MISE_SHIMS}:/bin:/usr/bin"
     os.environ["PATH"] = path
 
-    os.execvp("bash", [
-        "bash", "--rcfile", str(BASHRC_PATH), "-c", command,
-    ])
+    os.execvp(
+        "bash",
+        [
+            "bash",
+            "--rcfile",
+            str(BASHRC_PATH),
+            "-c",
+            command,
+        ],
+    )
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main():
     cmd = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "bash"
@@ -622,8 +717,7 @@ def main():
 
     # Trust workspace mise.toml
     if Path("/workspace/mise.toml").exists():
-        subprocess.run(["mise", "trust", "/workspace/mise.toml"],
-                       capture_output=True)
+        subprocess.run(["mise", "trust", "/workspace/mise.toml"], capture_output=True)
 
     # Apply mise hook-env for non-interactive shells
     try:

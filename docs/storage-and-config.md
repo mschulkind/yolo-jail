@@ -54,7 +54,7 @@ All persistent jail state lives under `~/.local/share/yolo-jail/`:
 │   ├── .copilot/          │  Copilot config, logs, auth tokens
 │   ├── .gemini/           │  Gemini config, cache, auth tokens
 │   ├── .npm-global/       │  NPM global packages (MCP servers, etc.)
-│   ├── go/                │  Go binaries (mcp-language-server)
+│   ├── go/                │  Go binaries (mcp-language-server, gopls)
 │   ├── .local/bin/        │  MCP wrappers, chrome-devtools wrapper
 │   ├── .gitconfig         │  Git config (written by entrypoint)
 │   ├── .config/jj/        │  jj config (written by entrypoint)

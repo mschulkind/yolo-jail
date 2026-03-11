@@ -63,13 +63,16 @@ class TestConfigSnapshot:
         _check_config_changes(workspace, config)
 
         import io
+
         monkeypatch.setattr("sys.stdin", io.StringIO("y\n"))
         # Make isatty return True on our StringIO
         monkeypatch.setattr("sys.stdin.isatty", lambda: True)
         new_config = {"packages": ["strace", "htop"]}
         assert _check_config_changes(workspace, new_config) is True
         # Snapshot should be updated
-        snapshot = json.loads((workspace / ".yolo" / "config-snapshot.json").read_text())
+        snapshot = json.loads(
+            (workspace / ".yolo" / "config-snapshot.json").read_text()
+        )
         assert snapshot == new_config
 
     def test_changed_config_interactive_no(self, tmp_path, monkeypatch):
@@ -79,10 +82,13 @@ class TestConfigSnapshot:
         _check_config_changes(workspace, config)
 
         import io
+
         monkeypatch.setattr("sys.stdin", io.StringIO("n\n"))
         monkeypatch.setattr("sys.stdin.isatty", lambda: True)
         new_config = {"packages": ["strace", "htop"]}
         assert _check_config_changes(workspace, new_config) is False
         # Snapshot should NOT be updated
-        snapshot = json.loads((workspace / ".yolo" / "config-snapshot.json").read_text())
+        snapshot = json.loads(
+            (workspace / ".yolo" / "config-snapshot.json").read_text()
+        )
         assert snapshot == config

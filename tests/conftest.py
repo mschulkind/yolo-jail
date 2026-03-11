@@ -4,6 +4,7 @@ runtime before integration tests run. This is needed when pytest itself runs ins
 a jail (nested-container scenario), where the inner podman has its own separate image
 store that doesn't see the outer host's images.
 """
+
 import subprocess
 import shutil
 from pathlib import Path
@@ -35,9 +36,7 @@ def ensure_jail_image():
     runtime. On the host this is a no-op (cli.py handles it). Inside a jail the inner
     podman has an empty image store, so we build via the host nix daemon and load.
     """
-    in_container = (
-        Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
-    )
+    in_container = Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
     if not in_container:
         return  # cli.py already handles this on the host
 
@@ -48,16 +47,22 @@ def ensure_jail_image():
     if _image_exists(runtime):
         return  # Already loaded from a previous session (persistent home dir)
 
-    print(f"\n[conftest] Loading {JAIL_IMAGE} into inner {runtime} (this may take a minute)...")
+    print(
+        f"\n[conftest] Loading {JAIL_IMAGE} into inner {runtime} (this may take a minute)..."
+    )
 
     # Build via host nix daemon (NIX_REMOTE=daemon + /nix/var/nix/daemon-socket are
     # mounted into the jail by cli.py so nix can delegate builds to the host daemon).
     build = subprocess.run(
         [
             "nix",
-            "--extra-experimental-features", "nix-command flakes",
-            "build", ".#dockerImage", "--impure",
-            "--out-link", str(REPO_ROOT / ".run-result"),
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "build",
+            ".#dockerImage",
+            "--impure",
+            "--out-link",
+            str(REPO_ROOT / ".run-result"),
         ],
         cwd=str(REPO_ROOT),
         capture_output=True,
@@ -80,9 +85,7 @@ def ensure_jail_image():
                 capture_output=True,
             )
         if load.returncode != 0:
-            pytest.fail(
-                f"{runtime} load failed: {load.stderr.decode()}"
-            )
+            pytest.fail(f"{runtime} load failed: {load.stderr.decode()}")
         print(f"[conftest] {load.stdout.decode().strip()}")
     finally:
         result_link.unlink(missing_ok=True)

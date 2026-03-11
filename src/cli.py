@@ -98,6 +98,7 @@ def _default(ctx: typer.Context):
         # No subcommand → default to `run` (interactive shell)
         ctx.invoke(run)
 
+
 JAIL_IMAGE = "yolo-jail:latest"
 GLOBAL_STORAGE = Path.home() / ".local/share/yolo-jail"
 GLOBAL_HOME = GLOBAL_STORAGE / "home"
@@ -108,11 +109,18 @@ USER_CONFIG_PATH = Path.home() / ".config" / "yolo-jail" / "config.jsonc"
 
 console = Console()
 
+
 def ensure_global_storage():
     GLOBAL_HOME.mkdir(parents=True, exist_ok=True)
     GLOBAL_MISE.mkdir(parents=True, exist_ok=True)
     CONTAINER_DIR.mkdir(parents=True, exist_ok=True)
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    # Pre-create intermediate directories inside GLOBAL_HOME that will be parents
+    # of nested bind mounts.  Without this, Docker daemon (running as root) auto-creates
+    # them as root:root, making them unwritable by the -u UID:GID container process.
+    # Podman rootless is unaffected (UID mapping handles ownership).
+    for subdir in [".copilot", ".gemini", Path(".config") / "git"]:
+        (GLOBAL_HOME / subdir).mkdir(parents=True, exist_ok=True)
 
 
 def _get_project_name() -> str:
@@ -126,8 +134,11 @@ def _tmux_rename_window(name: str):
         return
     if os.environ.get("TMUX"):
         try:
-            subprocess.run(["tmux", "rename-window", name],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(
+                ["tmux", "rename-window", name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         except Exception:
             pass
 
@@ -145,40 +156,67 @@ def _kitty_setup_jail_tab():
         try:
             subprocess.run(
                 ["kitten", "@", *cmd_args],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
         except Exception:
             pass
 
     try:
-        old_title = subprocess.check_output(
-            ["kitten", "@", "get-tab-title", "--match", match_arg],
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
+        old_title = (
+            subprocess.check_output(
+                ["kitten", "@", "get-tab-title", "--match", match_arg],
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
     except Exception:
         old_title = ""
 
     try:
         subprocess.run(
-            ["kitten", "@", "set-tab-title", "--match", match_arg,
-             f"🔒 JAIL {project}"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            [
+                "kitten",
+                "@",
+                "set-tab-title",
+                "--match",
+                match_arg,
+                f"🔒 JAIL {project}",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
     except Exception:
         return None
 
     # Turn the tab red
-    _kitten_run(["set-tab-color", "--match", match_arg,
-                 "active_bg=#cc0000", "active_fg=#ffffff",
-                 "inactive_bg=#880000", "inactive_fg=#cccccc"])
+    _kitten_run(
+        [
+            "set-tab-color",
+            "--match",
+            match_arg,
+            "active_bg=#cc0000",
+            "active_fg=#ffffff",
+            "inactive_bg=#880000",
+            "inactive_fg=#cccccc",
+        ]
+    )
 
     def restore():
-        _kitten_run(["set-tab-title", "--match", match_arg,
-                      old_title or "bash"])
+        _kitten_run(["set-tab-title", "--match", match_arg, old_title or "bash"])
         # Reset tab colors to kitty.conf defaults
-        _kitten_run(["set-tab-color", "--match", match_arg,
-                      "active_bg=none", "active_fg=none",
-                      "inactive_bg=none", "inactive_fg=none"])
+        _kitten_run(
+            [
+                "set-tab-color",
+                "--match",
+                match_arg,
+                "active_bg=none",
+                "active_fg=none",
+                "inactive_bg=none",
+                "inactive_fg=none",
+            ]
+        )
 
     return restore
 
@@ -197,7 +235,8 @@ def _tmux_setup_jail_pane():
         try:
             r = subprocess.run(
                 ["tmux", "show-option", "-pt", pane, opt],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             if r.returncode == 0 and r.stdout.strip():
                 # Output is "option-name value" — extract value after first space
@@ -211,7 +250,8 @@ def _tmux_setup_jail_pane():
         try:
             subprocess.run(
                 ["tmux", "set-option", "-pt", pane, opt, val],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
         except Exception:
             pass
@@ -220,24 +260,36 @@ def _tmux_setup_jail_pane():
         try:
             subprocess.run(
                 ["tmux", "set-option", "-put", pane, opt],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
         except Exception:
             pass
 
     # Save old state
-    old = {opt: _tmux_opt(opt) for opt in [
-        "pane-border-style", "pane-active-border-style",
-        "pane-border-status", "pane-border-format",
-    ]}
+    old = {
+        opt: _tmux_opt(opt)
+        for opt in [
+            "pane-border-style",
+            "pane-active-border-style",
+            "pane-border-status",
+            "pane-border-format",
+        ]
+    }
     old_window = None
     old_auto_rename = None
     try:
-        r = subprocess.run(["tmux", "display-message", "-p", "#{window_name}"],
-                           capture_output=True, text=True)
+        r = subprocess.run(
+            ["tmux", "display-message", "-p", "#{window_name}"],
+            capture_output=True,
+            text=True,
+        )
         old_window = r.stdout.strip() if r.returncode == 0 else None
-        r = subprocess.run(["tmux", "show-window-option", "-v", "automatic-rename"],
-                           capture_output=True, text=True)
+        r = subprocess.run(
+            ["tmux", "show-window-option", "-v", "automatic-rename"],
+            capture_output=True,
+            text=True,
+        )
         old_auto_rename = r.stdout.strip() if r.returncode == 0 else None
     except Exception:
         pass
@@ -248,10 +300,16 @@ def _tmux_setup_jail_pane():
     _tmux_set("pane-border-status", "bottom")
     _tmux_set("pane-border-format", f" 🔒 JAIL {jail_dir} ")
     try:
-        subprocess.run(["tmux", "set-window-option", "automatic-rename", "off"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["tmux", "rename-window", "JAIL"],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(
+            ["tmux", "set-window-option", "automatic-rename", "off"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        subprocess.run(
+            ["tmux", "rename-window", "JAIL"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
     except Exception:
         pass
 
@@ -275,8 +333,9 @@ def _tmux_setup_jail_pane():
                     if i > 0:
                         full_cmd.append(";")
                     full_cmd.extend(cmd.split())
-                subprocess.run(full_cmd, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL)
+                subprocess.run(
+                    full_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
             except Exception:
                 pass
 
@@ -295,7 +354,9 @@ def _runtime(config: Dict[str, Any] = None) -> str:
     for rt in ("podman", "docker"):
         if shutil.which(rt):
             return rt
-    console.print("[bold red]No container runtime found. Install podman or docker.[/bold red]")
+    console.print(
+        "[bold red]No container runtime found. Install podman or docker.[/bold red]"
+    )
     sys.exit(1)
 
 
@@ -309,7 +370,8 @@ def find_running_container(name: str, runtime: str = "docker") -> Optional[str]:
     """Return container ID if a container with this name is running, else None."""
     result = subprocess.run(
         [runtime, "ps", "-q", "--filter", f"name=^/{name}$"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
     )
     cid = result.stdout.strip()
     return cid if cid else None
@@ -396,48 +458,50 @@ def generate_agents_md(
             lines.append(f"- `{container_path}` (from host `{host_path}`)")
         lines.append("")
 
-    lines.extend([
-        "## Limitations",
-        "",
-        "- **No internet restrictions** but no host credentials (no ~/.ssh, no ~/.gitconfig).",
-        "- **No pagers**: PAGER=cat, GIT_PAGER=cat. Do not pipe to less/more.",
-        "- **Read-only mounts**: Context mounts under `/ctx/` are read-only.",
-        "- **No sudo/root**: You run as a mapped host user with no privilege escalation.",
-        "- **No git push/pull**: No GitHub credentials are available. Do not attempt `gh auth login` or SSH-based git operations.",
-        "",
-        "## Adding Packages",
-        "",
-        "If you need a tool that is not installed, you can request it:",
-        "",
-        "1. Edit `/workspace/yolo-jail.jsonc` and add the package to the `packages` array",
-        "2. Tell the human user: \"Please restart the jail so the new package becomes available\"",
-        "3. The human will see a config diff and confirm the change at next startup",
-        "4. After restart, the package will be available",
-        "",
-        "Example — to add PostgreSQL tools (latest version):",
-        "```json",
-        '  "packages": ["postgresql"]',
-        "```",
-        "",
-        "To pin a specific version, use an object with a nixpkgs commit hash:",
-        "```json",
-        '  "packages": [{"name": "freetype", "nixpkgs": "e6f23dc0..."}]',
-        "```",
-        "Find nixpkgs commits for specific versions at: https://lazamar.co.uk/nix-versions/",
-        "",
-        "To override a version with an upstream source (when nixpkgs hasn't caught up):",
-        "```json",
-        '  "packages": [{"name": "freetype", "version": "2.14.1",',
-        '    "url": "mirror://savannah/freetype/freetype-2.14.1.tar.xz",',
-        '    "hash": "sha256-MkJ+jEcawJWFMhKjeu+BbGC0IFLU2eSCMLqzvfKTbMw="}]',
-        "```",
-        "Get the hash: run nix-prefetch-url <url>, or set hash to empty and nix reports it.",
-        "",
-        "Package names must match nixpkgs attributes (https://search.nixos.org/packages).",
-        "Do NOT install packages via apt, nix-env, or other package managers.",
-        "Run `yolo config-ref` for the full configuration reference.",
-        "",
-    ])
+    lines.extend(
+        [
+            "## Limitations",
+            "",
+            "- **No internet restrictions** but no host credentials (no ~/.ssh, no ~/.gitconfig).",
+            "- **No pagers**: PAGER=cat, GIT_PAGER=cat. Do not pipe to less/more.",
+            "- **Read-only mounts**: Context mounts under `/ctx/` are read-only.",
+            "- **No sudo/root**: You run as a mapped host user with no privilege escalation.",
+            "- **No git push/pull**: No GitHub credentials are available. Do not attempt `gh auth login` or SSH-based git operations.",
+            "",
+            "## Adding Packages",
+            "",
+            "If you need a tool that is not installed, you can request it:",
+            "",
+            "1. Edit `/workspace/yolo-jail.jsonc` and add the package to the `packages` array",
+            '2. Tell the human user: "Please restart the jail so the new package becomes available"',
+            "3. The human will see a config diff and confirm the change at next startup",
+            "4. After restart, the package will be available",
+            "",
+            "Example — to add PostgreSQL tools (latest version):",
+            "```json",
+            '  "packages": ["postgresql"]',
+            "```",
+            "",
+            "To pin a specific version, use an object with a nixpkgs commit hash:",
+            "```json",
+            '  "packages": [{"name": "freetype", "nixpkgs": "e6f23dc0..."}]',
+            "```",
+            "Find nixpkgs commits for specific versions at: https://lazamar.co.uk/nix-versions/",
+            "",
+            "To override a version with an upstream source (when nixpkgs hasn't caught up):",
+            "```json",
+            '  "packages": [{"name": "freetype", "version": "2.14.1",',
+            '    "url": "mirror://savannah/freetype/freetype-2.14.1.tar.xz",',
+            '    "hash": "sha256-MkJ+jEcawJWFMhKjeu+BbGC0IFLU2eSCMLqzvfKTbMw="}]',
+            "```",
+            "Get the hash: run nix-prefetch-url <url>, or set hash to empty and nix reports it.",
+            "",
+            "Package names must match nixpkgs attributes (https://search.nixos.org/packages).",
+            "Do NOT install packages via apt, nix-env, or other package managers.",
+            "Run `yolo config-ref` for the full configuration reference.",
+            "",
+        ]
+    )
 
     jail_content = "\n".join(lines) + "\n"
 
@@ -453,6 +517,7 @@ def generate_agents_md(
 
     return agents_dir
 
+
 def _summarize_nix_line(line: str) -> str:
     """Extract a short human-readable summary from nix build stderr."""
     # "copying path '/nix/store/hash-name-1.0' from ..."
@@ -467,7 +532,7 @@ def _summarize_nix_line(line: str) -> str:
     if "evaluating" in line.lower():
         return "Evaluating flake..."
     # Progress counters like "[3/5 built, 2 copied (10.2 MiB)]"
-    m = re.match(r'\[[\d/]+ (?:built|copied|fetched).*\]', line.strip())
+    m = re.match(r"\[[\d/]+ (?:built|copied|fetched).*\]", line.strip())
     if m:
         return line.strip()
     return ""
@@ -485,9 +550,17 @@ def _estimate_image_size(store_path: str, sentinel: Path) -> int:
     # Fall back to nix closure size (approximates uncompressed image)
     try:
         r = subprocess.run(
-            ["nix", "--extra-experimental-features", "nix-command flakes",
-             "path-info", "--closure-size", store_path],
-            capture_output=True, text=True, timeout=5,
+            [
+                "nix",
+                "--extra-experimental-features",
+                "nix-command flakes",
+                "path-info",
+                "--closure-size",
+                store_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         if r.returncode == 0:
             # Output format: "/nix/store/...\t<size>" or just the path with -S flag
@@ -503,7 +576,7 @@ def _estimate_image_size(store_path: str, sentinel: Path) -> int:
 def _format_progress(current: int, estimate: int) -> str:
     """Format byte progress with optional percentage."""
     mb = current / (1024 * 1024)
-    cur_str = f"{mb/1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+    cur_str = f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
     if estimate > 0:
         pct = min(int(current * 100 / estimate), 99)  # Cap at 99% until done
         return f"{cur_str} ({pct}%)"
@@ -519,7 +592,11 @@ def _read_loaded_paths(sentinel: Path) -> set[str]:
 
 def _add_loaded_path(sentinel: Path, store_path: str):
     """Add a store path to the sentinel, capping at 10 entries (LRU)."""
-    paths = [line.strip() for line in sentinel.read_text().splitlines() if line.strip()] if sentinel.exists() else []
+    paths = (
+        [line.strip() for line in sentinel.read_text().splitlines() if line.strip()]
+        if sentinel.exists()
+        else []
+    )
     # Remove if already present (will re-add at end as most recent)
     paths = [p for p in paths if p != store_path]
     paths.append(store_path)
@@ -529,31 +606,46 @@ def _add_loaded_path(sentinel: Path, store_path: str):
     sentinel.write_text("\n".join(paths) + "\n")
 
 
-def auto_load_image(repo_root: Path, extra_packages: List[Union[str, dict]] = None, runtime: str = "docker"):
+def auto_load_image(
+    repo_root: Path,
+    extra_packages: List[Union[str, dict]] = None,
+    runtime: str = "docker",
+):
     """Cheaply check if the nix image needs to be reloaded into the container runtime."""
     # Per-runtime sentinel tracks all store paths loaded into this runtime
     sentinel = repo_root / f".last-load-{runtime}"
-    
+
     # 1. Build the image (fast if no changes, streams progress otherwise)
     build_env = os.environ.copy()
     pkg_json = json.dumps(extra_packages) if extra_packages else ""
     if extra_packages:
         build_env["YOLO_EXTRA_PACKAGES"] = pkg_json
-    
+
     build_stderr_tail: list[str] = []  # Keep last N lines for error display
     build_ok = True
     try:
         process = subprocess.Popen(
-            ["nix", "--extra-experimental-features", "nix-command flakes",
-             "build", ".#dockerImage", "--impure", "--out-link", ".run-result",
-             "--print-build-logs"],
-            cwd=repo_root, env=build_env,
+            [
+                "nix",
+                "--extra-experimental-features",
+                "nix-command flakes",
+                "build",
+                ".#dockerImage",
+                "--impure",
+                "--out-link",
+                ".run-result",
+                "--print-build-logs",
+            ],
+            cwd=repo_root,
+            env=build_env,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
         )
-        
-        with console.status("[bold blue]Checking jail image...", spinner="dots") as status:
+
+        with console.status(
+            "[bold blue]Checking jail image...", spinner="dots"
+        ) as status:
             if process.stderr:
                 for line in iter(process.stderr.readline, ""):
                     clean = line.rstrip()
@@ -564,17 +656,21 @@ def auto_load_image(repo_root: Path, extra_packages: List[Union[str, dict]] = No
                         summary = _summarize_nix_line(clean)
                         if summary:
                             status.update(f"[bold blue]{summary}[/bold blue]")
-        
+
         process.wait()
         if process.returncode != 0:
             build_ok = False
     except FileNotFoundError:
         build_ok = False
         build_stderr_tail.append("nix command not found")
-    
+
     if not build_ok:
-        err_summary = "\n".join(build_stderr_tail[-10:]) if build_stderr_tail else "unknown error"
-        console.print(f"[yellow]Warning: nix build failed:[/yellow]\n[dim]{err_summary}[/dim]")
+        err_summary = (
+            "\n".join(build_stderr_tail[-10:]) if build_stderr_tail else "unknown error"
+        )
+        console.print(
+            f"[yellow]Warning: nix build failed:[/yellow]\n[dim]{err_summary}[/dim]"
+        )
         # If the image already exists in the runtime (e.g. pre-loaded inside a jail),
         # we can still proceed — just skip the load step.
         check = subprocess.run(
@@ -584,7 +680,9 @@ def auto_load_image(repo_root: Path, extra_packages: List[Union[str, dict]] = No
         if check.returncode == 0:
             console.print(f"[yellow]Using existing {JAIL_IMAGE} image.[/yellow]")
             return
-        console.print(f"[bold red]No existing {JAIL_IMAGE} image found. Cannot start jail.[/bold red]")
+        console.print(
+            f"[bold red]No existing {JAIL_IMAGE} image found. Cannot start jail.[/bold red]"
+        )
         return
 
     # 2. Check if this store path has already been loaded into the runtime
@@ -594,17 +692,23 @@ def auto_load_image(repo_root: Path, extra_packages: List[Union[str, dict]] = No
     if current_path not in loaded_paths:
         # Print the reason for the reload
         if not loaded_paths:
-            console.print(f"[bold blue]Image load needed:[/bold blue] first run (no images loaded into {runtime} yet)")
+            console.print(
+                f"[bold blue]Image load needed:[/bold blue] first run (no images loaded into {runtime} yet)"
+            )
         else:
-            console.print("[bold blue]Image load needed:[/bold blue] nix store path changed")
+            console.print(
+                "[bold blue]Image load needed:[/bold blue] nix store path changed"
+            )
             console.print(f"  [dim]new: {current_path}[/dim]")
             if pkg_json:
                 console.print(f"  [dim]packages: {pkg_json}[/dim]")
         try:
-            with console.status(f"[bold cyan]Preparing image for {runtime}...", spinner="bouncingBar") as status:
+            with console.status(
+                f"[bold cyan]Preparing image for {runtime}...", spinner="bouncingBar"
+            ) as status:
                 # Estimate size (uses saved size from last stream, or nix closure size)
                 estimated_size = _estimate_image_size(current_path, sentinel)
-                
+
                 # streamLayeredImage produces a script that outputs the image tar to stdout.
                 # Pipe it directly to `runtime load` — generation and loading run in parallel.
                 status.update(f"[bold cyan]Starting image stream to {runtime}...")
@@ -619,7 +723,7 @@ def auto_load_image(repo_root: Path, extra_packages: List[Union[str, dict]] = No
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
-                
+
                 total_bytes = 0
                 chunk_size = 1024 * 1024  # 1 MB
                 while True:
@@ -631,25 +735,30 @@ def auto_load_image(repo_root: Path, extra_packages: List[Union[str, dict]] = No
                     progress = _format_progress(total_bytes, estimated_size)
                     status.update(f"[bold cyan]Streaming to {runtime}... {progress}")
                 load_proc.stdin.close()
-            
+
             stream_proc.wait()
             load_proc.wait()
-            
+
             if stream_proc.returncode != 0 or load_proc.returncode != 0:
-                console.print(f"[bold red]Error loading image into {runtime}.[/bold red]")
+                console.print(
+                    f"[bold red]Error loading image into {runtime}.[/bold red]"
+                )
             else:
                 mb = total_bytes / (1024 * 1024)
-                size_str = f"{mb/1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
-                console.print(f"[bold green]Done: loaded image ({size_str})[/bold green]")
+                size_str = f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+                console.print(
+                    f"[bold green]Done: loaded image ({size_str})[/bold green]"
+                )
                 _add_loaded_path(sentinel, current_path)
                 # Save actual size for accurate future estimates
                 size_file = sentinel.parent / f"{sentinel.name}-size"
                 size_file.write_text(str(total_bytes))
         except Exception as e:
             console.print(f"[bold red]Error streaming image: {e}[/bold red]")
-    
+
     # Cleanup temp link
     (repo_root / ".run-result").unlink(missing_ok=True)
+
 
 def _load_jsonc_file(path: Path, label: str) -> Dict[str, Any]:
     if not path.exists():
@@ -662,6 +771,7 @@ def _load_jsonc_file(path: Path, label: str) -> Dict[str, Any]:
         typer.echo(f"Warning: Failed to parse {label}: {e}", err=True)
         return {}
 
+
 def _merge_lists(base: List[Any], override: List[Any]) -> List[Any]:
     merged = list(base)
     seen = {json.dumps(item, sort_keys=True, default=str) for item in merged}
@@ -672,21 +782,28 @@ def _merge_lists(base: List[Any], override: List[Any]) -> List[Any]:
             seen.add(key)
     return merged
 
+
 def merge_config(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     result = dict(base)
     for key, value in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
             result[key] = merge_config(result[key], value)
-        elif key in result and isinstance(result[key], list) and isinstance(value, list):
+        elif (
+            key in result and isinstance(result[key], list) and isinstance(value, list)
+        ):
             result[key] = _merge_lists(result[key], value)
         else:
             result[key] = value
     return result
 
+
 def load_config() -> Dict[str, Any]:
     user_config = _load_jsonc_file(USER_CONFIG_PATH, str(USER_CONFIG_PATH))
-    workspace_config = _load_jsonc_file(Path.cwd() / "yolo-jail.jsonc", "yolo-jail.jsonc")
+    workspace_config = _load_jsonc_file(
+        Path.cwd() / "yolo-jail.jsonc", "yolo-jail.jsonc"
+    )
     return merge_config(user_config, workspace_config)
+
 
 @app.command()
 def init():
@@ -744,6 +861,17 @@ def init():
   // Extra tools to install via mise (key: tool name, value: version string).
   // Default: {"neovim": "stable"} — override in user or workspace config.
   // "mise_tools": {"neovim": "nightly", "typst": "latest"}
+
+  // Additional language servers for Copilot and Gemini.
+  // Defaults (always present): python (pyright), typescript, go (gopls).
+  // Add new servers or override defaults. Binary must be on PATH (e.g., via mise_tools).
+  // "lsp_servers": {
+  //   "rust": {
+  //     "command": "rust-analyzer",
+  //     "args": [],
+  //     "fileExtensions": {".rs": "rust"}
+  //   }
+  // }
 }
 """
     with open(config_path, "w") as f:
@@ -875,6 +1003,7 @@ def init_user_config():
         f.write(content)
     typer.echo(f"Created {USER_CONFIG_PATH}")
 
+
 @app.command("config-ref")
 def config_ref():
     """Show the full YOLO Jail configuration reference."""
@@ -940,6 +1069,19 @@ def config_ref():
     Deep-merged: user config adds tools, workspace config overrides versions.
     Example: {"neovim": "nightly", "typst": "latest"}
 
+  [bold]lsp_servers[/bold] (object): Additional language servers for Copilot and Gemini.
+    Default servers (always present): python (pyright), typescript, go (gopls).
+    Workspace servers are merged with defaults — add new ones or override existing.
+    Each key is a server name; value is an object with:
+      • command (string, required): Binary name (on PATH) or absolute path.
+      • args (array of strings): Args passed to the LSP binary. Default: [].
+      • fileExtensions (object): Extension → language ID map (required for Copilot).
+    The entrypoint translates these for each agent:
+      • Copilot: written to ~/.copilot/lsp-config.json as native LSP servers.
+      • Gemini: wrapped via mcp-language-server as MCP servers in settings.json.
+    Example: {"rust": {"command": "rust-analyzer", "args": [],
+              "fileExtensions": {".rs": "rust"}}}
+
   [bold]devices[/bold] (array): Host devices to pass through to the jail.
     Three formats supported:
     • USB by vendor:product ID (preferred — stable across reboots):
@@ -958,6 +1100,10 @@ def config_ref():
   {
     "runtime": "podman",
     "mise_tools": {"neovim": "nightly"},
+    "lsp_servers": {
+      "rust": {"command": "rust-analyzer", "args": [],
+               "fileExtensions": {".rs": "rust"}}
+    },
     "packages": [
       "strace",
       {"name": "freetype", "nixpkgs": "e6f23dc0..."},
@@ -1132,15 +1278,19 @@ def _check_config_changes(workspace: Path, config: Dict[str, Any]) -> bool:
         return True
 
     # Show diff
-    diff_lines = list(difflib.unified_diff(
-        old_json.splitlines(),
-        current_json.splitlines(),
-        fromfile="previous config",
-        tofile="current config",
-        lineterm="",
-    ))
+    diff_lines = list(
+        difflib.unified_diff(
+            old_json.splitlines(),
+            current_json.splitlines(),
+            fromfile="previous config",
+            tofile="current config",
+            lineterm="",
+        )
+    )
 
-    console.print("\n[bold yellow]⚠  Jail config changed since last run:[/bold yellow]\n")
+    console.print(
+        "\n[bold yellow]⚠  Jail config changed since last run:[/bold yellow]\n"
+    )
     for line in diff_lines:
         if line.startswith("+++") or line.startswith("---"):
             console.print(f"[dim]{line}[/dim]")
@@ -1154,7 +1304,9 @@ def _check_config_changes(workspace: Path, config: Dict[str, Any]) -> bool:
             console.print(line)
 
     if not sys.stdin.isatty():
-        console.print("\n[yellow]Non-interactive mode: accepting config changes automatically.[/yellow]")
+        console.print(
+            "\n[yellow]Non-interactive mode: accepting config changes automatically.[/yellow]"
+        )
         snapshot_path.write_text(current_json + "\n")
         return True
 
@@ -1173,18 +1325,30 @@ def _check_config_changes(workspace: Path, config: Dict[str, Any]) -> bool:
     return False
 
 
-@app.command(context_settings={"allow_extra_args": True, "ignore_unknown_options": True})
+@app.command(
+    context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
+)
 def run(
     ctx: typer.Context,
     network: str = typer.Option("bridge", help="Container network mode (bridge/host)"),
-    new: bool = typer.Option(False, "--new", help="Force a new container even if one already exists for this workspace"),
-    profile: bool = typer.Option(False, "--profile", help="Show detailed startup performance timing after command exits"),
+    new: bool = typer.Option(
+        False,
+        "--new",
+        help="Force a new container even if one already exists for this workspace",
+    ),
+    profile: bool = typer.Option(
+        False,
+        "--profile",
+        help="Show detailed startup performance timing after command exits",
+    ),
 ):
     """Run the YOLO jail in the current directory."""
     # Find repo root — use YOLO_REPO_ROOT env var inside jails, otherwise resolve from source
-    repo_root = Path(os.environ.get("YOLO_REPO_ROOT", Path(__file__).parent.parent)).resolve()
+    repo_root = Path(
+        os.environ.get("YOLO_REPO_ROOT", Path(__file__).parent.parent)
+    ).resolve()
     workspace = Path.cwd()
-    
+
     ensure_global_storage()
     config = load_config()
     runtime = _runtime(config)
@@ -1203,33 +1367,51 @@ def run(
     # Collect identity env vars early — needed for both exec and run paths
     identity_env = []
     try:
-        git_name = subprocess.check_output(
-            ["git", "config", "--get", "user.name"], stderr=subprocess.DEVNULL
-        ).decode().strip()
+        git_name = (
+            subprocess.check_output(
+                ["git", "config", "--get", "user.name"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
         if git_name:
             identity_env.extend(["-e", f"YOLO_GIT_NAME={git_name}"])
     except Exception:
         pass
     try:
-        git_email = subprocess.check_output(
-            ["git", "config", "--get", "user.email"], stderr=subprocess.DEVNULL
-        ).decode().strip()
+        git_email = (
+            subprocess.check_output(
+                ["git", "config", "--get", "user.email"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+        )
         if git_email:
             identity_env.extend(["-e", f"YOLO_GIT_EMAIL={git_email}"])
     except Exception:
         pass
     try:
-        jj_name = subprocess.check_output(
-            ["jj", "config", "get", "user.name"], stderr=subprocess.DEVNULL
-        ).decode().strip().strip('"')
+        jj_name = (
+            subprocess.check_output(
+                ["jj", "config", "get", "user.name"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+            .strip('"')
+        )
         if jj_name:
             identity_env.extend(["-e", f"YOLO_JJ_NAME={jj_name}"])
     except Exception:
         pass
     try:
-        jj_email = subprocess.check_output(
-            ["jj", "config", "get", "user.email"], stderr=subprocess.DEVNULL
-        ).decode().strip().strip('"')
+        jj_email = (
+            subprocess.check_output(
+                ["jj", "config", "get", "user.email"], stderr=subprocess.DEVNULL
+            )
+            .decode()
+            .strip()
+            .strip('"')
+        )
         if jj_email:
             identity_env.extend(["-e", f"YOLO_JJ_EMAIL={jj_email}"])
     except Exception:
@@ -1242,16 +1424,21 @@ def run(
 
     if existing_cid:
         # Exec into the existing container
-        console.print(f"[bold cyan]Attaching to existing jail [dim]({cname})[/dim]...[/bold cyan]")
+        console.print(
+            f"[bold cyan]Attaching to existing jail [dim]({cname})[/dim]...[/bold cyan]"
+        )
         _tmux_rename_window("JAIL")
         exec_flags = ["-i"]
         if sys.stdout.isatty():
             exec_flags.append("-t")
         docker_cmd = [
-            runtime, "exec", *exec_flags,
+            runtime,
+            "exec",
+            *exec_flags,
             *identity_env,
             cname,
-            "yolo-entrypoint", target_cmd,
+            "yolo-entrypoint",
+            target_cmd,
         ]
         # Use subprocess.run (not execvp) so atexit handlers fire for tmux cleanup
         result = subprocess.run(docker_cmd)
@@ -1271,7 +1458,9 @@ def run(
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
     except OSError as e:
-        console.print(f"[dim]Warning: could not acquire workspace lock ({e}); race protection disabled[/dim]")
+        console.print(
+            f"[dim]Warning: could not acquire workspace lock ({e}); race protection disabled[/dim]"
+        )
 
     # Re-check after acquiring the lock — another process may have started
     # a container while we were waiting.
@@ -1279,21 +1468,27 @@ def run(
         raced_cid = find_running_container(cname, runtime=runtime)
         if raced_cid:
             lock_file.close()
-            console.print(f"[bold cyan]Attaching to jail started by another process [dim]({cname})[/dim]...[/bold cyan]")
+            console.print(
+                f"[bold cyan]Attaching to jail started by another process [dim]({cname})[/dim]...[/bold cyan]"
+            )
             _tmux_rename_window("JAIL")
             exec_flags = ["-i"]
             if sys.stdout.isatty():
                 exec_flags.append("-t")
             docker_cmd = [
-                runtime, "exec", *exec_flags,
+                runtime,
+                "exec",
+                *exec_flags,
                 *identity_env,
                 cname,
-                "yolo-entrypoint", target_cmd,
+                "yolo-entrypoint",
+                target_cmd,
             ]
             result = subprocess.run(docker_cmd)
             sys.exit(result.returncode)
 
     import time as _time
+
     _profile_times = {}
     if profile:
         _profile_times["start"] = _time.monotonic()
@@ -1302,6 +1497,7 @@ def run(
     # Merge mise_tools: hardcoded defaults < user config < workspace config
     default_mise_tools = {"neovim": "stable"}
     mise_tools = {**default_mise_tools, **config.get("mise_tools", {})}
+    lsp_servers = config.get("lsp_servers", {})
     auto_load_image(repo_root, extra_packages=extra_packages or None, runtime=runtime)
 
     # Resolve host mise path — share the same data dir so venv paths match.
@@ -1320,7 +1516,7 @@ def run(
     net_mode = network
     if config.get("network", {}).get("mode"):
         net_mode = config["network"]["mode"]
-    
+
     # Determine Ports
     publish_args = []
     if net_mode == "bridge" and config.get("network", {}).get("ports"):
@@ -1329,9 +1525,9 @@ def run(
 
     # Process Blocked Tools for the Container
     security_section = config.get("security", {})
-    if security_section is None: 
+    if security_section is None:
         security_section = {}
-    
+
     raw_blocked = security_section.get("blocked_tools", ["grep", "find"])
     if raw_blocked is None:
         raw_blocked = ["grep", "find"]
@@ -1340,16 +1536,16 @@ def run(
     default_messages = {
         "grep": {
             "message": "grep is blocked to prevent unintended recursive searches. Use ripgrep (rg) or other targeted tools.",
-            "suggestion": "Try: rg <pattern> [file]"
+            "suggestion": "Try: rg <pattern> [file]",
         },
         "find": {
             "message": "find is blocked to prevent unintended recursive searches. Use fd for a faster, more intuitive alternative.",
-            "suggestion": "Try: fd <pattern>"
-        }
+            "suggestion": "Try: fd <pattern>",
+        },
     }
 
     normalized_blocked = []
-    
+
     for tool in raw_blocked:
         if isinstance(tool, str):
             tool_dict = {"name": tool}
@@ -1359,7 +1555,7 @@ def run(
             normalized_blocked.append(tool_dict)
         elif isinstance(tool, dict) and "name" in tool:
             normalized_blocked.append(tool)
-            
+
     blocked_config_json = json.dumps(normalized_blocked)
 
     # Process Extra Mounts
@@ -1378,7 +1574,9 @@ def run(
             container_path = f"/ctx/{Path(host_path).expanduser().resolve().name}"
         host_path = str(Path(host_path).expanduser().resolve())
         if not Path(host_path).exists():
-            console.print(f"[yellow]Warning: mount path does not exist, skipping: {host_path}[/yellow]")
+            console.print(
+                f"[yellow]Warning: mount path does not exist, skipping: {host_path}[/yellow]"
+            )
             continue
         mount_args.extend(["-v", f"{host_path}:{container_path}:ro"])
         mount_descriptions.append(f"{host_path}:{container_path}")
@@ -1398,45 +1596,78 @@ def run(
     (ws_state / "ssh").mkdir(exist_ok=True, mode=0o700)
 
     docker_cmd = [
-        runtime, "run", *docker_flags,
-        "-v", f"{workspace}:/workspace",
+        runtime,
+        "run",
+        *docker_flags,
+        "-v",
+        f"{workspace}:/workspace",
         # Global home as base (has auth, tools, configs)
-        "-v", f"{GLOBAL_HOME}:/home/agent",
+        "-v",
+        f"{GLOBAL_HOME}:/home/agent",
         # Per-workspace overlays for state that should not leak across workspaces
-        "-v", f"{ws_state / 'copilot-sessions'}:/home/agent/.copilot/session-state",
-        "-v", f"{ws_state / 'copilot-command-history'}:/home/agent/.copilot/command-history-state.json",
-        "-v", f"{ws_state / 'bash_history'}:/home/agent/.bash_history",
-        "-v", f"{ws_state / 'gemini-history'}:/home/agent/.gemini/history",
+        "-v",
+        f"{ws_state / 'copilot-sessions'}:/home/agent/.copilot/session-state",
+        "-v",
+        f"{ws_state / 'copilot-command-history'}:/home/agent/.copilot/command-history-state.json",
+        "-v",
+        f"{ws_state / 'bash_history'}:/home/agent/.bash_history",
+        "-v",
+        f"{ws_state / 'gemini-history'}:/home/agent/.gemini/history",
         # Per-workspace SSH keys — each project gets its own ~/.ssh/
-        "-v", f"{ws_state / 'ssh'}:/home/agent/.ssh",
-        "-v", f"{host_mise}:{host_mise}",
-        "--tmpfs", "/tmp",
+        "-v",
+        f"{ws_state / 'ssh'}:/home/agent/.ssh",
+        "-v",
+        f"{host_mise}:{host_mise}",
+        "--tmpfs",
+        "/tmp",
         "--shm-size=2g",
-        "-e", "JAIL_HOME=/home/agent",
-        "-e", "NPM_CONFIG_PREFIX=/home/agent/.npm-global",
-        "-e", "GOPATH=/home/agent/go",
-        "-e", f"MISE_DATA_DIR={host_mise}",
-        "-e", "MISE_TRUST=1",
-        "-e", "MISE_YES=1",
-        "-e", "COPILOT_ALLOW_ALL=true",
-        "-e", "LD_LIBRARY_PATH=/lib:/usr/lib",
-        "-e", "HOME=/home/agent",
+        "-e",
+        "JAIL_HOME=/home/agent",
+        "-e",
+        "NPM_CONFIG_PREFIX=/home/agent/.npm-global",
+        "-e",
+        "GOPATH=/home/agent/go",
+        "-e",
+        f"MISE_DATA_DIR={host_mise}",
+        "-e",
+        "MISE_TRUST=1",
+        "-e",
+        "MISE_YES=1",
+        "-e",
+        "COPILOT_ALLOW_ALL=true",
+        "-e",
+        "LD_LIBRARY_PATH=/lib:/usr/lib",
+        "-e",
+        "HOME=/home/agent",
         # EDITOR=cat prevents agents from getting stuck in interactive editors.
         # VISUAL=nvim is used by Copilot ctrl-g (checks COPILOT_EDITOR > VISUAL > EDITOR).
         # These must be container-level env vars, not just in .bashrc, because
         # Copilot runs as a non-interactive process that doesn't source .bashrc.
-        "-e", "EDITOR=cat",
-        "-e", "VISUAL=nvim",
-        "-e", "PAGER=cat",
-        "-e", "GIT_PAGER=cat",
-        "-e", f"YOLO_BLOCK_CONFIG={blocked_config_json}",
-        "-e", f"YOLO_HOST_DIR={workspace}",
-        "-e", "OVERMIND_SOCKET=/tmp/overmind.sock",
-        "-e", f"YOLO_MISE_TOOLS={json.dumps(mise_tools)}",
-        "-e", "YOLO_REPO_ROOT=/opt/yolo-jail",
-        "--workdir", "/workspace",
+        "-e",
+        "EDITOR=cat",
+        "-e",
+        "VISUAL=nvim",
+        "-e",
+        "PAGER=cat",
+        "-e",
+        "GIT_PAGER=cat",
+        "-e",
+        f"YOLO_BLOCK_CONFIG={blocked_config_json}",
+        "-e",
+        f"YOLO_HOST_DIR={workspace}",
+        "-e",
+        "OVERMIND_SOCKET=/tmp/overmind.sock",
+        "-e",
+        f"YOLO_MISE_TOOLS={json.dumps(mise_tools)}",
+        "-e",
+        f"YOLO_LSP_SERVERS={json.dumps(lsp_servers)}",
+        "-e",
+        "YOLO_REPO_ROOT=/opt/yolo-jail",
+        "--workdir",
+        "/workspace",
         # Mount yolo-jail repo for in-jail CLI (yolo --help, nested jailing)
-        "-v", f"{repo_root}:/opt/yolo-jail:ro",
+        "-v",
+        f"{repo_root}:/opt/yolo-jail:ro",
     ]
 
     # Docker needs explicit UID mapping; podman rootless maps container root to host user
@@ -1453,19 +1684,36 @@ def run(
     if runtime == "podman":
         if in_container:
             # Inside a container: share parent's user namespace
-            docker_cmd.extend([
-                "--security-opt", "label=disable",
-                "--userns", "host",
-            ])
+            docker_cmd.extend(
+                [
+                    "--security-opt",
+                    "label=disable",
+                    "--userns",
+                    "host",
+                ]
+            )
         else:
             # On host: create user namespace with UID/GID mapping for nesting
-            docker_cmd.extend([
-                "--security-opt", "label=disable",
-                "--device", "/dev/fuse",
-                "--uidmap", "0:0:1", "--uidmap", "1:1:65536",
-                "--gidmap", "0:0:1", "--gidmap", "1:1:65536",
-                "--cap-add", "SYS_ADMIN", "--cap-add", "MKNOD",
-            ])
+            docker_cmd.extend(
+                [
+                    "--security-opt",
+                    "label=disable",
+                    "--device",
+                    "/dev/fuse",
+                    "--uidmap",
+                    "0:0:1",
+                    "--uidmap",
+                    "1:1:65536",
+                    "--gidmap",
+                    "0:0:1",
+                    "--gidmap",
+                    "1:1:65536",
+                    "--cap-add",
+                    "SYS_ADMIN",
+                    "--cap-add",
+                    "MKNOD",
+                ]
+            )
 
     # Mount host nix daemon socket + store so nix builds work inside the jail.
     # NIX_REMOTE=daemon forces nix to use the host daemon (which has nixbld users)
@@ -1473,11 +1721,16 @@ def run(
     nix_socket = Path("/nix/var/nix/daemon-socket")
     nix_store = Path("/nix/store")
     if nix_socket.exists() and nix_store.exists():
-        docker_cmd.extend([
-            "-v", f"{nix_socket}:{nix_socket}",
-            "-v", f"{nix_store}:{nix_store}:ro",
-            "-e", "NIX_REMOTE=daemon",
-        ])
+        docker_cmd.extend(
+            [
+                "-v",
+                f"{nix_socket}:{nix_socket}",
+                "-v",
+                f"{nix_store}:{nix_store}:ro",
+                "-e",
+                "NIX_REMOTE=daemon",
+            ]
+        )
 
     # Podman rootless uses pasta networking by default (no nftables needed).
     # Only pass --net explicitly for non-default modes like "host".
@@ -1487,17 +1740,21 @@ def run(
         docker_cmd.append("--net=host")
     elif net_mode != "bridge" or runtime == "docker":
         docker_cmd.append(f"--net={net_mode}")
-    
+
     # Pass identity env vars (git + jj) collected earlier
     docker_cmd.extend(identity_env)
 
     # Propagate host global gitignore into the jail
     # (We don't mount ~/.gitconfig to avoid credential leaks, but gitignore is safe)
     try:
-        excludes_file = subprocess.check_output(
-            ["git", "config", "--global", "--get", "core.excludesFile"],
-            stderr=subprocess.DEVNULL
-        ).decode().strip()
+        excludes_file = (
+            subprocess.check_output(
+                ["git", "config", "--global", "--get", "core.excludesFile"],
+                stderr=subprocess.DEVNULL,
+            )
+            .decode()
+            .strip()
+        )
         if excludes_file:
             excludes_path = Path(excludes_file).expanduser()
         else:
@@ -1506,8 +1763,10 @@ def run(
         excludes_path = Path.home() / ".config" / "git" / "ignore"
     if excludes_path.is_file():
         docker_cmd.extend(["-v", f"{excludes_path}:/home/agent/.config/git/ignore:ro"])
-        docker_cmd.extend(["-e", "YOLO_GLOBAL_GITIGNORE=/home/agent/.config/git/ignore"])
-    
+        docker_cmd.extend(
+            ["-e", "YOLO_GLOBAL_GITIGNORE=/home/agent/.config/git/ignore"]
+        )
+
     docker_cmd.extend(publish_args)
     docker_cmd.extend(mount_args)
 
@@ -1516,7 +1775,9 @@ def run(
         if isinstance(dev, str):
             # Raw device path: "/dev/bus/usb/001/004"
             if not Path(dev).exists():
-                console.print(f"[yellow]Warning: device {dev} not found — skipping[/yellow]")
+                console.print(
+                    f"[yellow]Warning: device {dev} not found — skipping[/yellow]"
+                )
                 continue
             docker_cmd.extend(["--device", dev])
         elif isinstance(dev, dict):
@@ -1527,26 +1788,36 @@ def run(
                 try:
                     result = subprocess.run(
                         ["lsusb", "-d", usb_id],
-                        capture_output=True, text=True, timeout=5,
+                        capture_output=True,
+                        text=True,
+                        timeout=5,
                     )
                     if result.returncode != 0 or not result.stdout.strip():
-                        console.print(f"[yellow]Warning: USB device {desc} ({usb_id}) not found — skipping[/yellow]")
+                        console.print(
+                            f"[yellow]Warning: USB device {desc} ({usb_id}) not found — skipping[/yellow]"
+                        )
                         continue
                     # Parse: "Bus 001 Device 004: ID 0bda:2838 ..."
                     line = result.stdout.strip().split("\n")[0]
                     parts = line.split()
-                    bus = parts[1]       # "001"
+                    bus = parts[1]  # "001"
                     device = parts[3].rstrip(":")  # "004"
                     dev_path = f"/dev/bus/usb/{bus}/{device}"
                     if not Path(dev_path).exists():
-                        console.print(f"[yellow]Warning: USB device {desc} found by lsusb but {dev_path} missing — skipping[/yellow]")
+                        console.print(
+                            f"[yellow]Warning: USB device {desc} found by lsusb but {dev_path} missing — skipping[/yellow]"
+                        )
                         continue
                     docker_cmd.extend(["--device", dev_path])
                     console.print(f"[dim]USB device: {desc} → {dev_path}[/dim]")
                 except FileNotFoundError:
-                    console.print("[yellow]Warning: lsusb not found — cannot resolve USB device IDs[/yellow]")
+                    console.print(
+                        "[yellow]Warning: lsusb not found — cannot resolve USB device IDs[/yellow]"
+                    )
                 except Exception as e:
-                    console.print(f"[yellow]Warning: USB device resolution failed for {usb_id}: {e}[/yellow]")
+                    console.print(
+                        f"[yellow]Warning: USB device resolution failed for {usb_id}: {e}[/yellow]"
+                    )
             elif "cgroup_rule" in dev:
                 docker_cmd.extend(["--device-cgroup-rule", dev["cgroup_rule"]])
 
@@ -1585,19 +1856,32 @@ def run(
     # Mount host user-level copilot/gemini skills so they're available in the jail
     host_gemini_skills = Path.home() / ".gemini" / "skills"
     host_dotfiles_skills = Path.home() / ".dotfiles" / "gemini" / "skills"
-    
+
     if host_gemini_skills.exists() and host_gemini_skills.is_dir():
         docker_cmd.extend(["-v", f"{host_gemini_skills}:/ctx/host-gemini-skills:ro"])
         docker_cmd.extend(["-e", "YOLO_HOST_GEMINI_SKILLS=/ctx/host-gemini-skills"])
-        
+
         if host_dotfiles_skills.exists() and host_dotfiles_skills.is_dir():
-            docker_cmd.extend(["-v", f"{host_dotfiles_skills}:{host_dotfiles_skills}:ro"])
+            docker_cmd.extend(
+                ["-v", f"{host_dotfiles_skills}:{host_dotfiles_skills}:ro"]
+            )
 
     # Generate per-workspace AGENTS.md (separate for Copilot and Gemini to
     # respect user-level ~/.copilot/AGENTS.md vs ~/.gemini/AGENTS.md)
-    agents_path = generate_agents_md(cname, workspace, normalized_blocked, mount_descriptions, net_mode=net_mode, runtime=runtime)
-    docker_cmd.extend(["-v", f"{agents_path / 'AGENTS-copilot.md'}:/home/agent/.copilot/AGENTS.md:ro"])
-    docker_cmd.extend(["-v", f"{agents_path / 'AGENTS-gemini.md'}:/home/agent/.gemini/AGENTS.md:ro"])
+    agents_path = generate_agents_md(
+        cname,
+        workspace,
+        normalized_blocked,
+        mount_descriptions,
+        net_mode=net_mode,
+        runtime=runtime,
+    )
+    docker_cmd.extend(
+        ["-v", f"{agents_path / 'AGENTS-copilot.md'}:/home/agent/.copilot/AGENTS.md:ro"]
+    )
+    docker_cmd.extend(
+        ["-v", f"{agents_path / 'AGENTS-gemini.md'}:/home/agent/.gemini/AGENTS.md:ro"]
+    )
 
     if "TERM" in os.environ:
         docker_cmd.extend(["-e", f"TERM={os.environ['TERM']}"])
@@ -1619,7 +1903,7 @@ def run(
             "exec 3>&2; "  # save stderr
             f"_t0=$(date +%s%N); {setup_script} >/dev/null 2>&1; "
             "_t1=$(date +%s%N); "
-            "eval \"$(mise hook-env -s bash)\" 2>/dev/null; "
+            'eval "$(mise hook-env -s bash)" 2>/dev/null; '
             "_t2=$(date +%s%N); "
             f"{target_cmd}; _rc=$?; "
             "_t3=$(date +%s%N); "
@@ -1627,7 +1911,7 @@ def run(
             "echo '' >&3; echo '=== YOLO Jail Profile ===' >&3; "
             "echo '' >&3; echo '--- Entrypoint (config generation) ---' >&3; "
             # Extract only the LAST run from the perf log (separated by === markers)
-            "awk '/^=== YOLO/{buf=\"\"} {buf=buf $0 \"\\n\"} END{printf \"%s\", buf}' ~/.yolo-perf.log >&3 2>/dev/null; "
+            'awk \'/^=== YOLO/{buf=""} {buf=buf $0 "\\n"} END{printf "%s", buf}\' ~/.yolo-perf.log >&3 2>/dev/null; '
             "echo '' >&3; echo '--- Container setup ---' >&3; "
             "printf '  mise install + bootstrap: %s\\n' \"$(( (_t1 - _t0) / 1000000 ))ms\" >&3; "
             "printf '  mise hook-env:            %s\\n' \"$(( (_t2 - _t1) / 1000000 ))ms\" >&3; "
@@ -1644,8 +1928,8 @@ def run(
             "exit $_rc"
         )
     else:
-        final_internal_cmd = f"{setup_script} >/dev/null 2>&1 && eval \"$(mise hook-env -s bash)\" 2>/dev/null; {target_cmd}"
-    
+        final_internal_cmd = f'{setup_script} >/dev/null 2>&1 && eval "$(mise hook-env -s bash)" 2>/dev/null; {target_cmd}'
+
     docker_cmd.append(final_internal_cmd)
 
     write_container_tracking(cname, workspace)
@@ -1669,8 +1953,12 @@ def run(
         start = _profile_times["start"]
         err = Console(stderr=True)
         err.print("\n[bold cyan]--- Host-side timing ---[/bold cyan]")
-        err.print(f"  Image build/load:   {_profile_times.get('image_loaded', start) - start:.3f}s")
-        err.print(f"  Total (host-side):  {_profile_times['container_exited'] - start:.3f}s\n")
+        err.print(
+            f"  Image build/load:   {_profile_times.get('image_loaded', start) - start:.3f}s"
+        )
+        err.print(
+            f"  Total (host-side):  {_profile_times['container_exited'] - start:.3f}s\n"
+        )
 
     sys.exit(result.returncode)
 
@@ -1680,13 +1968,23 @@ def ps():
     """List running YOLO jail containers."""
     runtime = _runtime()
     result = subprocess.run(
-        [runtime, "ps", "--filter", "name=^yolo-", "--format", "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}"],
-        capture_output=True, text=True,
+        [
+            runtime,
+            "ps",
+            "--filter",
+            "name=^yolo-",
+            "--format",
+            "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}",
+        ],
+        capture_output=True,
+        text=True,
     )
     if result.stdout.strip():
         typer.echo(result.stdout.strip())
         # Show workspace mappings, clean up stale tracking files
-        for tracking_file in sorted(CONTAINER_DIR.iterdir()) if CONTAINER_DIR.exists() else []:
+        for tracking_file in (
+            sorted(CONTAINER_DIR.iterdir()) if CONTAINER_DIR.exists() else []
+        ):
             name = tracking_file.name
             if find_running_container(name, runtime=runtime):
                 workspace_path = tracking_file.read_text().strip()
@@ -1699,6 +1997,7 @@ def ps():
         if CONTAINER_DIR.exists():
             for tracking_file in CONTAINER_DIR.iterdir():
                 cleanup_container_tracking(tracking_file.name)
+
 
 @app.command()
 def doctor():
@@ -1736,7 +2035,10 @@ def doctor():
         if path:
             try:
                 result = subprocess.run(
-                    [rt, "--version"], capture_output=True, text=True, timeout=5,
+                    [rt, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
                 )
                 version = result.stdout.strip().split("\n")[0]
                 ok(f"{rt}: {version}")
@@ -1759,7 +2061,10 @@ def doctor():
     if nix_path:
         try:
             result = subprocess.run(
-                ["nix", "--version"], capture_output=True, text=True, timeout=5,
+                ["nix", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             ok(f"nix: {result.stdout.strip()}")
         except Exception as e:
@@ -1802,7 +2107,10 @@ def doctor():
         except Exception as e:
             fail(f"User config invalid: {e}", f"Edit {USER_CONFIG_PATH}")
     else:
-        warn("No user config", f"Run 'yolo init-user-config' to create {USER_CONFIG_PATH}")
+        warn(
+            "No user config",
+            f"Run 'yolo init-user-config' to create {USER_CONFIG_PATH}",
+        )
 
     workspace_config = Path.cwd() / "yolo-jail.jsonc"
     if workspace_config.exists():
@@ -1821,14 +2129,25 @@ def doctor():
     if runtime:
         try:
             result = subprocess.run(
-                [runtime, "images", JAIL_IMAGE, "--format", "{{.Repository}}:{{.Tag}} ({{.Size}})"],
-                capture_output=True, text=True, timeout=10,
+                [
+                    runtime,
+                    "images",
+                    JAIL_IMAGE,
+                    "--format",
+                    "{{.Repository}}:{{.Tag}} ({{.Size}})",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
             images = result.stdout.strip()
             if images:
                 ok(f"Image loaded: {images.split(chr(10))[0]}")
             else:
-                warn(f"Image '{JAIL_IMAGE}' not loaded", "Run 'yolo' once to build and load the image")
+                warn(
+                    f"Image '{JAIL_IMAGE}' not loaded",
+                    "Run 'yolo' once to build and load the image",
+                )
         except Exception as e:
             warn(f"Could not check image: {e}")
     else:
@@ -1841,7 +2160,9 @@ def doctor():
         try:
             result = subprocess.run(
                 [runtime, "ps", "--filter", "name=^yolo-", "--format", "{{.Names}}"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             containers = [c for c in result.stdout.strip().split("\n") if c]
             if containers:

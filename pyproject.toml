@@ -13,3 +13,8 @@ dependencies = [
 
 [project.scripts]
 yolo = "src.cli:main"
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: integration tests that spin up containers (skipped during promote)",
+]

@@ -16,6 +16,10 @@ load: build
 test:
     uv run pytest tests/
 
+# Run fast tests only (skip container integration tests)
+test-fast:
+    uv run pytest tests/ -m "not slow"
+
 # Run linter
 lint:
     uv run ruff check .
@@ -32,10 +36,9 @@ check: format lint test
 clean:
     rm -f result
 
-# Push bookmarks to remotes
+# Push bookmarks to remote
 push:
-    jj git push --bookmark main --remote public
-    jj git push --bookmark main --bookmark dev --bookmark staging --remote private
+    jj git push --bookmark main --remote origin
 
 # Pre-promote quality gate
 prepromote:
@@ -56,8 +59,10 @@ prepromote:
         exit 1
     fi
 
-    # Run project quality gates
-    just check
+    # Run project quality gates (fast only — no container integration tests)
+    just format
+    just lint
+    just test-fast
     echo "=== All pre-promote checks passed ==="
 
 # Promote staging to main
