@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 import typer
 import pyjson5
+from rich.console import Console
 
 app = typer.Typer(
     invoke_without_command=True,
@@ -36,7 +37,24 @@ def _default(ctx: typer.Context):
         yolo --new -- bash        Force new container (ignore running one)
         yolo --profile -- echo hi Profile startup performance
         yolo ps                   List running jails
+        yolo init                 Create config + agent briefing
         yolo config-ref           Full configuration reference
+
+    [bold cyan]What Agents Get Inside the Jail[/bold cyan]
+
+        Workspace:  Your project is bind-mounted at /workspace (read-write,
+                    same files — edits are visible on the host immediately)
+        Internet:   Full network access (bridge mode by default)
+        Tools:      Node.js 22, Python 3.13, Go, rg, fd, bat, jq, git, gh,
+                    nvim, curl, strace, and anything in packages/mise_tools
+        Home:       /home/agent — shared across ALL jails. Auth tokens,
+                    tool caches, and configs persist across restarts.
+        Identity:   Host git/jj identity is injected automatically.
+                    GitHub CLI (gh) is pre-authenticated.
+
+        NOT shared: ~/.ssh, ~/.gitconfig, cloud credentials, host PATH.
+        Blocked:    grep → rg, find → fd (configurable). Set YOLO_BYPASS_SHIMS=1
+                    in scripts that need the originals.
 
     [bold cyan]Configuration[/bold cyan]
 
@@ -87,9 +105,6 @@ GLOBAL_MISE = GLOBAL_STORAGE / "mise"
 CONTAINER_DIR = GLOBAL_STORAGE / "containers"
 AGENTS_DIR = GLOBAL_STORAGE / "agents"
 USER_CONFIG_PATH = Path.home() / ".config" / "yolo-jail" / "config.jsonc"
-
-from rich.console import Console
-from rich.status import Status
 
 console = Console()
 
@@ -581,7 +596,7 @@ def auto_load_image(repo_root: Path, extra_packages: List[Union[str, dict]] = No
         if not loaded_paths:
             console.print(f"[bold blue]Image load needed:[/bold blue] first run (no images loaded into {runtime} yet)")
         else:
-            console.print(f"[bold blue]Image load needed:[/bold blue] nix store path changed")
+            console.print("[bold blue]Image load needed:[/bold blue] nix store path changed")
             console.print(f"  [dim]new: {current_path}[/dim]")
             if pkg_json:
                 console.print(f"  [dim]packages: {pkg_json}[/dim]")
@@ -675,10 +690,11 @@ def load_config() -> Dict[str, Any]:
 
 @app.command()
 def init():
-    """Initialize a yolo-jail.jsonc configuration file in the current directory."""
+    """Initialize a yolo-jail.jsonc config and print an agent briefing."""
     config_path = Path.cwd() / "yolo-jail.jsonc"
     if config_path.exists():
         typer.echo("yolo-jail.jsonc already exists.")
+        _print_init_briefing(config_path)
         return
 
     content = """{
@@ -724,6 +740,10 @@ def init():
   //   "~/code/other-repo",
   //   "~/code/shared-lib:/ctx/shared-lib"
   // ]
+
+  // Extra tools to install via mise (key: tool name, value: version string).
+  // Default: {"neovim": "stable"} — override in user or workspace config.
+  // "mise_tools": {"neovim": "nightly", "typst": "latest"}
 }
 """
     with open(config_path, "w") as f:
@@ -740,6 +760,97 @@ def init():
     else:
         with open(gitignore, "w") as f:
             f.write("# YOLO Jail workspace state\n.yolo/\n")
+
+    _print_init_briefing(config_path)
+
+
+def _print_init_briefing(config_path: Path):
+    """Print the comprehensive agent briefing after init."""
+    console.print(f"""
+[bold green]✓ Config ready:[/bold green] {config_path}
+
+[bold]═══════════════════════════════════════════════════════════[/bold]
+[bold]  YOLO JAIL — AGENT BRIEFING                              [/bold]
+[bold]═══════════════════════════════════════════════════════════[/bold]
+
+You are about to be launched inside a YOLO Jail — an isolated container
+that protects the host system from unintended changes. Here is what you
+need to know.
+
+[bold cyan]WHAT YOU KEEP (shared with the host)[/bold cyan]
+
+  • [bold]Your workspace[/bold] is bind-mounted at [bold]/workspace[/bold] (read-write).
+    Every file edit you make is visible on the host immediately.
+    This is the SAME directory, not a copy.
+
+  • [bold]Internet access[/bold] is available (bridge networking by default).
+    You can curl, pip install, npm install, go get, etc.
+
+  • [bold]Git/jj identity[/bold] is injected from the host (name + email).
+    GitHub CLI (gh) is pre-authenticated.
+
+  • [bold]Mise tool data[/bold] is shared with the host. Python, Node, Go, and
+    other runtimes installed via mise are available at the same paths.
+    Venvs created on the host resolve inside the jail.
+
+[bold cyan]WHAT CHANGES (different from the host)[/bold cyan]
+
+  • [bold]Home directory[/bold] is /home/agent. This is a [bold]shared home[/bold] — the same
+    across ALL jail workspaces. Auth tokens, tool caches, shell configs,
+    and installed tools all persist here across restarts. It is separate
+    from the host home directory.
+
+  • [bold]Per-workspace state[/bold]: Some things are isolated per-workspace
+    (not shared across jails): SSH keys, bash history, copilot sessions,
+    gemini history. These live in <workspace>/.yolo/.
+
+  • [bold]Workspace path[/bold] is /workspace (not the host's absolute path).
+    Venv scripts with absolute host path shebangs may need fixing.
+
+  • [bold]Some tools are blocked[/bold] (e.g., grep → rg, find → fd).
+    Set YOLO_BYPASS_SHIMS=1 in scripts that need the originals.
+
+[bold cyan]TOOLS AVAILABLE INSIDE[/bold cyan]
+
+  Runtimes:  Node.js 22, Python 3.13, Go (managed by mise)
+  Editors:   nvim (stable by default, configurable via mise_tools)
+  CLI tools: rg, fd, bat, jq, git, jj, gh, curl, strace, uv, tmux
+  Agents:    copilot, gemini (auto-injected with --yolo flag)
+  The 'yolo' command itself is available inside for nested jailing.
+
+  [bold]Mise[/bold] manages all runtimes and supports thousands of tools from
+  multiple registries (aqua, asdf, cargo, go, npm, pipx, ubi, and more).
+  Run 'mise registry' inside the jail to browse. Add tools to the
+  "mise_tools" config or to /workspace/mise.toml for the workspace.
+  Examples: rust, zig, terraform, kubectl, typst, pixi, conda.
+
+[bold cyan]WHAT TO DO NOW[/bold cyan]
+
+  1. [bold]Review yolo-jail.jsonc[/bold] — edit it if you need extra packages.
+     • "packages": nix packages baked into the image (rebuilds on change).
+       Search: https://search.nixos.org/packages
+     • "mise_tools": tools installed via mise (no rebuild needed).
+       For tools with binary releases — fast, no compilation.
+
+  2. [bold]Write a handoff document[/bold] — create a file (e.g., scratch/jail-notes.md)
+     with instructions for your inner-jail self. Your jail instance will be
+     a fresh agent session that does NOT share your current conversation
+     context. Tell it:
+     • What you were working on and the current state
+     • What remains to be done
+     • Any decisions you made and why
+     • Files to look at first
+
+  3. [bold]Ask the human to restart you inside the jail[/bold]:
+     Tell them to run: yolo -- copilot  (or yolo -- gemini)
+     They may also point the inner agent at your handoff document.
+
+[bold cyan]CONFIGURATION REFERENCE[/bold cyan]
+
+  Run 'yolo config-ref' for the full field reference.
+  Run 'yolo --help' for usage examples.
+""")
+
 
 @app.command("init-user-config")
 def init_user_config():
@@ -914,14 +1025,89 @@ def config_ref():
 
 [bold cyan]INSIDE THE JAIL[/bold cyan]
 
-  The yolo command is available inside jails for:
-  - Reading this help: yolo --help, yolo config-ref
-  - Nested jailing (advanced): yolo -- <command>
+  [bold]Workspace[/bold]
+    Your project is bind-mounted read-write at /workspace.
+    Edits are visible on the host immediately — this is the SAME directory.
+    The workspace path changes from the host path to /workspace.
 
-  Workspace: /workspace (bind-mounted from host)
-  Home: /home/agent (persistent across restarts)
-  Runtimes: Node.js 22, Python 3.13, Go (via mise)
-  Tools: rg, fd, bat, jq, git, gh, nvim, curl, strace
+  [bold]Networking[/bold]
+    Full internet access is available. Bridge mode (default) isolates the
+    container network but allows outbound connections. Use network.ports
+    to publish container ports to the host. Host mode shares the host
+    network stack directly.
+
+  [bold]Home Directory (/home/agent)[/bold]
+    A shared persistent home that is the SAME across ALL jail workspaces.
+    Contains: auth tokens (gh, gemini), tool caches, npm/go globals,
+    nvim config, shell configs, mise tool data. All of this survives
+    jail restarts and is shared between every project's jail.
+
+  [bold]Per-Workspace State[/bold]
+    Some state is isolated per-workspace (in <workspace>/.yolo/):
+    SSH keys, bash history, copilot sessions, gemini history.
+    These are NOT shared across different project jails.
+
+  [bold]Identity & Auth[/bold]
+    Git/jj identity (name + email) is injected from the host automatically.
+    GitHub CLI (gh) is pre-authenticated via the shared home.
+    SSH keys are per-workspace — configure in <workspace>/.yolo/home/ssh/.
+
+  [bold]Tools & Runtimes[/bold]
+    Runtimes: Node.js 22, Python 3.13, Go (managed by mise)
+    Editors:  nvim (version configurable via mise_tools config)
+    CLI:      rg, fd, bat, jq, git, jj, gh, curl, strace, uv, tmux
+    Agents:   copilot, gemini (--yolo auto-injected)
+    The 'yolo' command is available inside for nested jailing and help.
+
+  [bold]Mise Tool Management[/bold]
+    Mise manages all runtimes and supports thousands of tools from
+    multiple registries:
+    • aqua — pre-built binaries (kubectl, terraform, gh, etc.)
+    • asdf — version-managed runtimes (python, node, ruby, etc.)
+    • cargo — Rust crates (ripgrep, fd-find, bat, etc.)
+    • go — Go modules (built from source)
+    • npm — Node packages (installed globally)
+    • pipx — Python CLI tools (isolated envs)
+    • ubi — universal binary installer (GitHub releases)
+    Run 'mise registry' to browse all available tools. Add tools via:
+    • "mise_tools" in yolo-jail.jsonc (injected into jail global config)
+    • /workspace/mise.toml (workspace-specific, checked into git)
+    The host's mise data directory is shared with the jail, so tool
+    installs are available in both environments.
+
+  [bold]Blocked Tools[/bold]
+    By default, grep is replaced by rg and find by fd. These are shims —
+    set YOLO_BYPASS_SHIMS=1 in scripts that need the real commands.
+    Configure via security.blocked_tools in yolo-jail.jsonc.
+
+  [bold]Venvs & Python[/bold]
+    The host's mise data directory is shared with the jail, so venvs
+    created on the host resolve inside the jail (python binary paths
+    match). The workspace path changes to /workspace though, so
+    venv scripts with absolute shebangs may need fixing.
+
+  [bold]Persistence Summary[/bold]
+    Shared home:   /home/agent (same across all jails — auth, tools, caches)
+    Workspace:     /workspace edits visible on host immediately
+    Per-workspace: SSH keys, bash history, copilot/gemini sessions
+    Ephemeral:     /tmp, container processes
+
+[bold cyan]SPAWNING A NEW PROJECT[/bold cyan]
+
+  When setting up a new project for jail use:
+
+  1. Run 'yolo init' in the project root to create yolo-jail.jsonc
+  2. Edit the config — add any nix packages or mise_tools needed
+  3. Run 'yolo -- bash' to enter the jail interactively
+  4. Start your agent: 'yolo -- copilot' or 'yolo -- gemini'
+
+  [bold]For agents preparing to enter a jail:[/bold]
+  Before asking the human to restart you inside the jail, write a
+  handoff document (e.g., scratch/jail-notes.md) with:
+  • Current task state and what remains to be done
+  • Decisions made and their rationale
+  • Key files to examine first
+  Your inner-jail self will be a fresh session without your context.
 """)
 
 
@@ -1118,6 +1304,15 @@ def run(
     mise_tools = {**default_mise_tools, **config.get("mise_tools", {})}
     auto_load_image(repo_root, extra_packages=extra_packages or None, runtime=runtime)
 
+    # Resolve host mise path — share the same data dir so venv paths match.
+    # Inside a nested jail, YOLO_OUTER_MISE_PATH carries the original host path.
+    host_mise_path = os.environ.get("YOLO_OUTER_MISE_PATH") or os.environ.get(
+        "MISE_DATA_DIR", str(Path.home() / ".local" / "share" / "mise")
+    )
+    host_mise = Path(host_mise_path)
+    if not host_mise.exists():
+        host_mise.mkdir(parents=True, exist_ok=True)
+
     if profile:
         _profile_times["image_loaded"] = _time.monotonic()
 
@@ -1200,6 +1395,7 @@ def run(
     (ws_state / "copilot-command-history").touch()
     (ws_state / "bash_history").touch()
     (ws_state / "gemini-history").mkdir(exist_ok=True)
+    (ws_state / "ssh").mkdir(exist_ok=True, mode=0o700)
 
     docker_cmd = [
         runtime, "run", *docker_flags,
@@ -1211,13 +1407,15 @@ def run(
         "-v", f"{ws_state / 'copilot-command-history'}:/home/agent/.copilot/command-history-state.json",
         "-v", f"{ws_state / 'bash_history'}:/home/agent/.bash_history",
         "-v", f"{ws_state / 'gemini-history'}:/home/agent/.gemini/history",
-        "-v", f"{GLOBAL_MISE}:/mise",
+        # Per-workspace SSH keys — each project gets its own ~/.ssh/
+        "-v", f"{ws_state / 'ssh'}:/home/agent/.ssh",
+        "-v", f"{host_mise}:{host_mise}",
         "--tmpfs", "/tmp",
         "--shm-size=2g",
         "-e", "JAIL_HOME=/home/agent",
         "-e", "NPM_CONFIG_PREFIX=/home/agent/.npm-global",
         "-e", "GOPATH=/home/agent/go",
-        "-e", "MISE_DATA_DIR=/mise",
+        "-e", f"MISE_DATA_DIR={host_mise}",
         "-e", "MISE_TRUST=1",
         "-e", "MISE_YES=1",
         "-e", "COPILOT_ALLOW_ALL=true",
@@ -1381,14 +1579,8 @@ def run(
     if overmind_sock.exists():
         docker_cmd.extend(["-v", "/dev/null:/workspace/.overmind.sock:ro"])
 
-    # Mount host mise at its original path so .venv symlinks created on host resolve inside jail.
-    # When nested, pass the path as an env var so inner jails can re-mount it.
-    host_mise = Path(os.environ.get("YOLO_OUTER_MISE_PATH") or os.environ.get("MISE_DATA_DIR", str(Path.home() / ".local/share/mise")))
-    if host_mise.exists() and str(host_mise) != "/mise":
-        docker_cmd.extend([
-            "-v", f"{host_mise}:{host_mise}:ro",
-            "-e", f"YOLO_OUTER_MISE_PATH={host_mise}",
-        ])
+    # Pass original host mise path for nested jail re-mounting
+    docker_cmd.extend(["-e", f"YOLO_OUTER_MISE_PATH={host_mise}"])
 
     # Mount host user-level copilot/gemini skills so they're available in the jail
     host_gemini_skills = Path.home() / ".gemini" / "skills"

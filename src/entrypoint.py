@@ -575,6 +575,15 @@ def main():
     cmd = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else "bash"
     _perf("start")
 
+    # Create /mise symlink for backward compat when MISE_DATA_DIR is the host path.
+    # Scripts and PATH entries may reference /mise/shims — this ensures they resolve.
+    mise_data = os.environ.get("MISE_DATA_DIR", "/mise")
+    if mise_data != "/mise" and not Path("/mise").exists():
+        try:
+            Path("/mise").symlink_to(mise_data)
+        except OSError:
+            pass  # may lack permissions on /
+
     generate_shims()
     _perf("generate_shims")
     generate_bashrc()

@@ -11,7 +11,7 @@ import pytest
 REPO_ROOT = Path(__file__).parent.parent.resolve()
 
 sys.path.insert(0, str(REPO_ROOT / "src"))
-from cli import _runtime
+from cli import _runtime  # noqa: E402
 
 
 # --- Unit tests for _runtime() ---
@@ -48,7 +48,6 @@ def test_runtime_rejects_invalid_config():
 
 def test_sentinel_is_per_runtime(tmp_path):
     """Verify that .last-load-<runtime> sentinel files are created per runtime."""
-    from cli import auto_load_image
     # Just check the sentinel path logic (don't actually load)
     # We can verify by checking the sentinel attribute
     sentinel_docker = tmp_path / ".last-load-docker"
@@ -114,7 +113,7 @@ def test_exec_path_no_unbound_errors(tmp_path, monkeypatch):
          patch.object(cli.subprocess, "run", side_effect=capture_run):
         from typer.testing import CliRunner
         try:
-            result = CliRunner().invoke(cli.app, ["run", "--", "echo", "hi"], catch_exceptions=False)
+            CliRunner().invoke(cli.app, ["run", "--", "echo", "hi"], catch_exceptions=False)
         except SystemExit:
             pass
 

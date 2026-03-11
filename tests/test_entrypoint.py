@@ -262,7 +262,6 @@ class TestSkillsMerging:
         monkeypatch.setenv("YOLO_HOST_GEMINI_SKILLS", str(host_skills))
 
         # Workspace skill with same name
-        ws_skills = Path("/workspace/.copilot/skills")
         # Can't create in /workspace for real, so test the logic via a temp workspace
         ws = tmp_path / "ws-skills"
         (ws / "shared").mkdir(parents=True)
