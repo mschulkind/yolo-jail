@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 from unittest.mock import patch
 import pytest
+from typer.testing import CliRunner
 
 REPO_ROOT = Path(__file__).parent.parent.resolve()
 
@@ -48,6 +49,38 @@ def test_runtime_rejects_invalid_config():
         os.environ.pop("YOLO_RUNTIME", None)
         result = _runtime({"runtime": "lxc"})
         assert result in ("podman", "docker")  # Falls through to auto-detect
+
+
+def test_check_help_mentions_every_config_edit():
+    import cli
+
+    result = CliRunner().invoke(cli.app, ["check", "--help"])
+    assert result.exit_code == 0
+    assert "after every config edit" in result.stdout.lower()
+
+
+def test_config_ref_mentions_yolo_check_after_every_edit():
+    import cli
+
+    result = CliRunner().invoke(cli.app, ["config-ref"])
+    assert result.exit_code == 0
+    assert "After EVERY edit" in result.stdout
+    assert "yolo check" in result.stdout
+
+
+def test_generated_agents_md_mentions_yolo_check(tmp_path, monkeypatch):
+    import cli
+
+    monkeypatch.setattr(cli, "AGENTS_DIR", tmp_path / "agents")
+    agents_path = cli.generate_agents_md(
+        "yolo-test",
+        tmp_path / "workspace",
+        [],
+        [],
+    )
+
+    content = (agents_path / "AGENTS-copilot.md").read_text()
+    assert "ALWAYS run `yolo check` after every config edit" in content
 
 
 # --- ensure_global_storage tests ---

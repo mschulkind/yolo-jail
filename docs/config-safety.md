@@ -11,8 +11,9 @@ would silently take effect on the next jail restart.
 
 1. **Agents CAN edit the config** — they need to request packages for their work
 2. **Humans MUST approve changes** — no silent config modifications
-3. **The flow should be natural** — no special commands or flags needed
-4. **Non-interactive use should still work** — CI/scripts shouldn't block
+3. **Agents MUST self-validate edits** — run `yolo check` after every config change
+4. **The flow should be natural** — no special commands or flags needed
+5. **Non-interactive use should still work** — CI/scripts shouldn't block
 
 ## How It Works
 
@@ -58,9 +59,10 @@ Accept these config changes? [y/N]
 
 ### Reusing Containers
 
-Config checks only run when **creating a new container**. When attaching to
+Config approval checks only run when **creating a new container**. When attaching to
 an existing running container (`docker exec`), the config is not re-checked
-because the container was already started with its config.
+because the container was already started with its config. This is why agents
+must run `yolo check` themselves after every config edit, even mid-session.
 
 ## Agent Workflow
 
@@ -80,12 +82,14 @@ The intended flow for agents that need additional packages:
    }
    ```
    Find commits per version at: https://lazamar.co.uk/nix-versions/
-3. Agent tells the human: *"I've added `postgresql` to the jail config.
-   Please restart the jail so I can use it."*
-4. Human exits the jail and runs `yolo` again
-5. Human sees the config diff and types `y` to approve
-6. Image rebuilds with the new package (takes a minute)
-7. Agent can now use `psql` and PostgreSQL tools
+3. Agent runs `yolo check` (or `yolo check --no-build` inside a running jail)
+   and fixes any reported config/build problems before asking for a restart
+4. Agent tells the human: *"I've added `postgresql` to the jail config and ran
+   `yolo check`. Please restart the jail so I can use it."*
+5. Human exits the jail and runs `yolo` again
+6. Human sees the config diff and types `y` to approve
+7. Image rebuilds with the new package (takes a minute)
+8. Agent can now use `psql` and PostgreSQL tools
 
 ### What Agents Should Know
 
@@ -94,6 +98,7 @@ every jail. Agents are told:
 
 - They can edit `yolo-jail.jsonc` to add packages
 - Package names must match nixpkgs attributes
+- They must run `yolo check` after **every** config edit before asking for a restart
 - They must ask the human to restart
 - They must NOT use apt, nix-env, or other package managers
 

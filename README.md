@@ -67,6 +67,9 @@ yolo -- gemini           # Gemini with --yolo auto-injected
 # Force a new container
 yolo --new -- bash
 
+# ALWAYS run this after every yolo-jail.jsonc edit, before restarting
+yolo check
+
 # Check your setup
 yolo doctor
 
@@ -119,6 +122,8 @@ Create a per-project config in `yolo-jail.jsonc`:
 
 Workspace config merges over user defaults (`~/.config/yolo-jail/config.jsonc`). Lists merge and dedupe, scalars override.
 
+Run `yolo check` after **every** edit to `yolo-jail.jsonc` to validate the merged config, dry-run the generated jail agent configs, and preflight the image build before restarting into the jail. Inside a running jail, `yolo check --no-build` is the fast way to validate config changes mid-session before asking for a restart.
+
 Run `yolo config-ref` for the full configuration reference.
 
 ## Security
@@ -139,6 +144,8 @@ yolo doctor
 ```
 
 This checks your container runtime, Nix installation, configuration files, image status, and running containers.
+
+Run `yolo check` after **every** config edit, especially when handing work from an outside agent into the jail or when an in-jail agent edits `yolo-jail.jsonc` mid-session and needs to verify the restart will succeed.
 
 ## Contributing
 

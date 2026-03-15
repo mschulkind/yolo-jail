@@ -2,8 +2,16 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-from cli import merge_config, _check_config_changes
+from cli import (
+    ConfigError,
+    _check_config_changes,
+    _load_jsonc_file,
+    _validate_config,
+    merge_config,
+)
 
 
 def test_merge_config_lists_dedup_and_override_scalars():
@@ -26,6 +34,76 @@ def test_merge_config_lists_dedup_and_override_scalars():
     assert merged["mounts"] == ["~/code/shared:/ctx/shared", "~/code/extra:/ctx/extra"]
     assert merged["network"]["mode"] == "host"
     assert merged["security"]["blocked_tools"] == ["wget", {"name": "grep"}, "curl"]
+
+
+def test_merge_config_merges_mcp_servers_dicts():
+    user = {
+        "mcp_servers": {
+            "foo": {"command": "/bin/foo", "args": ["--a"]},
+            "bar": {"command": "/bin/bar", "args": []},
+        }
+    }
+    workspace = {
+        "mcp_servers": {
+            "bar": {"command": "/workspace/bar", "args": ["--override"]},
+            "baz": {"command": "/workspace/baz", "args": []},
+        }
+    }
+
+    merged = merge_config(user, workspace)
+
+    assert merged["mcp_servers"]["foo"]["command"] == "/bin/foo"
+    assert merged["mcp_servers"]["bar"]["command"] == "/workspace/bar"
+    assert merged["mcp_servers"]["baz"]["command"] == "/workspace/baz"
+
+
+def test_merge_config_mcp_servers_can_disable_inherited_server():
+    user = {
+        "mcp_servers": {
+            "foo": {"command": "/bin/foo", "args": ["--a"]},
+        }
+    }
+    workspace = {
+        "mcp_servers": {
+            "foo": None,
+        }
+    }
+
+    merged = merge_config(user, workspace)
+
+    assert merged["mcp_servers"]["foo"] is None
+
+
+def test_load_jsonc_file_strict_raises_for_invalid_json(tmp_path):
+    config_path = tmp_path / "yolo-jail.jsonc"
+    config_path.write_text("{invalid json")
+
+    with pytest.raises(ConfigError):
+        _load_jsonc_file(config_path, "yolo-jail.jsonc", strict=True)
+
+
+def test_validate_config_rejects_unknown_top_level_keys():
+    errors, warnings = _validate_config({"mcp_server": {}}, workspace=Path.cwd())
+
+    assert warnings == []
+    assert "config.mcp_server: unknown key" in errors
+
+
+def test_validate_config_requires_file_extensions_for_lsp_servers():
+    errors, warnings = _validate_config(
+        {
+            "lsp_servers": {
+                "python": {
+                    "command": "/custom/pyright",
+                    "args": ["--stdio"],
+                }
+            }
+        },
+        workspace=Path.cwd(),
+    )
+
+    assert warnings == []
+    assert "config.lsp_servers.python.fileExtensions: expected an object" in errors
 
 
 class TestConfigSnapshot:

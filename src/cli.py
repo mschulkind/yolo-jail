@@ -9,6 +9,7 @@ import shlex
 import shutil
 import hashlib
 import time
+import tempfile
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 import typer
@@ -37,6 +38,7 @@ def _default(ctx: typer.Context):
         yolo -- gemini            Run Gemini in jail (--yolo auto-injected)
         yolo --new -- bash        Force new container (ignore running one)
         yolo --profile -- echo hi Profile startup performance
+        yolo check                Validate config and preflight the build
         yolo ps                   List running jails
         yolo init                 Create config + agent briefing
         yolo config-ref           Full configuration reference
@@ -76,6 +78,7 @@ def _default(ctx: typer.Context):
         }
 
     User defaults: ~/.config/yolo-jail/config.jsonc (merged under workspace).
+    Run [bold]yolo check[/bold] to validate config changes before restarting.
     Run [bold]yolo config-ref[/bold] for the complete field reference.
 
     [bold cyan]Environment Variables[/bold cyan]
@@ -91,8 +94,10 @@ def _default(ctx: typer.Context):
 
     [bold cyan]Agent Package Workflow[/bold cyan]
 
-    Agents inside the jail can edit yolo-jail.jsonc to add packages, then ask
-    the human to restart. The human sees the diff and approves at next startup.
+    Agents inside the jail can edit yolo-jail.jsonc to add packages, but they
+    MUST run [bold]yolo check[/bold] after every config edit before asking the human
+    to restart. The human sees the diff and approves at next startup.
+    Use [bold]yolo check --no-build[/bold] inside a running jail for a quick preflight.
     See [bold]yolo config-ref[/bold] for details.
     """
     if ctx.invoked_subcommand is None:
@@ -106,9 +111,55 @@ GLOBAL_HOME = GLOBAL_STORAGE / "home"
 GLOBAL_MISE = GLOBAL_STORAGE / "mise"
 CONTAINER_DIR = GLOBAL_STORAGE / "containers"
 AGENTS_DIR = GLOBAL_STORAGE / "agents"
+BUILD_DIR = GLOBAL_STORAGE / "build"
 USER_CONFIG_PATH = Path.home() / ".config" / "yolo-jail" / "config.jsonc"
 
 console = Console()
+
+
+class ConfigError(ValueError):
+    """Raised when a yolo-jail config file or merged config is invalid."""
+
+
+def _resolve_repo_root() -> Path:
+    """Find the yolo-jail repo root for nix image builds.
+
+    Resolution order:
+      1. YOLO_REPO_ROOT env var (set inside jails and CI)
+      2. Source checkout detection (Path(__file__) → parent → flake.nix exists)
+      3. User config repo_path field (~/.config/yolo-jail/config.jsonc)
+      4. Error with helpful message
+    """
+    # 1. Env var (used inside jails, CI, etc.)
+    env_val = os.environ.get("YOLO_REPO_ROOT")
+    if env_val:
+        return Path(env_val).resolve()
+
+    # 2. Running from source checkout (dev mode)
+    source_root = Path(__file__).parent.parent
+    if (source_root / "flake.nix").exists():
+        return source_root.resolve()
+
+    # 3. User config
+    if USER_CONFIG_PATH.exists():
+        try:
+            with open(USER_CONFIG_PATH) as f:
+                cfg = pyjson5.load(f)
+            repo_path = cfg.get("repo_path")
+            if repo_path:
+                p = Path(repo_path).expanduser().resolve()
+                if (p / "flake.nix").exists():
+                    return p
+        except Exception:
+            pass
+
+    console.print(
+        "[bold red]Cannot find yolo-jail repo root.[/bold red]\n"
+        "The yolo CLI needs the repo for nix image builds.\n\n"
+        "Fix: add [bold]repo_path[/bold] to ~/.config/yolo-jail/config.jsonc:\n"
+        '  { "repo_path": "~/code/yolo_jail" }'
+    )
+    raise typer.Exit(1)
 
 
 def ensure_global_storage():
@@ -116,6 +167,7 @@ def ensure_global_storage():
     GLOBAL_MISE.mkdir(parents=True, exist_ok=True)
     CONTAINER_DIR.mkdir(parents=True, exist_ok=True)
     AGENTS_DIR.mkdir(parents=True, exist_ok=True)
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
     # Pre-create intermediate directories inside GLOBAL_HOME that will be parents
     # of nested bind mounts.  Without this, Docker daemon (running as root) auto-creates
     # them as root:root, making them unwritable by the -u UID:GID container process.
@@ -369,11 +421,14 @@ def container_name_for_workspace(workspace: Path) -> str:
 
 def find_running_container(name: str, runtime: str = "docker") -> Optional[str]:
     """Return container ID if a container with this name is running, else None."""
-    result = subprocess.run(
-        [runtime, "ps", "-q", "--filter", f"name=^/{name}$"],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            [runtime, "ps", "-q", "--filter", f"name=^/{name}$"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
     cid = result.stdout.strip()
     return cid if cid else None
 
@@ -492,6 +547,78 @@ def cleanup_port_forwarding(
         shutil.rmtree(socket_dir, ignore_errors=True)
 
 
+DEFAULT_MCP_SERVER_NAMES = ["chrome-devtools", "sequential-thinking"]
+DEFAULT_MISE_TOOLS = {"neovim": "stable"}
+
+
+def _effective_mcp_server_names(
+    mcp_servers: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Return the effective MCP server names after config overrides/removals."""
+    names = list(DEFAULT_MCP_SERVER_NAMES)
+    if not isinstance(mcp_servers, dict):
+        return names
+
+    for name, cfg in mcp_servers.items():
+        if cfg is None:
+            if name in names:
+                names.remove(name)
+            continue
+        if isinstance(cfg, dict) and name not in names:
+            names.append(name)
+    return names
+
+
+def _merge_mise_tools(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Merge built-in mise defaults with config overrides."""
+    return {**DEFAULT_MISE_TOOLS, **config.get("mise_tools", {})}
+
+
+def _normalize_blocked_tools(
+    security_section: Optional[Dict[str, Any]],
+) -> List[Dict[str, str]]:
+    """Normalize blocked tool config into the format consumed by the entrypoint."""
+    if security_section is None:
+        security_section = {}
+
+    raw_blocked = security_section.get("blocked_tools", ["grep", "find"])
+    if raw_blocked is None:
+        raw_blocked = ["grep", "find"]
+
+    default_messages = {
+        "grep": {
+            "message": "grep is blocked to prevent unintended recursive searches. Use ripgrep (rg) or other targeted tools.",
+            "suggestion": "Try: rg <pattern> [file]",
+        },
+        "find": {
+            "message": "find is blocked to prevent unintended recursive searches. Use fd for a faster, more intuitive alternative.",
+            "suggestion": "Try: fd <pattern>",
+        },
+    }
+
+    normalized_blocked = []
+    for tool in raw_blocked:
+        if isinstance(tool, str):
+            tool_dict = {"name": tool}
+            if tool in default_messages:
+                tool_dict.update(default_messages[tool])
+            normalized_blocked.append(tool_dict)
+        elif isinstance(tool, dict) and "name" in tool:
+            normalized_blocked.append(tool)
+    return normalized_blocked
+
+
+def _host_mise_dir() -> Path:
+    """Return the host-visible mise data dir shared with the jail."""
+    host_mise_path = os.environ.get("YOLO_OUTER_MISE_PATH") or os.environ.get(
+        "MISE_DATA_DIR", str(Path.home() / ".local" / "share" / "mise")
+    )
+    host_mise = Path(host_mise_path)
+    if not host_mise.exists():
+        host_mise.mkdir(parents=True, exist_ok=True)
+    return host_mise
+
+
 def generate_agents_md(
     cname: str,
     workspace: Path,
@@ -500,6 +627,7 @@ def generate_agents_md(
     net_mode: str = "bridge",
     runtime: str = "podman",
     forward_host_ports: Optional[List] = None,
+    mcp_servers: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Generate per-workspace AGENTS.md files and return the directory.
 
@@ -515,7 +643,7 @@ def generate_agents_md(
     elif runtime == "podman":
         network_line = "- **Network**: Bridge mode. Use `host.containers.internal` (resolves to 169.254.1.2) to reach the host."
     else:  # docker bridge
-        network_line = "- **Network**: Bridge mode (Docker). Discover gateway IP: `ip route | awk '/default/ {print $3}'` (typically 172.17.0.1). Use that IP to reach the host."
+        network_line = "- **Network**: Bridge mode (Docker). Use `host.internal` to reach the host."
 
     # Build forwarded host ports description
     forwarded_ports_lines = []
@@ -538,6 +666,8 @@ def generate_agents_md(
                     f"  - `localhost:{entry}` → host port {entry}"
                 )
 
+    mcp_server_names = _effective_mcp_server_names(mcp_servers)
+
     lines = [
         "# YOLO Jail Environment",
         "",
@@ -555,7 +685,7 @@ def generate_agents_md(
         "",
         "Standard CLI tools: git, rg (ripgrep), fd, bat, jq, nvim, curl, wget, strace, gh",
         "Runtimes: Node.js 22, Python 3.13, Go (managed by mise)",
-        "MCP Servers: chrome-devtools (headless Chromium), sequential-thinking",
+        f"MCP Servers: {', '.join(mcp_server_names)}",
         "",
     ]
 
@@ -599,9 +729,10 @@ def generate_agents_md(
             "If you need a tool that is not installed, you can request it:",
             "",
             "1. Edit `/workspace/yolo-jail.jsonc` and add the package to the `packages` array",
-            '2. Tell the human user: "Please restart the jail so the new package becomes available"',
-            "3. The human will see a config diff and confirm the change at next startup",
-            "4. After restart, the package will be available",
+            "2. ALWAYS run `yolo check` after every config edit (`yolo check --no-build` is fine inside a running jail)",
+            '3. If the check passes, tell the human user: "Please restart the jail so the new package becomes available"',
+            "4. The human will see a config diff and confirm the change at next startup",
+            "5. After restart, the package will be available",
             "",
             "Example — to add PostgreSQL tools (latest version):",
             "```json",
@@ -706,6 +837,61 @@ def _estimate_image_size(store_path: str, sentinel: Path) -> int:
     return 0
 
 
+def _build_image_store_path(
+    repo_root: Path,
+    extra_packages: Optional[List[Union[str, dict]]] = None,
+    *,
+    out_link: Path,
+    status_message: str,
+) -> tuple[Optional[str], list[str]]:
+    """Run the nix image build and return the resulting store path on success."""
+    build_env = os.environ.copy()
+    pkg_json = json.dumps(extra_packages) if extra_packages else ""
+    if extra_packages:
+        build_env["YOLO_EXTRA_PACKAGES"] = pkg_json
+
+    build_stderr_tail: list[str] = []
+    try:
+        process = subprocess.Popen(
+            [
+                "nix",
+                "--extra-experimental-features",
+                "nix-command flakes",
+                "build",
+                ".#dockerImage",
+                "--impure",
+                "--out-link",
+                str(out_link),
+                "--print-build-logs",
+            ],
+            cwd=repo_root,
+            env=build_env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None, ["nix command not found"]
+
+    with console.status(status_message, spinner="dots") as status:
+        if process.stderr:
+            for line in iter(process.stderr.readline, ""):
+                clean = line.rstrip()
+                if clean:
+                    build_stderr_tail.append(clean)
+                    if len(build_stderr_tail) > 30:
+                        build_stderr_tail.pop(0)
+                    summary = _summarize_nix_line(clean)
+                    if summary:
+                        status.update(f"[bold blue]{summary}[/bold blue]")
+
+    process.wait()
+    if process.returncode != 0:
+        return None, build_stderr_tail
+
+    return str(out_link.resolve()), build_stderr_tail
+
+
 def _format_progress(current: int, estimate: int) -> str:
     """Format byte progress with optional percentage."""
     mb = current / (1024 * 1024)
@@ -746,58 +932,17 @@ def auto_load_image(
 ):
     """Cheaply check if the nix image needs to be reloaded into the container runtime."""
     # Per-runtime sentinel tracks all store paths loaded into this runtime
-    sentinel = repo_root / f".last-load-{runtime}"
-
-    # 1. Build the image (fast if no changes, streams progress otherwise)
-    build_env = os.environ.copy()
+    sentinel = BUILD_DIR / f"last-load-{runtime}"
+    out_link = BUILD_DIR / "run-result"
     pkg_json = json.dumps(extra_packages) if extra_packages else ""
-    if extra_packages:
-        build_env["YOLO_EXTRA_PACKAGES"] = pkg_json
+    current_path, build_stderr_tail = _build_image_store_path(
+        repo_root,
+        extra_packages=extra_packages,
+        out_link=out_link,
+        status_message="[bold blue]Checking jail image...",
+    )
 
-    build_stderr_tail: list[str] = []  # Keep last N lines for error display
-    build_ok = True
-    try:
-        process = subprocess.Popen(
-            [
-                "nix",
-                "--extra-experimental-features",
-                "nix-command flakes",
-                "build",
-                ".#dockerImage",
-                "--impure",
-                "--out-link",
-                ".run-result",
-                "--print-build-logs",
-            ],
-            cwd=repo_root,
-            env=build_env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-
-        with console.status(
-            "[bold blue]Checking jail image...", spinner="dots"
-        ) as status:
-            if process.stderr:
-                for line in iter(process.stderr.readline, ""):
-                    clean = line.rstrip()
-                    if clean:
-                        build_stderr_tail.append(clean)
-                        if len(build_stderr_tail) > 30:
-                            build_stderr_tail.pop(0)
-                        summary = _summarize_nix_line(clean)
-                        if summary:
-                            status.update(f"[bold blue]{summary}[/bold blue]")
-
-        process.wait()
-        if process.returncode != 0:
-            build_ok = False
-    except FileNotFoundError:
-        build_ok = False
-        build_stderr_tail.append("nix command not found")
-
-    if not build_ok:
+    if current_path is None:
         err_summary = (
             "\n".join(build_stderr_tail[-10:]) if build_stderr_tail else "unknown error"
         )
@@ -819,7 +964,6 @@ def auto_load_image(
         return
 
     # 2. Check if this store path has already been loaded into the runtime
-    current_path = str((repo_root / ".run-result").resolve())
     loaded_paths = _read_loaded_paths(sentinel)
 
     if current_path not in loaded_paths:
@@ -890,17 +1034,25 @@ def auto_load_image(
             console.print(f"[bold red]Error streaming image: {e}[/bold red]")
 
     # Cleanup temp link
-    (repo_root / ".run-result").unlink(missing_ok=True)
+    out_link.unlink(missing_ok=True)
 
 
-def _load_jsonc_file(path: Path, label: str) -> Dict[str, Any]:
+def _load_jsonc_file(path: Path, label: str, *, strict: bool = False) -> Dict[str, Any]:
     if not path.exists():
         return {}
     try:
         with open(path, "r") as f:
             parsed = pyjson5.load(f)
-        return parsed if isinstance(parsed, dict) else {}
+        if isinstance(parsed, dict):
+            return parsed
+        msg = f"{label} must contain a top-level JSON object"
+        if strict:
+            raise ConfigError(msg)
+        typer.echo(f"Warning: {msg}", err=True)
+        return {}
     except Exception as e:
+        if strict:
+            raise ConfigError(f"Failed to parse {label}: {e}") from e
         typer.echo(f"Warning: Failed to parse {label}: {e}", err=True)
         return {}
 
@@ -930,12 +1082,424 @@ def merge_config(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, An
     return result
 
 
-def load_config() -> Dict[str, Any]:
-    user_config = _load_jsonc_file(USER_CONFIG_PATH, str(USER_CONFIG_PATH))
+def load_config(
+    workspace: Optional[Path] = None, *, strict: bool = False
+) -> Dict[str, Any]:
+    workspace = workspace or Path.cwd()
+    user_config = _load_jsonc_file(
+        USER_CONFIG_PATH, str(USER_CONFIG_PATH), strict=strict
+    )
     workspace_config = _load_jsonc_file(
-        Path.cwd() / "yolo-jail.jsonc", "yolo-jail.jsonc"
+        workspace / "yolo-jail.jsonc", "yolo-jail.jsonc", strict=strict
     )
     return merge_config(user_config, workspace_config)
+
+
+KNOWN_TOP_LEVEL_CONFIG_KEYS = {
+    "runtime",
+    "repo_path",
+    "packages",
+    "mounts",
+    "network",
+    "security",
+    "mise_tools",
+    "lsp_servers",
+    "mcp_servers",
+    "devices",
+}
+KNOWN_NETWORK_KEYS = {"mode", "ports", "forward_host_ports"}
+KNOWN_SECURITY_KEYS = {"blocked_tools"}
+KNOWN_BLOCKED_TOOL_KEYS = {"name", "message", "suggestion"}
+KNOWN_PACKAGE_KEYS = {"name", "nixpkgs", "version", "url", "hash"}
+KNOWN_LSP_SERVER_KEYS = {"command", "args", "fileExtensions"}
+KNOWN_MCP_SERVER_KEYS = {"command", "args"}
+KNOWN_DEVICE_KEYS = {"usb", "description", "cgroup_rule"}
+USB_ID_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$")
+
+
+def _report_unknown_keys(
+    mapping: Dict[str, Any], allowed: set[str], path: str, errors: List[str]
+):
+    for key in sorted(mapping):
+        if key not in allowed:
+            errors.append(f"{path}.{key}: unknown key")
+
+
+def _validate_string_list(values: Any, path: str, errors: List[str]):
+    if not isinstance(values, list):
+        errors.append(f"{path}: expected a list")
+        return
+    for idx, value in enumerate(values):
+        if not isinstance(value, str):
+            errors.append(f"{path}[{idx}]: expected a string")
+
+
+def _validate_port_number(value: Any, path: str, errors: List[str]):
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        errors.append(f"{path}: expected an integer port number")
+        return
+    if port < 1 or port > 65535:
+        errors.append(f"{path}: port must be between 1 and 65535")
+
+
+def _validate_publish_port(value: Any, path: str, errors: List[str]):
+    if not isinstance(value, str):
+        errors.append(f"{path}: expected a string like '8000:8000'")
+        return
+    base = value
+    if "/" in base:
+        base, protocol = base.rsplit("/", 1)
+        if protocol not in ("tcp", "udp"):
+            errors.append(f"{path}: protocol must be tcp or udp")
+    parts = base.split(":")
+    if len(parts) == 2:
+        host_port, container_port = parts
+    elif len(parts) == 3:
+        _, host_port, container_port = parts
+    else:
+        errors.append(f"{path}: expected 'host:container' or 'ip:host:container'")
+        return
+    _validate_port_number(host_port, f"{path}.host", errors)
+    _validate_port_number(container_port, f"{path}.container", errors)
+
+
+def _validate_forward_host_port(value: Any, path: str, errors: List[str]):
+    if isinstance(value, int):
+        _validate_port_number(value, path, errors)
+        return
+    if not isinstance(value, str):
+        errors.append(f"{path}: expected an int or string like '8080:9090'")
+        return
+    parts = value.split(":")
+    if len(parts) == 1:
+        _validate_port_number(parts[0], path, errors)
+        return
+    if len(parts) == 2:
+        _validate_port_number(parts[0], f"{path}.local", errors)
+        _validate_port_number(parts[1], f"{path}.host", errors)
+        return
+    errors.append(f"{path}: expected '<port>' or '<local>:<host>'")
+
+
+def _validate_config(
+    config: Dict[str, Any], workspace: Optional[Path] = None
+) -> tuple[List[str], List[str]]:
+    errors: List[str] = []
+    warnings: List[str] = []
+    workspace = workspace or Path.cwd()
+
+    _report_unknown_keys(config, KNOWN_TOP_LEVEL_CONFIG_KEYS, "config", errors)
+
+    runtime = config.get("runtime")
+    if runtime is not None and runtime not in ("podman", "docker"):
+        errors.append("config.runtime: expected 'podman' or 'docker'")
+
+    repo_path = config.get("repo_path")
+    if repo_path is not None and not isinstance(repo_path, str):
+        errors.append("config.repo_path: expected a string path")
+
+    packages = config.get("packages")
+    if packages is not None:
+        if not isinstance(packages, list):
+            errors.append("config.packages: expected a list")
+        else:
+            for idx, pkg in enumerate(packages):
+                path = f"config.packages[{idx}]"
+                if isinstance(pkg, str):
+                    continue
+                if not isinstance(pkg, dict):
+                    errors.append(f"{path}: expected a string or object")
+                    continue
+                _report_unknown_keys(pkg, KNOWN_PACKAGE_KEYS, path, errors)
+                if not isinstance(pkg.get("name"), str):
+                    errors.append(f"{path}.name: expected a string")
+                has_nixpkgs = "nixpkgs" in pkg
+                has_version_override = any(
+                    key in pkg for key in ("version", "url", "hash")
+                )
+                if has_nixpkgs:
+                    if not isinstance(pkg.get("nixpkgs"), str):
+                        errors.append(f"{path}.nixpkgs: expected a string")
+                    if has_version_override:
+                        errors.append(
+                            f"{path}: use either nixpkgs pinning or version/url/hash overrides, not both"
+                        )
+                elif has_version_override:
+                    for key in ("version", "url", "hash"):
+                        if not isinstance(pkg.get(key), str):
+                            errors.append(f"{path}.{key}: expected a string")
+                else:
+                    errors.append(
+                        f"{path}: object packages must use either 'nixpkgs' or 'version'+'url'+'hash'"
+                    )
+
+    mounts = config.get("mounts")
+    if mounts is not None:
+        if not isinstance(mounts, list):
+            errors.append("config.mounts: expected a list")
+        else:
+            for idx, mount in enumerate(mounts):
+                path = f"config.mounts[{idx}]"
+                if not isinstance(mount, str):
+                    errors.append(f"{path}: expected a string")
+                    continue
+                colon_idx = mount.rfind(":")
+                host_path = mount
+                if colon_idx > 0 and mount[colon_idx + 1 : colon_idx + 2] == "/":
+                    host_path = mount[:colon_idx]
+                    container_path = mount[colon_idx + 1 :]
+                    if not container_path.startswith("/"):
+                        errors.append(f"{path}: container mount path must be absolute")
+                if not host_path:
+                    errors.append(f"{path}: host mount path cannot be empty")
+                    continue
+                resolved_host = Path(host_path).expanduser().resolve()
+                if not resolved_host.exists():
+                    warnings.append(
+                        f"{path}: host path does not exist and will be skipped: {resolved_host}"
+                    )
+
+    network = config.get("network")
+    if network is not None:
+        if not isinstance(network, dict):
+            errors.append("config.network: expected an object")
+        else:
+            _report_unknown_keys(network, KNOWN_NETWORK_KEYS, "config.network", errors)
+            mode = network.get("mode")
+            if mode is not None and mode not in ("bridge", "host"):
+                errors.append("config.network.mode: expected 'bridge' or 'host'")
+            ports = network.get("ports")
+            if ports is not None:
+                if not isinstance(ports, list):
+                    errors.append("config.network.ports: expected a list")
+                else:
+                    for idx, port in enumerate(ports):
+                        _validate_publish_port(
+                            port, f"config.network.ports[{idx}]", errors
+                        )
+            forward_host_ports = network.get("forward_host_ports")
+            if forward_host_ports is not None:
+                if not isinstance(forward_host_ports, list):
+                    errors.append("config.network.forward_host_ports: expected a list")
+                else:
+                    for idx, port in enumerate(forward_host_ports):
+                        _validate_forward_host_port(
+                            port,
+                            f"config.network.forward_host_ports[{idx}]",
+                            errors,
+                        )
+            if mode == "host":
+                if network.get("ports"):
+                    warnings.append(
+                        "config.network.ports: ignored when network.mode is 'host'"
+                    )
+                if network.get("forward_host_ports"):
+                    warnings.append(
+                        "config.network.forward_host_ports: ignored when network.mode is 'host'"
+                    )
+
+    security = config.get("security")
+    if security is not None:
+        if not isinstance(security, dict):
+            errors.append("config.security: expected an object")
+        else:
+            _report_unknown_keys(
+                security, KNOWN_SECURITY_KEYS, "config.security", errors
+            )
+            blocked_tools = security.get("blocked_tools")
+            if blocked_tools is not None:
+                if not isinstance(blocked_tools, list):
+                    errors.append("config.security.blocked_tools: expected a list")
+                else:
+                    for idx, tool in enumerate(blocked_tools):
+                        path = f"config.security.blocked_tools[{idx}]"
+                        if isinstance(tool, str):
+                            continue
+                        if not isinstance(tool, dict):
+                            errors.append(f"{path}: expected a string or object")
+                            continue
+                        _report_unknown_keys(
+                            tool, KNOWN_BLOCKED_TOOL_KEYS, path, errors
+                        )
+                        if not isinstance(tool.get("name"), str):
+                            errors.append(f"{path}.name: expected a string")
+                        for key in ("message", "suggestion"):
+                            if key in tool and not isinstance(tool.get(key), str):
+                                errors.append(f"{path}.{key}: expected a string")
+
+    mise_tools = config.get("mise_tools")
+    if mise_tools is not None:
+        if not isinstance(mise_tools, dict):
+            errors.append("config.mise_tools: expected an object")
+        else:
+            for key, value in mise_tools.items():
+                if not isinstance(key, str):
+                    errors.append("config.mise_tools: tool names must be strings")
+                if not isinstance(value, str):
+                    errors.append(f"config.mise_tools.{key}: expected a version string")
+
+    lsp_servers = config.get("lsp_servers")
+    if lsp_servers is not None:
+        if not isinstance(lsp_servers, dict):
+            errors.append("config.lsp_servers: expected an object")
+        else:
+            for name, cfg in lsp_servers.items():
+                path = f"config.lsp_servers.{name}"
+                if not isinstance(cfg, dict):
+                    errors.append(f"{path}: expected an object")
+                    continue
+                _report_unknown_keys(cfg, KNOWN_LSP_SERVER_KEYS, path, errors)
+                if not isinstance(cfg.get("command"), str):
+                    errors.append(f"{path}.command: expected a string")
+                if "args" in cfg:
+                    _validate_string_list(cfg["args"], f"{path}.args", errors)
+                file_extensions = cfg.get("fileExtensions")
+                if not isinstance(file_extensions, dict):
+                    errors.append(f"{path}.fileExtensions: expected an object")
+                else:
+                    for ext, lang in file_extensions.items():
+                        if not isinstance(ext, str) or not isinstance(lang, str):
+                            errors.append(
+                                f"{path}.fileExtensions: keys and values must be strings"
+                            )
+
+    mcp_servers = config.get("mcp_servers")
+    if mcp_servers is not None:
+        if not isinstance(mcp_servers, dict):
+            errors.append("config.mcp_servers: expected an object")
+        else:
+            for name, cfg in mcp_servers.items():
+                path = f"config.mcp_servers.{name}"
+                if cfg is None:
+                    continue
+                if not isinstance(cfg, dict):
+                    errors.append(f"{path}: expected an object or null")
+                    continue
+                _report_unknown_keys(cfg, KNOWN_MCP_SERVER_KEYS, path, errors)
+                if not isinstance(cfg.get("command"), str):
+                    errors.append(f"{path}.command: expected a string")
+                if "args" in cfg:
+                    _validate_string_list(cfg["args"], f"{path}.args", errors)
+
+    devices = config.get("devices")
+    if devices is not None:
+        if not isinstance(devices, list):
+            errors.append("config.devices: expected a list")
+        else:
+            for idx, device in enumerate(devices):
+                path = f"config.devices[{idx}]"
+                if isinstance(device, str):
+                    if not Path(device).exists():
+                        warnings.append(
+                            f"{path}: device path does not exist and may be skipped: {device}"
+                        )
+                    continue
+                if not isinstance(device, dict):
+                    errors.append(f"{path}: expected a string or object")
+                    continue
+                _report_unknown_keys(device, KNOWN_DEVICE_KEYS, path, errors)
+                has_usb = "usb" in device
+                has_cgroup = "cgroup_rule" in device
+                if has_usb == has_cgroup:
+                    errors.append(
+                        f"{path}: expected exactly one of 'usb' or 'cgroup_rule'"
+                    )
+                    continue
+                if has_usb:
+                    if not isinstance(device.get("usb"), str):
+                        errors.append(f"{path}.usb: expected a string")
+                    elif not USB_ID_RE.match(device["usb"]):
+                        errors.append(
+                            f"{path}.usb: expected vendor:product hex format like '0bda:2838'"
+                        )
+                    if "description" in device and not isinstance(
+                        device.get("description"), str
+                    ):
+                        errors.append(f"{path}.description: expected a string")
+                if has_cgroup and not isinstance(device.get("cgroup_rule"), str):
+                    errors.append(f"{path}.cgroup_rule: expected a string")
+
+    return errors, warnings
+
+
+def _runtime_for_check(config: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    """Resolve the effective runtime without exiting."""
+    env = os.environ.get("YOLO_RUNTIME")
+    if env and env in ("podman", "docker"):
+        if shutil.which(env):
+            return env, None
+        return None, f"Configured runtime '{env}' from YOLO_RUNTIME is not on PATH"
+
+    cfg = config.get("runtime")
+    if cfg and cfg in ("podman", "docker"):
+        if shutil.which(cfg):
+            return cfg, None
+        return None, f"Configured runtime '{cfg}' from yolo-jail.jsonc is not on PATH"
+
+    for rt in ("podman", "docker"):
+        if shutil.which(rt):
+            return rt, None
+    return None, "No container runtime found on PATH"
+
+
+def _entrypoint_preflight(repo_root: Path, workspace: Path, config: Dict[str, Any]):
+    """Generate jail-managed config into a temp home to catch config/render errors."""
+    src_dir = repo_root / "src"
+    host_mise = _host_mise_dir()
+    normalized_blocked = _normalize_blocked_tools(config.get("security"))
+    env = os.environ.copy()
+
+    with tempfile.TemporaryDirectory(prefix="yolo-check-") as tmp:
+        env.update(
+            {
+                "JAIL_HOME": tmp,
+                "HOME": tmp,
+                "NPM_CONFIG_PREFIX": f"{tmp}/.npm-global",
+                "GOPATH": f"{tmp}/go",
+                "MISE_DATA_DIR": str(host_mise),
+                "YOLO_HOST_DIR": str(workspace.resolve()),
+                "YOLO_BLOCK_CONFIG": json.dumps(normalized_blocked),
+                "YOLO_MISE_TOOLS": json.dumps(_merge_mise_tools(config)),
+                "YOLO_LSP_SERVERS": json.dumps(config.get("lsp_servers", {})),
+                "YOLO_MCP_SERVERS": json.dumps(config.get("mcp_servers", {})),
+            }
+        )
+        code = f"""
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, {str(src_dir)!r})
+import entrypoint
+
+entrypoint.generate_shims()
+entrypoint.generate_bashrc()
+entrypoint.generate_bootstrap_script()
+entrypoint.generate_venv_precreate_script()
+entrypoint.generate_mise_config()
+entrypoint.generate_mcp_wrappers()
+entrypoint.configure_copilot()
+entrypoint.configure_gemini()
+
+json.loads((entrypoint.COPILOT_DIR / "mcp-config.json").read_text())
+json.loads((entrypoint.COPILOT_DIR / "lsp-config.json").read_text())
+json.loads((entrypoint.GEMINI_DIR / "settings.json").read_text())
+print("ok")
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=workspace,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            details = "\n".join(
+                part for part in (result.stdout.strip(), result.stderr.strip()) if part
+            )
+            raise ConfigError(details or "entrypoint dry-run failed")
 
 
 @app.command()
@@ -1006,6 +1570,18 @@ def init():
   //     "args": [],
   //     "fileExtensions": {".rs": "rust"}
   //   }
+  // }
+  //
+  // Additional MCP servers for Copilot and Gemini.
+  // Defaults: chrome-devtools, sequential-thinking.
+  // Add new servers, override defaults, or set a server to null to disable it.
+  // Binary must be on PATH or absolute.
+  // "mcp_servers": {
+  //   "my-custom": {
+  //     "command": "/workspace/scripts/my-mcp-server.py",
+  //     "args": []
+  //   },
+  //   "chrome-devtools": null
   // }
 }
 """
@@ -1100,7 +1676,12 @@ need to know.
        For tools with binary releases — fast, no compilation.
      Most tasks need NO config changes. Skip this step if unsure.
 
-  2. [bold](MANDATORY) Write a handover document[/bold] at:
+  2. [bold]Run `yolo check`[/bold] after [bold]EVERY[/bold] `yolo-jail.jsonc` edit to validate
+     the config and preflight the build. Use `yolo check --no-build` inside a
+     running jail if you only need config/entrypoint validation. Do this before
+     asking the human to restart you into the jail.
+
+  3. [bold](MANDATORY) Write a handover document[/bold] at:
      [bold yellow].yolo/handover.md[/bold yellow]
 
      This file is [bold]required[/bold]. Your jail instance will be a completely
@@ -1112,7 +1693,7 @@ need to know.
      • Files to look at first
      • Any gotchas or context the inner agent needs
 
-  3. [bold]Ask the human to restart you inside the jail[/bold]:
+  4. [bold]Ask the human to restart you inside the jail[/bold]:
      Tell them to run: yolo -- copilot  (or yolo -- gemini)
 
      The inner agent has a built-in [bold]jail-startup[/bold] skill that reads
@@ -1168,6 +1749,11 @@ def config_ref():
 
   Workspace config merges over user defaults.
   Lists are merged and deduplicated. Scalars override.
+
+  [bold yellow]Rule:[/bold yellow] After [bold]EVERY[/bold] edit to `yolo-jail.jsonc` or
+  `~/.config/yolo-jail/config.jsonc`, run `yolo check` before restarting or
+  asking a human to restart the jail. Use `yolo check --no-build` inside a
+  running jail for a faster preflight.
 
 [bold cyan]FIELDS[/bold cyan]
 
@@ -1243,6 +1829,19 @@ def config_ref():
     Example: {"rust": {"command": "rust-analyzer", "args": [],
               "fileExtensions": {".rs": "rust"}}}
 
+  [bold]mcp_servers[/bold] (object): MCP servers for Copilot and Gemini.
+    Default servers: chrome-devtools, sequential-thinking.
+    Workspace servers are merged with defaults — add new ones, override existing,
+    or set a server to [bold]null[/bold] to disable a default or inherited server.
+    Each key is a server name; value is an object with:
+      • command (string, required): Binary name (on PATH) or absolute path.
+      • args (array of strings): Args passed to the MCP server. Default: [].
+    The entrypoint translates these for each agent:
+      • Copilot: written to ~/.copilot/mcp-config.json.
+      • Gemini: written to ~/.gemini/settings.json.
+    Example: {"my-custom": {"command": "/workspace/scripts/my-mcp.py", "args": []},
+              "chrome-devtools": null}
+
   [bold]devices[/bold] (array): Host devices to pass through to the jail.
     Three formats supported:
     • USB by vendor:product ID (preferred — stable across reboots):
@@ -1300,7 +1899,8 @@ def config_ref():
   When yolo-jail.jsonc changes between jail startups, the CLI shows a
   diff of the normalized config and asks for y/N confirmation. This
   prevents agents from silently adding packages or mounts without the
-  human operator noticing.
+  human operator noticing. Agents should still run `yolo check` after
+  every config edit before asking for that restart.
 
   - First run: config is accepted and a snapshot saved.
   - Subsequent runs: changes require explicit y/N approval.
@@ -1313,19 +1913,21 @@ def config_ref():
   Agents inside the jail can request new packages:
 
   1. Agent edits /workspace/yolo-jail.jsonc, adds to "packages" array
-  2. Agent tells the human: "Please restart the jail for new packages"
-  3. On next startup, human sees the config diff and approves (y/N)
-  4. Image rebuilds with the new package
-  5. Agent can use the package after restart
+  2. Agent ALWAYS runs `yolo check` after the edit (`--no-build` is okay inside a running jail)
+  3. If the check passes, agent tells the human: "Please restart the jail for new packages"
+  4. On next startup, human sees the config diff and approves (y/N)
+  5. Image rebuilds with the new package
+  6. Agent can use the package after restart
 
   This keeps the human in the loop for all environment changes.
   Do NOT install packages via apt, nix-env, or other package managers.
 
-[bold cyan]COMMANDS[/bold cyan]
+  [bold cyan]COMMANDS[/bold cyan]
 
   yolo                      Start interactive jail shell
   yolo -- <command>         Run a command inside the jail
   yolo --new -- <command>   Force a new container
+  yolo check                Validate config and preflight the build
   yolo ps                   List running jail containers
   yolo init                 Create yolo-jail.jsonc in current directory
   yolo init-user-config     Create user-level defaults config
@@ -1406,17 +2008,174 @@ def config_ref():
 
   1. Run 'yolo init' in the project root to create yolo-jail.jsonc
   2. Edit the config — add any nix packages or mise_tools needed
-  3. Run 'yolo -- bash' to enter the jail interactively
-  4. Start your agent: 'yolo -- copilot' or 'yolo -- gemini'
+  3. Run 'yolo check' after EVERY config edit to validate the config before restarting
+  4. Run 'yolo -- bash' to enter the jail interactively
+  5. Start your agent: 'yolo -- copilot' or 'yolo -- gemini'
 
   [bold]For agents preparing to enter a jail:[/bold]
-  Before asking the human to restart you inside the jail, write a
+  Before asking the human to restart you inside the jail, ALWAYS run 'yolo check'
+  and write a
   handoff document (e.g., scratch/jail-notes.md) with:
   • Current task state and what remains to be done
   • Decisions made and their rationale
   • Key files to examine first
   Your inner-jail self will be a fresh session without your context.
 """)
+
+
+@app.command()
+def check(
+    build: bool = typer.Option(
+        True,
+        "--build/--no-build",
+        help="Run nix build as part of the preflight (default: on)",
+    ),
+):
+    """Validate yolo-jail config and preflight the build after every config edit."""
+    ensure_global_storage()
+    workspace = Path.cwd()
+
+    passed = 0
+    failed = 0
+    warned = 0
+
+    def ok(msg: str):
+        nonlocal passed
+        passed += 1
+        console.print(f"  ✅ {msg}")
+
+    def fail(msg: str, note: str = ""):
+        nonlocal failed
+        failed += 1
+        console.print(f"  ❌ {msg}")
+        if note:
+            console.print(f"     → {note}")
+
+    def warn(msg: str, note: str = ""):
+        nonlocal warned
+        warned += 1
+        console.print(f"  ⚠️  {msg}")
+        if note:
+            console.print(f"     → {note}")
+
+    console.print("\n[bold]YOLO Jail Check[/bold]\n")
+
+    console.print("[bold]Config Files[/bold]")
+    try:
+        user_config = _load_jsonc_file(
+            USER_CONFIG_PATH, str(USER_CONFIG_PATH), strict=True
+        )
+        if USER_CONFIG_PATH.exists():
+            ok(f"Parsed user config: {USER_CONFIG_PATH}")
+        else:
+            ok(f"No user config found: {USER_CONFIG_PATH}")
+    except ConfigError as e:
+        user_config = {}
+        fail(str(e))
+
+    workspace_config_path = workspace / "yolo-jail.jsonc"
+    try:
+        workspace_config = _load_jsonc_file(
+            workspace_config_path, "yolo-jail.jsonc", strict=True
+        )
+        if workspace_config_path.exists():
+            ok(f"Parsed workspace config: {workspace_config_path}")
+        else:
+            ok("No workspace yolo-jail.jsonc found")
+    except ConfigError as e:
+        workspace_config = {}
+        fail(str(e))
+    console.print()
+
+    if failed:
+        console.print("[bold]Summary[/bold]")
+        console.print(f"  [red]{failed} failed[/red]\n")
+        raise typer.Exit(1)
+
+    config = merge_config(user_config, workspace_config)
+    repo_root: Optional[Path] = None
+    try:
+        repo_root = _resolve_repo_root()
+        ok(f"Using yolo-jail repo: {repo_root}")
+    except SystemExit:
+        fail("Could not resolve the yolo-jail repo root")
+
+    console.print("[bold]Merged Configuration[/bold]")
+    errors, warnings = _validate_config(config, workspace=workspace)
+    runtime, runtime_error = _runtime_for_check(config)
+    if runtime_error:
+        errors.append(runtime_error)
+    elif runtime:
+        ok(f"Runtime available: {runtime}")
+
+    if workspace_config_path.exists() and "repo_path" in workspace_config:
+        warnings.append(
+            "config.repo_path: workspace repo_path is ignored; only the user config uses it"
+        )
+
+    for message in warnings:
+        warn(message)
+    if errors:
+        for message in errors:
+            fail(message)
+        console.print()
+        console.print("[bold]Summary[/bold]")
+        parts = [f"[red]{failed} failed[/red]"]
+        if warned:
+            parts.append(f"[yellow]{warned} warnings[/yellow]")
+        console.print(f"  {', '.join(parts)}\n")
+        raise typer.Exit(1)
+    ok("Merged config is semantically valid")
+    console.print()
+
+    console.print("[bold]Entrypoint Dry-Run[/bold]")
+    try:
+        if repo_root is None:
+            raise ConfigError("repo root resolution failed")
+        if not (repo_root / "src" / "entrypoint.py").exists():
+            raise ConfigError(f"entrypoint source not found under {repo_root}")
+        _entrypoint_preflight(repo_root, workspace, config)
+        ok("Generated Copilot/Gemini jail config in a temp home")
+    except (ConfigError, SystemExit) as e:
+        fail("Entrypoint preflight failed", str(e))
+    console.print()
+
+    console.print("[bold]Image Build[/bold]")
+    if build:
+        out_link = BUILD_DIR / "check-result"
+        if repo_root is None:
+            fail("Skipped nix build", "repo root resolution failed")
+        else:
+            try:
+                store_path, build_stderr_tail = _build_image_store_path(
+                    repo_root,
+                    extra_packages=config.get("packages") or None,
+                    out_link=out_link,
+                    status_message="[bold blue]Preflighting jail image...",
+                )
+                if store_path is None:
+                    fail(
+                        "nix build failed",
+                        "\n".join(build_stderr_tail[-10:]) if build_stderr_tail else "",
+                    )
+                else:
+                    ok(f"nix build succeeded: {store_path}")
+            finally:
+                out_link.unlink(missing_ok=True)
+    else:
+        warn("Skipped nix build (--no-build)")
+    console.print()
+
+    console.print("[bold]Summary[/bold]")
+    parts = [f"[green]{passed} passed[/green]"]
+    if failed:
+        parts.append(f"[red]{failed} failed[/red]")
+    if warned:
+        parts.append(f"[yellow]{warned} warnings[/yellow]")
+    console.print(f"  {', '.join(parts)}\n")
+
+    if failed:
+        raise typer.Exit(1)
 
 
 def _config_snapshot_path(workspace: Path) -> Path:
@@ -1505,14 +2264,24 @@ def run(
     ),
 ):
     """Run the YOLO jail in the current directory."""
-    # Find repo root — use YOLO_REPO_ROOT env var inside jails, otherwise resolve from source
-    repo_root = Path(
-        os.environ.get("YOLO_REPO_ROOT", Path(__file__).parent.parent)
-    ).resolve()
+    repo_root = _resolve_repo_root()
     workspace = Path.cwd()
 
     ensure_global_storage()
-    config = load_config()
+    try:
+        config = load_config(workspace, strict=True)
+    except ConfigError as e:
+        console.print(f"[bold red]{e}[/bold red]")
+        sys.exit(1)
+    config_errors, _ = _validate_config(config, workspace=workspace)
+    if config_errors:
+        console.print("[bold red]Invalid jail config:[/bold red]")
+        for message in config_errors:
+            console.print(f"  • {message}")
+        console.print(
+            "\n[dim]Run `yolo check` for a full preflight before restarting.[/dim]"
+        )
+        sys.exit(1)
     runtime = _runtime(config)
 
     # Command construction (needed for both exec and run paths)
@@ -1524,6 +2293,9 @@ def run(
         if full_command[0] in ["gemini", "copilot"]:
             if "--yolo" not in full_command and "-y" not in full_command:
                 full_command.insert(1, "--yolo")
+        if full_command[0] == "copilot":
+            if "--no-auto-update" not in full_command:
+                full_command.insert(1, "--no-auto-update")
         target_cmd = shlex.join(full_command)
 
     # Collect identity env vars early — needed for both exec and run paths
@@ -1603,7 +2375,16 @@ def run(
             target_cmd,
         ]
         # Use subprocess.run (not execvp) so atexit handlers fire for tmux cleanup
-        result = subprocess.run(docker_cmd)
+        try:
+            result = subprocess.run(docker_cmd)
+        except FileNotFoundError:
+            console.print(
+                f"[bold red]Configured runtime '{runtime}' not found on PATH.[/bold red]"
+            )
+            console.print(
+                "[dim]Run `yolo check` to validate runtime availability before restarting.[/dim]"
+            )
+            sys.exit(1)
         sys.exit(result.returncode)
 
     # No existing container — build/load the image then start a new one.
@@ -1646,7 +2427,16 @@ def run(
                 "yolo-entrypoint",
                 target_cmd,
             ]
-            result = subprocess.run(docker_cmd)
+            try:
+                result = subprocess.run(docker_cmd)
+            except FileNotFoundError:
+                console.print(
+                    f"[bold red]Configured runtime '{runtime}' not found on PATH.[/bold red]"
+                )
+                console.print(
+                    "[dim]Run `yolo check` to validate runtime availability before restarting.[/dim]"
+                )
+                sys.exit(1)
             sys.exit(result.returncode)
 
     import time as _time
@@ -1656,20 +2446,14 @@ def run(
         _profile_times["start"] = _time.monotonic()
 
     extra_packages = config.get("packages", [])
-    # Merge mise_tools: hardcoded defaults < user config < workspace config
-    default_mise_tools = {"neovim": "stable"}
-    mise_tools = {**default_mise_tools, **config.get("mise_tools", {})}
+    mise_tools = _merge_mise_tools(config)
     lsp_servers = config.get("lsp_servers", {})
+    mcp_servers = config.get("mcp_servers", {})
     auto_load_image(repo_root, extra_packages=extra_packages or None, runtime=runtime)
 
     # Resolve host mise path — share the same data dir so venv paths match.
     # Inside a nested jail, YOLO_OUTER_MISE_PATH carries the original host path.
-    host_mise_path = os.environ.get("YOLO_OUTER_MISE_PATH") or os.environ.get(
-        "MISE_DATA_DIR", str(Path.home() / ".local" / "share" / "mise")
-    )
-    host_mise = Path(host_mise_path)
-    if not host_mise.exists():
-        host_mise.mkdir(parents=True, exist_ok=True)
+    host_mise = _host_mise_dir()
 
     if profile:
         _profile_times["image_loaded"] = _time.monotonic()
@@ -1690,39 +2474,7 @@ def run(
     if net_mode == "bridge" and config.get("network", {}).get("forward_host_ports"):
         forward_host_ports = config["network"]["forward_host_ports"]
 
-    # Process Blocked Tools for the Container
-    security_section = config.get("security", {})
-    if security_section is None:
-        security_section = {}
-
-    raw_blocked = security_section.get("blocked_tools", ["grep", "find"])
-    if raw_blocked is None:
-        raw_blocked = ["grep", "find"]
-
-    # Default messages and suggestions for standard tools
-    default_messages = {
-        "grep": {
-            "message": "grep is blocked to prevent unintended recursive searches. Use ripgrep (rg) or other targeted tools.",
-            "suggestion": "Try: rg <pattern> [file]",
-        },
-        "find": {
-            "message": "find is blocked to prevent unintended recursive searches. Use fd for a faster, more intuitive alternative.",
-            "suggestion": "Try: fd <pattern>",
-        },
-    }
-
-    normalized_blocked = []
-
-    for tool in raw_blocked:
-        if isinstance(tool, str):
-            tool_dict = {"name": tool}
-            # Add default message if available
-            if tool in default_messages:
-                tool_dict.update(default_messages[tool])
-            normalized_blocked.append(tool_dict)
-        elif isinstance(tool, dict) and "name" in tool:
-            normalized_blocked.append(tool)
-
+    normalized_blocked = _normalize_blocked_tools(config.get("security"))
     blocked_config_json = json.dumps(normalized_blocked)
 
     # Process Extra Mounts
@@ -1833,6 +2585,8 @@ def run(
         f"YOLO_MISE_TOOLS={json.dumps(mise_tools)}",
         "-e",
         f"YOLO_LSP_SERVERS={json.dumps(lsp_servers)}",
+        "-e",
+        f"YOLO_MCP_SERVERS={json.dumps(mcp_servers)}",
         "-e",
         f"YOLO_RUNTIME={runtime}",
         "-e",
@@ -2064,6 +2818,7 @@ def run(
         net_mode=net_mode,
         runtime=runtime,
         forward_host_ports=forward_host_ports or None,
+        mcp_servers=mcp_servers or None,
     )
     docker_cmd.extend(
         ["-v", f"{agents_path / 'AGENTS-copilot.md'}:/home/agent/.copilot/AGENTS.md:ro"]
@@ -2140,7 +2895,18 @@ def run(
     # Use Popen so we can release the workspace lock once the container is
     # confirmed running.  Any concurrent yolo process waiting on the lock will
     # re-check and find our container, then exec into it.
-    proc = subprocess.Popen(docker_cmd)
+    try:
+        proc = subprocess.Popen(docker_cmd)
+    except FileNotFoundError:
+        console.print(
+            f"[bold red]Configured runtime '{runtime}' not found on PATH.[/bold red]"
+        )
+        console.print(
+            "[dim]Run `yolo check` to validate runtime availability before restarting.[/dim]"
+        )
+        cleanup_port_forwarding(socat_procs, socket_dir)
+        lock_file.close()
+        sys.exit(1)
     for _ in range(20):
         if find_running_container(cname, runtime=runtime):
             break
@@ -2278,14 +3044,12 @@ def doctor():
         fail("nix not found", "Install Nix: https://nixos.org/download/")
 
     # Check flake.nix exists
-    flake = Path.cwd() / "flake.nix"
-    if not flake.exists():
-        # Try repo root
-        flake = Path(__file__).resolve().parent.parent / "flake.nix"
-    if flake.exists():
+    try:
+        repo = _resolve_repo_root()
+        flake = repo / "flake.nix"
         ok(f"flake.nix found: {flake}")
-    else:
-        warn("flake.nix not found in current directory")
+    except SystemExit:
+        warn("yolo-jail repo root not found (set repo_path in user config)")
     console.print()
 
     # 3. Global storage
@@ -2295,6 +3059,7 @@ def doctor():
         ("Mise", GLOBAL_MISE),
         ("Containers", CONTAINER_DIR),
         ("Agents", AGENTS_DIR),
+        ("Build", BUILD_DIR),
     ]:
         if path.exists():
             ok(f"{name}: {path}")

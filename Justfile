@@ -4,21 +4,33 @@ runtime := env("YOLO_RUNTIME", "podman")
 default:
     @just --list
 
-# Build the container image using Nix
+# Build the Python package
 build:
+    uv build
+
+# Install yolo as a standalone tool (decoupled from source tree)
+install: build
+    uv tool install dist/*.whl --force
+
+# Build + install (deploy the yolo CLI)
+deploy: install
+    @echo "yolo-jail deployed. Verify: which yolo"
+
+# Build the container image using Nix
+build-image:
     nix --extra-experimental-features 'nix-command flakes' build .#dockerImage
 
 # Build and load the image into the container runtime
-load: build
+load: build-image
     {{runtime}} load < result
 
 # Run all tests
 test:
-    uv run pytest tests/
+    uv run --group dev python -m pytest tests/
 
 # Run fast tests only (skip container integration tests)
 test-fast:
-    uv run pytest tests/ -m "not slow"
+    uv run --group dev python -m pytest tests/ -m "not slow"
 
 # Run linter
 lint:
@@ -35,6 +47,7 @@ check: format lint test
 # Clean up build artifacts
 clean:
     rm -f result
+    rm -rf dist/ build/
 
 # Push bookmarks to remote
 push:

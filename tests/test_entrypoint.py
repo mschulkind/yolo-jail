@@ -27,6 +27,7 @@ def jail_home(tmp_path):
         "BASHRC_PATH",
         "COPILOT_DIR",
         "GEMINI_DIR",
+        "GEMINI_MANAGED_MCP_PATH",
         "MISE_CONFIG_DIR",
     ]
     for attr in attrs:
@@ -42,6 +43,9 @@ def jail_home(tmp_path):
     entrypoint.BASHRC_PATH = tmp_path / ".bashrc"
     entrypoint.COPILOT_DIR = tmp_path / ".copilot"
     entrypoint.GEMINI_DIR = tmp_path / ".gemini"
+    entrypoint.GEMINI_MANAGED_MCP_PATH = (
+        tmp_path / ".gemini" / "yolo-managed-mcp-servers.json"
+    )
     entrypoint.MISE_CONFIG_DIR = tmp_path / ".config" / "mise"
 
     yield tmp_path
@@ -133,7 +137,7 @@ class TestBashrcGeneration:
         entrypoint.generate_bashrc()
         content = entrypoint.BASHRC_PATH.read_text()
         assert "alias gemini='gemini --yolo'" in content
-        assert "alias copilot='copilot --yolo'" in content
+        assert "alias copilot='copilot --yolo --no-auto-update'" in content
 
     def test_pager_disabled(self, jail_home, monkeypatch):
         monkeypatch.setenv("YOLO_HOST_DIR", "test")
@@ -147,6 +151,9 @@ class TestBashrcGeneration:
         entrypoint.generate_bashrc()
         content = entrypoint.BASHRC_PATH.read_text()
         assert "/mise/shims" in content or "MISE_DATA_DIR" in content
+        assert content.index("$NPM_CONFIG_PREFIX/bin") < content.index(
+            "${MISE_DATA_DIR:-/mise}/shims"
+        )
 
 
 # -- Copilot config --
@@ -157,6 +164,52 @@ class TestCopilotConfig:
         entrypoint.configure_copilot()
         mcp = json.loads((entrypoint.COPILOT_DIR / "mcp-config.json").read_text())
         assert "chrome-devtools" in mcp["mcpServers"]
+        assert "sequential-thinking" in mcp["mcpServers"]
+
+    def test_mcp_workspace_override(self, jail_home, monkeypatch):
+        monkeypatch.setenv(
+            "YOLO_MCP_SERVERS",
+            json.dumps(
+                {
+                    "probe-mcp": {
+                        "command": "/workspace/probe-mcp.py",
+                        "args": ["--stdio"],
+                    }
+                }
+            ),
+        )
+        entrypoint.configure_copilot()
+        mcp = json.loads((entrypoint.COPILOT_DIR / "mcp-config.json").read_text())
+        assert "chrome-devtools" in mcp["mcpServers"]
+        assert "sequential-thinking" in mcp["mcpServers"]
+        assert mcp["mcpServers"]["probe-mcp"]["command"] == "/workspace/probe-mcp.py"
+
+    def test_mcp_workspace_override_replaces_default(self, jail_home, monkeypatch):
+        monkeypatch.setenv(
+            "YOLO_MCP_SERVERS",
+            json.dumps(
+                {
+                    "sequential-thinking": {
+                        "command": "/workspace/custom-seq.py",
+                        "args": ["--custom"],
+                    }
+                }
+            ),
+        )
+        entrypoint.configure_copilot()
+        mcp = json.loads((entrypoint.COPILOT_DIR / "mcp-config.json").read_text())
+        assert mcp["mcpServers"]["sequential-thinking"]["command"] == (
+            "/workspace/custom-seq.py"
+        )
+
+    def test_mcp_workspace_override_can_disable_default(self, jail_home, monkeypatch):
+        monkeypatch.setenv(
+            "YOLO_MCP_SERVERS",
+            json.dumps({"chrome-devtools": None}),
+        )
+        entrypoint.configure_copilot()
+        mcp = json.loads((entrypoint.COPILOT_DIR / "mcp-config.json").read_text())
+        assert "chrome-devtools" not in mcp["mcpServers"]
         assert "sequential-thinking" in mcp["mcpServers"]
 
     def test_lsp_config(self, jail_home):
@@ -239,6 +292,56 @@ class TestGeminiConfig:
         assert "python-lsp" in cfg["mcpServers"]
         assert "typescript-lsp" in cfg["mcpServers"]
         assert "go-lsp" in cfg["mcpServers"]
+        assert cfg["general"]["enableAutoUpdate"] is False
+        assert cfg["general"]["enableAutoUpdateNotification"] is False
+
+    def test_gemini_mcp_workspace_server(self, jail_home, monkeypatch):
+        monkeypatch.setenv(
+            "YOLO_MCP_SERVERS",
+            json.dumps(
+                {
+                    "probe-mcp": {
+                        "command": "/workspace/probe-mcp.py",
+                        "args": ["--stdio"],
+                    }
+                }
+            ),
+        )
+        entrypoint.configure_gemini()
+        cfg = json.loads((entrypoint.GEMINI_DIR / "settings.json").read_text())
+        assert cfg["mcpServers"]["probe-mcp"]["command"] == "/workspace/probe-mcp.py"
+
+    def test_gemini_mcp_workspace_override_replaces_default(
+        self, jail_home, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "YOLO_MCP_SERVERS",
+            json.dumps(
+                {
+                    "chrome-devtools": {
+                        "command": "/workspace/custom-node",
+                        "args": ["custom-devtools"],
+                    }
+                }
+            ),
+        )
+        entrypoint.configure_gemini()
+        cfg = json.loads((entrypoint.GEMINI_DIR / "settings.json").read_text())
+        assert cfg["mcpServers"]["chrome-devtools"]["command"] == (
+            "/workspace/custom-node"
+        )
+
+    def test_gemini_mcp_workspace_override_can_disable_default(
+        self, jail_home, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "YOLO_MCP_SERVERS",
+            json.dumps({"chrome-devtools": None}),
+        )
+        entrypoint.configure_gemini()
+        cfg = json.loads((entrypoint.GEMINI_DIR / "settings.json").read_text())
+        assert "chrome-devtools" not in cfg["mcpServers"]
+        assert "sequential-thinking" in cfg["mcpServers"]
 
     def test_gemini_lsp_workspace_server(self, jail_home, monkeypatch):
         """Workspace LSP servers appear as MCP-wrapped servers in Gemini config."""
@@ -277,6 +380,59 @@ class TestGeminiConfig:
         entrypoint.configure_gemini()
         cfg = json.loads((entrypoint.GEMINI_DIR / "settings.json").read_text())
         assert cfg["security"]["approvalMode"] == "confirm"
+
+    def test_removes_stale_workspace_mcp_servers(self, jail_home):
+        entrypoint.GEMINI_DIR.mkdir(parents=True)
+        existing = {
+            "mcpServers": {
+                "my-server": {"command": "foo"},
+                "probe-mcp": {"command": "/workspace/probe_mcp.py", "args": []},
+            }
+        }
+        (entrypoint.GEMINI_DIR / "settings.json").write_text(json.dumps(existing))
+        entrypoint.configure_gemini()
+        cfg = json.loads((entrypoint.GEMINI_DIR / "settings.json").read_text())
+        assert "my-server" in cfg["mcpServers"]
+        assert "probe-mcp" not in cfg["mcpServers"]
+
+    def test_uses_managed_mcp_sidecar_to_cleanup_prior_servers(
+        self, jail_home, monkeypatch
+    ):
+        entrypoint.GEMINI_DIR.mkdir(parents=True)
+        (entrypoint.GEMINI_DIR / "settings.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "my-server": {"command": "foo"},
+                        "probe-mcp": {"command": "/workspace/probe_mcp.py", "args": []},
+                    }
+                }
+            )
+        )
+        entrypoint.GEMINI_MANAGED_MCP_PATH.write_text(json.dumps(["probe-mcp"]))
+        monkeypatch.setenv(
+            "YOLO_MCP_SERVERS",
+            json.dumps({"other-mcp": {"command": "/workspace/other.py", "args": []}}),
+        )
+        entrypoint.configure_gemini()
+        cfg = json.loads((entrypoint.GEMINI_DIR / "settings.json").read_text())
+        assert "my-server" in cfg["mcpServers"]
+        assert "probe-mcp" not in cfg["mcpServers"]
+        assert "other-mcp" in cfg["mcpServers"]
+
+    def test_gemini_auto_update_is_forced_off(self, jail_home):
+        entrypoint.GEMINI_DIR.mkdir(parents=True)
+        existing = {
+            "general": {
+                "enableAutoUpdate": True,
+                "enableAutoUpdateNotification": True,
+            }
+        }
+        (entrypoint.GEMINI_DIR / "settings.json").write_text(json.dumps(existing))
+        entrypoint.configure_gemini()
+        cfg = json.loads((entrypoint.GEMINI_DIR / "settings.json").read_text())
+        assert cfg["general"]["enableAutoUpdate"] is False
+        assert cfg["general"]["enableAutoUpdateNotification"] is False
 
     def test_handles_corrupt_json(self, jail_home):
         entrypoint.GEMINI_DIR.mkdir(parents=True)
@@ -348,6 +504,9 @@ class TestBootstrapScript:
         assert "chrome-devtools-mcp" in script
         assert "mcp-language-server" in script
         assert "showboat" in script
+        assert (
+            "npm install -g @google/gemini-cli@latest @github/copilot@latest" in script
+        )
         assert os.access(jail_home / ".yolo-bootstrap.sh", os.X_OK)
 
 

@@ -56,6 +56,27 @@ def run_yolo(project_dir, command, timeout=120):
     return result
 
 
+def run_yolo_cli(project_dir, *args, timeout=120):
+    """Run a yolo subcommand directly on the host-side CLI."""
+    result = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--project",
+            str(REPO_ROOT),
+            "python",
+            str(REPO_ROOT / "src" / "cli.py"),
+            *args,
+        ],
+        cwd=str(project_dir),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env={**os.environ, "TERM": "dumb"},
+    )
+    return result
+
+
 def run_yolo_direct(project_dir, *args, timeout=120):
     """Run a command directly via `yolo -- <cmd>`, matching real-world usage.
 
@@ -125,6 +146,40 @@ def test_yolo_init(tmp_path):
     )
 
     assert (project_dir / "yolo-jail.jsonc").exists()
+
+
+def test_yolo_check_valid_config(temp_project):
+    """Host-side `yolo check --no-build` should validate a normal config."""
+    result = run_yolo_cli(temp_project, "check", "--no-build")
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "Merged config is semantically valid" in output
+
+
+def test_yolo_check_invalid_config_fails(tmp_path):
+    """`yolo check --no-build` should fail fast on invalid config."""
+    project_dir = tmp_path / "invalid_check"
+    project_dir.mkdir()
+    (project_dir / "yolo-jail.jsonc").write_text(
+        json.dumps({"network": {"mode": "bridg"}})
+    )
+
+    result = run_yolo_cli(project_dir, "check", "--no-build")
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "config.network.mode" in output
+
+
+def test_yolo_run_invalid_config_fails_before_start(tmp_path):
+    """`yolo run` should reject invalid config instead of silently defaulting."""
+    project_dir = tmp_path / "invalid_run"
+    project_dir.mkdir()
+    (project_dir / "yolo-jail.jsonc").write_text('{"security": {"blocked_tools": [}')
+
+    result = run_yolo_cli(project_dir, "run", "--", "bash", "-lc", "true")
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "Failed to parse yolo-jail.jsonc" in output
 
 
 def test_shim_persistence(tmp_path):
@@ -205,6 +260,65 @@ def test_jail_configs_present(temp_project):
         "ls /home/agent/.copilot/config.json && ls /home/agent/.gemini/settings.json",
     )
     assert result.returncode == 0
+
+
+def test_yolo_check_available_inside_jail(temp_project):
+    """In-jail agents should be able to run `yolo check --no-build` mid-session."""
+    result = run_yolo(temp_project, "yolo check --no-build")
+    assert result.returncode == 0, result.stderr
+    assert "YOLO Jail Check" in result.stdout
+
+
+def test_custom_mcp_server_config_propagates(temp_project):
+    """Custom MCP servers from yolo-jail.jsonc should reach both agent configs."""
+    probe_script = temp_project / "probe-mcp.py"
+    probe_script.write_text("#!/usr/bin/env python3\n")
+
+    config_path = temp_project / "yolo-jail.jsonc"
+    config = json.loads(config_path.read_text())
+    config["mcp_servers"] = {
+        "probe-mcp": {
+            "command": "/workspace/probe-mcp.py",
+            "args": ["--stdio"],
+        }
+    }
+    config_path.write_text(json.dumps(config))
+
+    result = run_yolo(
+        temp_project,
+        """python - <<'PY'
+import json
+from pathlib import Path
+copilot = json.loads(Path('/home/agent/.copilot/mcp-config.json').read_text())
+gemini = json.loads(Path('/home/agent/.gemini/settings.json').read_text())
+print(copilot['mcpServers']['probe-mcp']['command'])
+print(gemini['mcpServers']['probe-mcp']['command'])
+PY""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("/workspace/probe-mcp.py") == 2
+
+
+def test_default_mcp_server_can_be_disabled(temp_project):
+    """Default MCP servers can be removed via yolo-jail.jsonc."""
+    config_path = temp_project / "yolo-jail.jsonc"
+    config = json.loads(config_path.read_text())
+    config["mcp_servers"] = {"chrome-devtools": None}
+    config_path.write_text(json.dumps(config))
+
+    result = run_yolo(
+        temp_project,
+        """python - <<'PY'
+import json
+from pathlib import Path
+copilot = json.loads(Path('/home/agent/.copilot/mcp-config.json').read_text())
+gemini = json.loads(Path('/home/agent/.gemini/settings.json').read_text())
+print('chrome-devtools' in copilot['mcpServers'])
+print('chrome-devtools' in gemini['mcpServers'])
+PY""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines() == ["False", "False"]
 
 
 def test_workspace_agents_untouched_and_home_agents_present(temp_project):

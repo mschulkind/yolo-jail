@@ -69,6 +69,7 @@ MCP_WRAPPERS_BIN = HOME / ".local" / "bin" / "mcp-wrappers"
 BASHRC_PATH = HOME / ".bashrc"
 COPILOT_DIR = HOME / ".copilot"
 GEMINI_DIR = HOME / ".gemini"
+GEMINI_MANAGED_MCP_PATH = GEMINI_DIR / "yolo-managed-mcp-servers.json"
 MISE_CONFIG_DIR = HOME / ".config" / "mise"
 
 # Default LSP servers always available in the jail.
@@ -202,7 +203,7 @@ export VISUAL=nvim
 export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.npm-global}"
 export GOPATH="${GOPATH:-$HOME/go}"
 SHIM_DIR="${HOME}/.yolo-shims"
-export PATH="$SHIM_DIR:$NPM_CONFIG_PREFIX/bin:$GOPATH/bin:${MISE_DATA_DIR:-/mise}/shims:/bin:/usr/bin"
+export PATH="$SHIM_DIR:$NPM_CONFIG_PREFIX/bin:${MISE_DATA_DIR:-/mise}/shims:$GOPATH/bin:/bin:/usr/bin"
 
 # Activate mise with shell hooks (interactive shells only).
 # Non-interactive shells (bash -lc) skip activation to avoid a deadlock:
@@ -220,7 +221,7 @@ fi
 alias ls='ls --color=auto'
 alias ll='ls -alF'
 alias gemini='gemini --yolo'
-alias copilot='copilot --yolo'
+alias copilot='copilot --yolo --no-auto-update'
 alias vi='nvim'
 alias vim='nvim'
 alias bat='bat --style=plain --paging=never'
@@ -241,10 +242,19 @@ def generate_bootstrap_script():
 export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.npm-global}"
 export GOPATH="${GOPATH:-$HOME/go}"
 export GOBIN="$GOPATH/bin"
-export PATH="$NPM_CONFIG_PREFIX/bin:$GOBIN:$PATH"
+export PATH="$NPM_CONFIG_PREFIX/bin:${MISE_DATA_DIR:-/mise}/shims:$GOBIN:$PATH"
 
 # Initialize font cache (once, not on every shell session)
 fc-cache -f >/dev/null 2>&1
+
+# Keep agent CLIs current in the npm-global prefix that the jail prioritizes on PATH.
+# Their built-in self-updaters are disabled in jail config/launchers, so startup owns
+# the update step instead.
+if command -v npm >/dev/null; then
+    if ! YOLO_BYPASS_SHIMS=1 npm install -g @google/gemini-cli@latest @github/copilot@latest; then
+        echo "Warning: failed to update gemini/copilot via npm; continuing with installed versions" >&2
+    fi
+fi
 
 # Install binaries if missing.
 if ! command -v chrome-devtools-mcp >/dev/null; then
@@ -671,6 +681,36 @@ def _chrome_devtools_args() -> list:
     ]
 
 
+def _load_mcp_servers():
+    """Load MCP servers from defaults plus YOLO_MCP_SERVERS overrides.
+
+    Configured entries with a null value remove a default or inherited server.
+    """
+    servers = {
+        "chrome-devtools": {
+            "command": str(MCP_WRAPPERS_BIN / "node"),
+            "args": _chrome_devtools_args(),
+        },
+        "sequential-thinking": {
+            "command": str(MCP_WRAPPERS_BIN / "node"),
+            "args": [str(NPM_BIN / "mcp-server-sequential-thinking")],
+        },
+    }
+    extra_json = os.environ.get("YOLO_MCP_SERVERS", "")
+    if extra_json:
+        try:
+            extra = json.loads(extra_json)
+            if isinstance(extra, dict):
+                for name, cfg in extra.items():
+                    if cfg is None:
+                        servers.pop(name, None)
+                    elif isinstance(cfg, dict):
+                        servers[name] = cfg
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return servers
+
+
 def configure_copilot():
     """Set up Copilot directory, MCP config, and LSP config."""
     COPILOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -680,18 +720,7 @@ def configure_copilot():
         config_json.write_text('{"yolo": true}\n')
 
     # MCP config
-    mcp_config = {
-        "mcpServers": {
-            "chrome-devtools": {
-                "command": str(MCP_WRAPPERS_BIN / "node"),
-                "args": _chrome_devtools_args(),
-            },
-            "sequential-thinking": {
-                "command": str(MCP_WRAPPERS_BIN / "node"),
-                "args": [str(NPM_BIN / "mcp-server-sequential-thinking")],
-            },
-        }
-    }
+    mcp_config = {"mcpServers": _load_mcp_servers()}
     (COPILOT_DIR / "mcp-config.json").write_text(
         json.dumps(mcp_config, indent=2) + "\n"
     )
@@ -720,16 +749,7 @@ def configure_gemini():
     GEMINI_DIR.mkdir(parents=True, exist_ok=True)
     config_path = GEMINI_DIR / "settings.json"
 
-    default_servers = {
-        "chrome-devtools": {
-            "command": str(MCP_WRAPPERS_BIN / "node"),
-            "args": _chrome_devtools_args(),
-        },
-        "sequential-thinking": {
-            "command": str(MCP_WRAPPERS_BIN / "node"),
-            "args": [str(NPM_BIN / "mcp-server-sequential-thinking")],
-        },
-    }
+    configured_servers = _load_mcp_servers()
 
     # Add LSP servers wrapped as MCP via mcp-language-server
     lsp_servers = _load_lsp_servers()
@@ -740,7 +760,7 @@ def configure_gemini():
         mcp_args = ["-lsp", bare_cmd, "-workspace", "/workspace"]
         if lsp_args:
             mcp_args.extend(["--"] + lsp_args)
-        default_servers[f"{name}-lsp"] = {
+        configured_servers[f"{name}-lsp"] = {
             "command": str(GO_BIN / "mcp-language-server"),
             "args": mcp_args,
         }
@@ -754,12 +774,39 @@ def configure_gemini():
         else:
             current = {}
 
-        current.setdefault("mcpServers", {}).update(default_servers)
+        current_mcp_servers = current.setdefault("mcpServers", {})
+        try:
+            previous_managed = set(json.loads(GEMINI_MANAGED_MCP_PATH.read_text()))
+        except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+            # Migration path for older jails: clean up the default yolo-managed
+            # servers plus any stale workspace-bound servers from previous runs.
+            previous_managed = {"chrome-devtools", "sequential-thinking"}
+            for name, cfg in current_mcp_servers.items():
+                if not isinstance(cfg, dict):
+                    continue
+                command = str(cfg.get("command", ""))
+                if name.endswith("-lsp") and command == str(
+                    GO_BIN / "mcp-language-server"
+                ):
+                    previous_managed.add(name)
+                if command.startswith("/workspace/"):
+                    previous_managed.add(name)
+
+        for name in previous_managed:
+            current_mcp_servers.pop(name, None)
+        current_mcp_servers.update(configured_servers)
+
         current.setdefault("security", {})
         current["security"].setdefault("approvalMode", "yolo")
         current["security"].setdefault("enablePermanentToolApproval", True)
+        current.setdefault("general", {})
+        current["general"]["enableAutoUpdate"] = False
+        current["general"]["enableAutoUpdateNotification"] = False
 
         config_path.write_text(json.dumps(current, indent=2) + "\n")
+        GEMINI_MANAGED_MCP_PATH.write_text(
+            json.dumps(sorted(configured_servers.keys()), indent=2) + "\n"
+        )
     except Exception as e:
         print(f"Error configuring Gemini MCP: {e}", file=sys.stderr)
 
@@ -771,7 +818,7 @@ def configure_gemini():
 
 def exec_bash(command: str):
     """Set up final PATH, activate mise, and exec bash with the given command."""
-    path = f"{SHIM_DIR}:{NPM_BIN}:{GO_BIN}:{MISE_SHIMS}:/bin:/usr/bin"
+    path = f"{SHIM_DIR}:{NPM_BIN}:{MISE_SHIMS}:{GO_BIN}:/bin:/usr/bin"
     os.environ["PATH"] = path
 
     os.execvp(
@@ -920,7 +967,7 @@ def main():
     _perf("port_forwarding")
 
     # Set PATH including mise shims so tools like copilot/gemini are found
-    os.environ["PATH"] = f"{SHIM_DIR}:{NPM_BIN}:{GO_BIN}:{MISE_SHIMS}:/bin:/usr/bin"
+    os.environ["PATH"] = f"{SHIM_DIR}:{NPM_BIN}:{MISE_SHIMS}:{GO_BIN}:/bin:/usr/bin"
 
     # Trust workspace mise.toml
     if Path("/workspace/mise.toml").exists():
