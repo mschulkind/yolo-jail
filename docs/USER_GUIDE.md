@@ -17,6 +17,7 @@ This guide covers everything you need to get started with YOLO Jail and make the
 - [Package Management](#package-management)
 - [Blocked Tools](#blocked-tools)
 - [Device Passthrough](#device-passthrough)
+- [GPU Passthrough (NVIDIA)](#gpu-passthrough-nvidia)
 - [Storage & Persistence](#storage--persistence)
 - [Container Reuse](#container-reuse)
 - [Config Safety](#config-safety)
@@ -485,6 +486,99 @@ Pass host devices (USB, serial, etc.) into the jail:
 - **Cgroup rule** (broad access): `{"cgroup_rule": "c 189:* rwm"}`
 
 Missing devices produce a warning but don't prevent the jail from starting. Device changes are subject to [config safety](#config-safety) approval.
+
+---
+
+## GPU Passthrough (NVIDIA)
+
+Train deep learning models inside the jail using NVIDIA GPUs. Requires the NVIDIA Container Toolkit on the host.
+
+### Host Setup
+
+1. **Verify your GPU driver:**
+   ```bash
+   nvidia-smi
+   ```
+
+2. **Install the NVIDIA Container Toolkit:**
+   ```bash
+   curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+     | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+   curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+     | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+     | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+   sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit
+   ```
+
+3. **Configure the container runtime:**
+   ```bash
+   # Docker
+   sudo nvidia-ctk runtime configure --runtime=docker
+   sudo systemctl restart docker
+
+   # Podman (CDI)
+   sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+   ```
+
+4. **Validate:**
+   ```bash
+   yolo check   # GPU section will show nvidia-smi, nvidia-ctk, CDI spec status
+   ```
+
+### Jail Configuration
+
+```jsonc
+// yolo-jail.jsonc
+{
+  "gpu": {
+    "enabled": true,
+    "devices": "all",
+    "capabilities": "compute,utility"
+  }
+}
+```
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `enabled` | `false` | Enable GPU passthrough |
+| `devices` | `"all"` | `"all"`, or specific GPUs: `"0"`, `"0,1"`, `"GPU-<uuid>"` |
+| `capabilities` | `"compute,utility"` | NVIDIA driver capabilities to expose |
+
+### Installing PyTorch
+
+Once inside the GPU-enabled jail:
+
+```bash
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+### Runtime Details
+
+| Runtime | Mechanism | Notes |
+|---------|-----------|-------|
+| **Docker** | `--gpus all` | Requires `nvidia-ctk runtime configure --runtime=docker` |
+| **Podman** | `--device nvidia.com/gpu=all` (CDI) | Requires CDI spec at `/etc/cdi/nvidia.yaml` |
+
+- **Podman rootless:** GPU passthrough uses `--userns=keep-id` instead of `--uidmap` (nested podman-in-podman is not available when GPU is active).
+- **Shared memory:** The jail uses `--shm-size=2g` for PyTorch multi-process data loading.
+- **CUDA forward compatibility:** CUDA in the container can be newer than the host driver, but not the reverse.
+
+### AWS EC2
+
+Use an AWS Deep Learning AMI (DLAMI) — drivers and toolkit come pre-installed.
+
+| Instance | GPU | VRAM | Use Case | $/hr (approx) |
+|----------|-----|------|----------|----------------|
+| g4dn.xlarge | 1× T4 | 16 GB | Inference, light training | ~$0.53 |
+| g5.xlarge | 1× A10G | 24 GB | Training + inference | ~$1.01 |
+| p3.2xlarge | 1× V100 | 16 GB | Training | ~$3.06 |
+
+### Troubleshooting GPU
+
+- **`conmon bytes "": readObjectStart` error (Podman):** Caused by `--uidmap` conflicting with CDI. Fixed in current release. If you see this, update your `yolo-jail` installation.
+- **`nvidia-smi` not found inside jail:** The NVIDIA Container Toolkit injects driver libs at container start. Check the toolkit is installed and configured on the host.
+- **CUDA out of memory:** Reduce batch size, or limit which GPUs are exposed with `"devices": "0"`.
 
 ---
 

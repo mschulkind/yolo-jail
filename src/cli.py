@@ -2884,6 +2884,9 @@ def run(
     # Detect if we're already inside a container
     in_container = Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
 
+    # Check if GPU passthrough is enabled (affects user namespace strategy)
+    gpu_enabled = config.get("gpu", {}).get("enabled", False)
+
     # Podman: enable nested container support (rootless podman-in-podman)
     # When running on the host, use UID/GID mapping to create a user namespace.
     # When already inside a container, share the parent's user namespace instead
@@ -2897,6 +2900,25 @@ def run(
                     "label=disable",
                     "--userns",
                     "host",
+                ]
+            )
+        elif gpu_enabled:
+            # GPU passthrough: CDI device injection fails inside custom user
+            # namespaces created by --uidmap/--gidmap. Skip UID mapping and
+            # use keep-id (maps host UID into container without a new userns).
+            # Nested podman-in-podman won't work with GPU, but that's fine.
+            docker_cmd.extend(
+                [
+                    "--security-opt",
+                    "label=disable",
+                    "--userns",
+                    "keep-id",
+                    "--device",
+                    "/dev/fuse",
+                    "--cap-add",
+                    "SYS_ADMIN",
+                    "--cap-add",
+                    "MKNOD",
                 ]
             )
         else:
