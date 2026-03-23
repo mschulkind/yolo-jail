@@ -1,0 +1,55 @@
+[tool.uv]
+package = true
+
+[project]
+name = "yolo-jail"
+version = "0.1.0"
+description = "Secure container jail for AI agents — run Copilot and Gemini in YOLO mode safely"
+readme = "README.md"
+requires-python = ">=3.13"
+license = "Apache-2.0"
+authors = [
+    {name = "Matt Schulkind"},
+]
+keywords = ["ai", "agents", "docker", "podman", "sandbox", "copilot", "gemini", "security", "nix"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "pyjson5>=2.0.0",
+    "rich>=14.3.2",
+    "typer>=0.23.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/mschulkind/yolo-jail"
+Repository = "https://github.com/mschulkind/yolo-jail"
+Documentation = "https://github.com/mschulkind/yolo-jail/blob/main/docs/USER_GUIDE.md"
+Issues = "https://github.com/mschulkind/yolo-jail/issues"
+
+[project.scripts]
+yolo = "src.cli:main"
+
+[tool.setuptools]
+packages = ["src"]
+
+[tool.setuptools.package-data]
+src = ["flake.nix", "flake.lock", "shims/*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.14.10",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "slow: integration tests that spin up containers (skipped during promote)",
+]

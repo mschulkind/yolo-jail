@@ -1,0 +1,4 @@
+#!/bin/sh
+echo "Error: Manual package management (apt, apk, pip, etc.) is disabled." >&2
+echo "To add dependencies, modify 'flake.nix' in the host repository and run 'just load' to rebuild the jail." >&2
+exit 127

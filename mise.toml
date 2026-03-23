@@ -1,0 +1,7 @@
+[tools]
+node = "22"
+python = "3.13"
+go = "latest"
+uv = "latest"
+gemini = "latest"
+"npm:@github/copilot" = "latest"
