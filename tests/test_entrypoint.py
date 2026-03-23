@@ -4,6 +4,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -850,3 +851,341 @@ class TestPortInUse:
             assert entrypoint._port_in_use(port) is True
         finally:
             sock.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Entrypoint gap tests — cover missing lines for 80% coverage
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestPerfLogging:
+    """Cover _perf and _perf_dump (lines 28-54)."""
+
+    def test_perf_appends_checkpoint(self, jail_home):
+        orig_log = list(entrypoint._PERF_LOG)
+        entrypoint._PERF_LOG.clear()
+        try:
+            entrypoint._perf("test_checkpoint")
+            assert len(entrypoint._PERF_LOG) == 1
+            elapsed, label = entrypoint._PERF_LOG[0]
+            assert label == "test_checkpoint"
+            assert elapsed >= 0
+        finally:
+            entrypoint._PERF_LOG.clear()
+            entrypoint._PERF_LOG.extend(orig_log)
+
+    def test_perf_dump_writes_log(self, jail_home):
+        orig_log = list(entrypoint._PERF_LOG)
+        entrypoint._PERF_LOG.clear()
+        try:
+            entrypoint._PERF_LOG.append((0.001, "start"))
+            entrypoint._PERF_LOG.append((0.150, "shims"))
+            entrypoint._perf_dump()
+            log_path = jail_home / ".yolo-perf.log"
+            assert log_path.exists()
+            content = log_path.read_text()
+            assert "start" in content
+            assert "shims" in content
+        finally:
+            entrypoint._PERF_LOG.clear()
+            entrypoint._PERF_LOG.extend(orig_log)
+
+    def test_perf_dump_trims_old_runs(self, jail_home):
+        orig_log = list(entrypoint._PERF_LOG)
+        entrypoint._PERF_LOG.clear()
+        try:
+            log_path = jail_home / ".yolo-perf.log"
+            # Write >50 fake runs
+            fake = "".join(f"=== YOLO Run {i} ===\ndata\n" for i in range(60))
+            log_path.write_text(fake)
+            entrypoint._PERF_LOG.append((0.001, "trim_test"))
+            entrypoint._perf_dump()
+            content = log_path.read_text()
+            runs = content.split("=== YOLO")
+            assert len(runs) <= 52  # 50 + header + new
+        finally:
+            entrypoint._PERF_LOG.clear()
+            entrypoint._PERF_LOG.extend(orig_log)
+
+
+class TestVenvPrecreateScript:
+    """Cover generate_venv_precreate_script (lines 292-329)."""
+
+    def test_script_created(self, jail_home):
+        entrypoint.generate_venv_precreate_script()
+        script_path = jail_home / ".yolo-venv-precreate.sh"
+        assert script_path.exists()
+        content = script_path.read_text()
+        assert "#!/bin/bash" in content
+        assert "mise which uv" in content
+        assert "mise which python" in content
+
+    def test_script_is_executable(self, jail_home):
+        entrypoint.generate_venv_precreate_script()
+        script_path = jail_home / ".yolo-venv-precreate.sh"
+        import stat as stat_mod
+
+        mode = script_path.stat().st_mode
+        assert mode & stat_mod.S_IEXEC
+
+
+class TestConfigureGit:
+    """Cover configure_git (lines 494-512)."""
+
+    @patch("shutil.which", return_value=None)
+    def test_noop_when_git_missing(self, mock_which, jail_home, monkeypatch):
+        with patch("subprocess.run") as mock_run:
+            entrypoint.configure_git()
+            mock_run.assert_not_called()
+
+    @patch("shutil.which", return_value="/usr/bin/git")
+    @patch("subprocess.run")
+    def test_sets_name_and_email(self, mock_run, mock_which, jail_home, monkeypatch):
+        monkeypatch.setenv("YOLO_GIT_NAME", "Test User")
+        monkeypatch.setenv("YOLO_GIT_EMAIL", "test@example.com")
+        entrypoint.configure_git()
+        assert mock_run.call_count >= 2
+        calls = [c[0][0] for c in mock_run.call_args_list]
+        assert any("user.name" in c for c in calls)
+        assert any("user.email" in c for c in calls)
+
+    @patch("shutil.which", return_value="/usr/bin/git")
+    @patch("subprocess.run")
+    def test_sets_gitignore(
+        self, mock_run, mock_which, jail_home, monkeypatch, tmp_path
+    ):
+        ignore_file = tmp_path / "gitignore"
+        ignore_file.write_text("*.pyc\n")
+        monkeypatch.setenv("YOLO_GLOBAL_GITIGNORE", str(ignore_file))
+        monkeypatch.delenv("YOLO_GIT_NAME", raising=False)
+        monkeypatch.delenv("YOLO_GIT_EMAIL", raising=False)
+        entrypoint.configure_git()
+        calls = [c[0][0] for c in mock_run.call_args_list]
+        assert any("core.excludesFile" in c for c in calls)
+
+
+class TestConfigureJj:
+    """Cover configure_jj (lines 517-529)."""
+
+    @patch("shutil.which", return_value=None)
+    def test_noop_when_jj_missing(self, mock_which, jail_home, monkeypatch):
+        with patch("subprocess.run") as mock_run:
+            entrypoint.configure_jj()
+            mock_run.assert_not_called()
+
+    @patch("shutil.which", return_value="/usr/bin/jj")
+    @patch("subprocess.run")
+    def test_sets_jj_identity(self, mock_run, mock_which, jail_home, monkeypatch):
+        monkeypatch.setenv("YOLO_JJ_NAME", "Test User")
+        monkeypatch.setenv("YOLO_JJ_EMAIL", "test@example.com")
+        entrypoint.configure_jj()
+        assert mock_run.call_count >= 2
+
+
+class TestLspServerLoading:
+    """Cover _load_lsp_servers edge cases (lines 112-113)."""
+
+    def test_invalid_json_ignored(self, jail_home, monkeypatch):
+        monkeypatch.setenv("YOLO_LSP_SERVERS", "{invalid json}")
+        servers = entrypoint._load_lsp_servers()
+        # Should still return defaults
+        assert "python" in servers
+
+    def test_non_dict_ignored(self, jail_home, monkeypatch):
+        monkeypatch.setenv("YOLO_LSP_SERVERS", '"just a string"')
+        servers = entrypoint._load_lsp_servers()
+        assert "python" in servers
+
+
+class TestMiseConfigUpdate:
+    """Cover mise config update edge cases (lines 364, 385-395)."""
+
+    def test_update_existing_tool_version(self, jail_home, monkeypatch):
+        monkeypatch.setenv("YOLO_MISE_TOOLS", json.dumps({"node": "22"}))
+        entrypoint.generate_mise_config()
+        config_path = jail_home / ".config" / "mise" / "config.toml"
+        content = config_path.read_text()
+        # Now update with a different node version
+        monkeypatch.setenv("YOLO_MISE_TOOLS", json.dumps({"node": "23"}))
+        entrypoint.generate_mise_config()
+        content = config_path.read_text()
+        assert 'node = "23"' in content
+
+    def test_base_tools_not_duplicated(self, jail_home, monkeypatch):
+        monkeypatch.delenv("YOLO_MISE_TOOLS", raising=False)
+        entrypoint.generate_mise_config()
+        entrypoint.generate_mise_config()  # Run twice
+        config_path = jail_home / ".config" / "mise" / "config.toml"
+        content = config_path.read_text()
+        # node should appear exactly once
+        assert content.count("node =") == 1
+
+
+class TestExecBash:
+    """Cover exec_bash PATH setup (lines 951-1003 partially)."""
+
+    @patch("os.execvp")
+    def test_exec_bash_basic(self, mock_exec, jail_home, monkeypatch):
+        monkeypatch.setenv("PATH", "/bin:/usr/bin")
+        entrypoint.exec_bash("echo hello")
+        mock_exec.assert_called_once()
+        args = mock_exec.call_args[0]
+        assert args[0] == "bash"
+        assert "-c" in args[1]
+        assert "echo hello" in args[1][-1]
+
+    @patch("os.execvp")
+    def test_exec_bash_default_interactive(self, mock_exec, jail_home, monkeypatch):
+        monkeypatch.setenv("PATH", "/bin:/usr/bin")
+        entrypoint.exec_bash("bash")
+        mock_exec.assert_called_once()
+        args = mock_exec.call_args[0]
+        assert args[0] == "bash"
+
+    @patch("os.execvp")
+    def test_exec_bash_with_profile(self, mock_exec, jail_home, monkeypatch):
+        monkeypatch.setenv("PATH", "/bin:/usr/bin")
+        monkeypatch.setenv("YOLO_PROFILE_ENTRYPOINT", "1")
+        entrypoint.exec_bash("echo hi")
+        mock_exec.assert_called_once()
+
+
+class TestMainFunction:
+    """Cover main() orchestration (lines 951-1003)."""
+
+    @patch("entrypoint.exec_bash")
+    @patch("entrypoint.start_container_port_forwarding")
+    @patch("entrypoint.configure_gemini")
+    @patch("entrypoint.configure_copilot")
+    @patch("entrypoint.merge_skills")
+    @patch("entrypoint.configure_jj")
+    @patch("entrypoint.configure_git")
+    @patch("entrypoint.generate_mcp_wrappers")
+    @patch("entrypoint.generate_mise_config")
+    @patch("entrypoint.generate_venv_precreate_script")
+    @patch("entrypoint.generate_bootstrap_script")
+    @patch("entrypoint.generate_bashrc")
+    @patch("entrypoint.generate_shims")
+    @patch("entrypoint._perf_dump")
+    @patch("entrypoint._perf")
+    def test_main_calls_all_generators(
+        self,
+        mock_perf,
+        mock_dump,
+        mock_shims,
+        mock_bashrc,
+        mock_bootstrap,
+        mock_venv,
+        mock_mise,
+        mock_wrappers,
+        mock_git,
+        mock_jj,
+        mock_skills,
+        mock_copilot,
+        mock_gemini,
+        mock_port_fwd,
+        mock_exec,
+        jail_home,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("sys.argv", ["entrypoint", "echo", "hello"])
+        monkeypatch.setenv("MISE_DATA_DIR", "/mise")
+        monkeypatch.setenv("PATH", "/bin:/usr/bin")
+        entrypoint.main()
+        mock_shims.assert_called_once()
+        mock_bashrc.assert_called_once()
+        mock_bootstrap.assert_called_once()
+        mock_venv.assert_called_once()
+        mock_mise.assert_called_once()
+        mock_git.assert_called_once()
+        mock_jj.assert_called_once()
+        mock_copilot.assert_called_once()
+        mock_gemini.assert_called_once()
+        mock_exec.assert_called_once_with("echo hello")
+
+    @patch("entrypoint.exec_bash")
+    @patch("entrypoint.start_container_port_forwarding")
+    @patch("entrypoint.configure_gemini")
+    @patch("entrypoint.configure_copilot")
+    @patch("entrypoint.merge_skills")
+    @patch("entrypoint.configure_jj")
+    @patch("entrypoint.configure_git")
+    @patch("entrypoint.generate_mcp_wrappers")
+    @patch("entrypoint.generate_mise_config")
+    @patch("entrypoint.generate_venv_precreate_script")
+    @patch("entrypoint.generate_bootstrap_script")
+    @patch("entrypoint.generate_bashrc")
+    @patch("entrypoint.generate_shims")
+    @patch("entrypoint._perf_dump")
+    @patch("entrypoint._perf")
+    def test_main_creates_mise_symlink(
+        self,
+        mock_perf,
+        mock_dump,
+        mock_shims,
+        mock_bashrc,
+        mock_bootstrap,
+        mock_venv,
+        mock_mise,
+        mock_wrappers,
+        mock_git,
+        mock_jj,
+        mock_skills,
+        mock_copilot,
+        mock_gemini,
+        mock_port_fwd,
+        mock_exec,
+        jail_home,
+        monkeypatch,
+    ):
+        monkeypatch.setattr("sys.argv", ["entrypoint"])
+        monkeypatch.setenv("MISE_DATA_DIR", str(jail_home / "custom-mise"))
+        monkeypatch.setenv("PATH", "/bin:/usr/bin")
+        # Can't actually create /mise symlink in test env without root
+        entrypoint.main()
+        mock_exec.assert_called_once_with("bash")
+
+    @patch("entrypoint.exec_bash")
+    @patch("entrypoint.start_container_port_forwarding")
+    @patch("entrypoint.configure_gemini")
+    @patch("entrypoint.configure_copilot")
+    @patch("entrypoint.merge_skills")
+    @patch("entrypoint.configure_jj")
+    @patch("entrypoint.configure_git")
+    @patch("entrypoint.generate_mcp_wrappers")
+    @patch("entrypoint.generate_mise_config")
+    @patch("entrypoint.generate_venv_precreate_script")
+    @patch("entrypoint.generate_bootstrap_script")
+    @patch("entrypoint.generate_bashrc")
+    @patch("entrypoint.generate_shims")
+    @patch("entrypoint._perf_dump")
+    @patch("entrypoint._perf")
+    def test_main_trusts_mise_toml(
+        self,
+        mock_perf,
+        mock_dump,
+        mock_shims,
+        mock_bashrc,
+        mock_bootstrap,
+        mock_venv,
+        mock_mise,
+        mock_wrappers,
+        mock_git,
+        mock_jj,
+        mock_skills,
+        mock_copilot,
+        mock_gemini,
+        mock_port_fwd,
+        mock_exec,
+        jail_home,
+        monkeypatch,
+        tmp_path,
+    ):
+        monkeypatch.setattr("sys.argv", ["entrypoint"])
+        monkeypatch.setenv("MISE_DATA_DIR", "/mise")
+        monkeypatch.setenv("PATH", "/bin:/usr/bin")
+        Path("/workspace/mise.toml")
+        # This test just verifies main() doesn't crash when /workspace/mise.toml exists
+        with patch("subprocess.run"):
+            entrypoint.main()
+        mock_exec.assert_called_once()

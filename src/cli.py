@@ -3271,6 +3271,27 @@ def main():
     """
     import atexit
 
+    # Rewrite argv so `yolo -- echo foo` routes to `yolo run -- echo foo`.
+    # Typer groups resolve the first positional arg as a subcommand name, so
+    # extra args after `--` that aren't subcommands would fail with "No such
+    # command".  We detect this and insert `run` before `--`.
+    _SUBCOMMANDS = {
+        "init",
+        "init-user-config",
+        "config-ref",
+        "check",
+        "run",
+        "ps",
+        "doctor",
+    }
+    args = sys.argv[1:]
+    if args and "--" in args:
+        pre_dash = args[: args.index("--")]
+        # If nothing before `--` looks like a subcommand, insert `run`
+        if not any(a in _SUBCOMMANDS for a in pre_dash):
+            idx = sys.argv.index("--")
+            sys.argv.insert(idx, "run")
+
     # Kitty-native mode takes priority over tmux
     if os.environ.get("KITTY_PID") and not os.environ.get("TMUX"):
         restore = _kitty_setup_jail_tab()
