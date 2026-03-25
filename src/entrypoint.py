@@ -840,6 +840,11 @@ def exec_bash(command: str):
     path = f"{SHIM_DIR}:{NPM_BIN}:{MISE_SHIMS}:{GO_BIN}:/bin:/usr/bin"
     os.environ["PATH"] = path
 
+    # Prepend mise env activation so tool paths (copilot, gemini, .venv/bin,
+    # etc.) are available. Fresh containers get this from cli.py's inline
+    # eval, but exec-into-existing skips that code path.
+    activated_command = f'eval "$(mise env -s bash)" 2>/dev/null; {command}'
+
     os.execvp(
         "bash",
         [
@@ -847,7 +852,7 @@ def exec_bash(command: str):
             "--rcfile",
             str(BASHRC_PATH),
             "-c",
-            command,
+            activated_command,
         ],
     )
 

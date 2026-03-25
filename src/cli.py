@@ -2490,8 +2490,14 @@ def check(
                     cdi_text = cdi_found.read_text()
                     # nvidia-smi driver version from earlier check
                     smi_result = subprocess.run(
-                        ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
-                        capture_output=True, text=True, timeout=10,
+                        [
+                            "nvidia-smi",
+                            "--query-gpu=driver_version",
+                            "--format=csv,noheader",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
                     )
                     if smi_result.returncode == 0:
                         smi_driver = smi_result.stdout.strip().split("\n")[0].strip()
@@ -3035,7 +3041,7 @@ def run(
         "-e",
         "COPILOT_ALLOW_ALL=true",
         "-e",
-        "LD_LIBRARY_PATH=/lib:/usr/lib",
+        "LD_LIBRARY_PATH=/lib:/usr/lib:/usr/lib/x86_64-linux-gnu",
         "-e",
         "HOME=/home/agent",
         # EDITOR=cat prevents agents from getting stuck in interactive editors.
