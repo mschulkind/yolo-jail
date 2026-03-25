@@ -1184,6 +1184,7 @@ KNOWN_TOP_LEVEL_CONFIG_KEYS = {
     "mcp_servers",
     "mcp_presets",
     "devices",
+    "gpu",
 }
 KNOWN_NETWORK_KEYS = {"mode", "ports", "forward_host_ports"}
 KNOWN_SECURITY_KEYS = {"blocked_tools"}
@@ -1192,6 +1193,7 @@ KNOWN_PACKAGE_KEYS = {"name", "nixpkgs", "version", "url", "hash"}
 KNOWN_LSP_SERVER_KEYS = {"command", "args", "fileExtensions"}
 KNOWN_MCP_SERVER_KEYS = {"command", "args"}
 KNOWN_DEVICE_KEYS = {"usb", "description", "cgroup_rule"}
+KNOWN_GPU_KEYS = {"enabled", "devices", "capabilities"}
 USB_ID_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$")
 
 
@@ -1532,6 +1534,45 @@ def _validate_config(
                         errors.append(f"{path}.description: expected a string")
                 if has_cgroup and not isinstance(device.get("cgroup_rule"), str):
                     errors.append(f"{path}.cgroup_rule: expected a string")
+
+    # GPU config validation
+    gpu = config.get("gpu")
+    if gpu is not None:
+        if not isinstance(gpu, dict):
+            errors.append("config.gpu: expected an object")
+        else:
+            _report_unknown_keys(gpu, KNOWN_GPU_KEYS, "config.gpu", errors)
+            enabled = gpu.get("enabled")
+            if enabled is not None and not isinstance(enabled, bool):
+                errors.append("config.gpu.enabled: expected a boolean")
+            devices_val = gpu.get("devices")
+            if devices_val is not None:
+                if not isinstance(devices_val, str):
+                    errors.append(
+                        "config.gpu.devices: expected a string ('all', '0', '0,1', or 'GPU-<uuid>')"
+                    )
+            capabilities = gpu.get("capabilities")
+            if capabilities is not None:
+                if not isinstance(capabilities, str):
+                    errors.append(
+                        "config.gpu.capabilities: expected a string (e.g. 'compute,utility')"
+                    )
+                else:
+                    valid_caps = {
+                        "compute",
+                        "utility",
+                        "graphics",
+                        "video",
+                        "display",
+                        "compat32",
+                    }
+                    for cap in capabilities.split(","):
+                        cap = cap.strip()
+                        if cap and cap not in valid_caps:
+                            errors.append(
+                                f"config.gpu.capabilities: unknown capability '{cap}'. "
+                                f"Valid: {', '.join(sorted(valid_caps))}"
+                            )
 
     return errors, warnings
 
@@ -1982,6 +2023,24 @@ def config_ref():
     Missing devices produce a warning, not an error — the jail still starts.
     Subject to config change safety (human approval required).
 
+  [bold]gpu[/bold] (object): NVIDIA GPU passthrough configuration.
+    Requires NVIDIA Container Toolkit on the host.
+    • [bold]enabled[/bold] (bool): Enable GPU passthrough. Default: false.
+    • [bold]devices[/bold] (string): Which GPUs to expose. Default: "all".
+      Values: "all", "0", "0,1", or "GPU-<uuid>".
+      Docker uses --gpus flag; Podman uses CDI (nvidia.com/gpu=...).
+    • [bold]capabilities[/bold] (string): NVIDIA driver capabilities. Default: "compute,utility".
+      Valid: compute, utility, graphics, video, display, compat32.
+      "compute,utility" is sufficient for PyTorch/CUDA training.
+
+    Host prerequisites:
+      1. NVIDIA driver installed (nvidia-smi works)
+      2. nvidia-container-toolkit installed
+      3. Docker: sudo nvidia-ctk runtime configure --runtime=docker
+         Podman: sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+    Run [bold]yolo check[/bold] to verify GPU readiness.
+    Subject to config change safety (human approval required).
+
 [bold cyan]EXAMPLE CONFIG[/bold cyan]
 
   {
@@ -2003,6 +2062,11 @@ def config_ref():
     "devices": [
       {"usb": "0bda:2838", "description": "RTL-SDR Blog V4"}
     ],
+    "gpu": {
+      "enabled": true,
+      "devices": "all",
+      "capabilities": "compute,utility"
+    },
     "network": {
       "mode": "bridge",
       "ports": ["8000:8000"],
@@ -2360,6 +2424,87 @@ def check(
     except (ConfigError, SystemExit) as e:
         fail("Entrypoint preflight failed", str(e))
     console.print()
+
+    # --- GPU Checks ---
+
+    gpu_config = config.get("gpu", {})
+    if gpu_config.get("enabled", False):
+        console.print("[bold]GPU (NVIDIA)[/bold]")
+        # Check nvidia-smi
+        nvidia_smi = shutil.which("nvidia-smi")
+        if nvidia_smi:
+            try:
+                result = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=name,driver_version",
+                        "--format=csv,noheader",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    for line in result.stdout.strip().split("\n"):
+                        ok(f"GPU detected: {line.strip()}")
+                else:
+                    fail(
+                        "nvidia-smi found but no GPUs detected",
+                        "Check NVIDIA driver installation",
+                    )
+            except Exception as e:
+                fail("nvidia-smi execution failed", str(e))
+        else:
+            fail(
+                "nvidia-smi not found",
+                "Install NVIDIA drivers: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/install-nvidia-driver.html",
+            )
+
+        # Check nvidia-ctk
+        nvidia_ctk = shutil.which("nvidia-ctk")
+        if nvidia_ctk:
+            ok("nvidia-ctk found (NVIDIA Container Toolkit)")
+        else:
+            fail(
+                "nvidia-ctk not found",
+                "Install: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html",
+            )
+
+        # Runtime-specific checks
+        effective_runtime, _ = _runtime_for_check(config)
+        if effective_runtime == "podman":
+            # Check CDI spec exists
+            cdi_paths = [
+                Path("/etc/cdi/nvidia.yaml"),
+                Path("/var/run/cdi/nvidia.yaml"),
+            ]
+            cdi_found = any(p.exists() for p in cdi_paths)
+            if cdi_found:
+                ok("CDI spec found for Podman GPU support")
+            else:
+                fail(
+                    "No CDI spec found for Podman",
+                    "Generate with: sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
+                )
+        elif effective_runtime == "docker":
+            # Check Docker NVIDIA runtime configured
+            try:
+                result = subprocess.run(
+                    ["docker", "info", "--format", "{{.Runtimes}}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0 and "nvidia" in result.stdout.lower():
+                    ok("Docker NVIDIA runtime configured")
+                else:
+                    warn(
+                        "Docker NVIDIA runtime may not be configured",
+                        "Run: sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker",
+                    )
+            except Exception:
+                warn("Could not verify Docker NVIDIA runtime configuration")
+        console.print()
 
     # --- Image & Containers ---
 
@@ -3090,6 +3235,41 @@ def run(
                     )
             elif "cgroup_rule" in dev:
                 docker_cmd.extend(["--device-cgroup-rule", dev["cgroup_rule"]])
+
+    # GPU passthrough from config
+    gpu_config = config.get("gpu", {})
+    if gpu_config.get("enabled", False):
+        gpu_devices = gpu_config.get("devices", "all")
+        gpu_capabilities = gpu_config.get("capabilities", "compute,utility")
+
+        if runtime == "docker":
+            # Docker: use --gpus flag (requires nvidia-container-toolkit)
+            if gpu_devices == "all":
+                docker_cmd.extend(["--gpus", "all"])
+            else:
+                docker_cmd.extend(["--gpus", f'"device={gpu_devices}"'])
+        elif runtime == "podman":
+            # Podman: use CDI (Container Device Interface) notation
+            if gpu_devices == "all":
+                docker_cmd.extend(["--device", "nvidia.com/gpu=all"])
+            else:
+                # CDI supports individual GPU indices: nvidia.com/gpu=0
+                for gpu_idx in gpu_devices.split(","):
+                    gpu_idx = gpu_idx.strip()
+                    docker_cmd.extend(["--device", f"nvidia.com/gpu={gpu_idx}"])
+
+        # Set NVIDIA environment variables for the container runtime to pick up
+        docker_cmd.extend(
+            [
+                "-e",
+                f"NVIDIA_VISIBLE_DEVICES={gpu_devices}",
+                "-e",
+                f"NVIDIA_DRIVER_CAPABILITIES={gpu_capabilities}",
+            ]
+        )
+        console.print(
+            f"[dim]GPU passthrough: devices={gpu_devices}, capabilities={gpu_capabilities}[/dim]"
+        )
 
     # Copy host nvim config (resolving symlinks) so ctrl-g uses the user's config.
     # We copy instead of bind-mounting because dotfile managers (stow, etc.) create
