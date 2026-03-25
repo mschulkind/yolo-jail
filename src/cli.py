@@ -1698,6 +1698,14 @@ def init():
   //     "args": []
   //   }
   // }
+
+  // NVIDIA GPU passthrough. Requires NVIDIA Container Toolkit on the host.
+  // Run "yolo check" to verify GPU readiness before enabling.
+  // "gpu": {
+  //   "enabled": true,
+  //   "devices": "all",          // "all", "0", "0,1", or "GPU-<uuid>"
+  //   "capabilities": "compute,utility"
+  // }
 }
 """
     with open(config_path, "w") as f:
