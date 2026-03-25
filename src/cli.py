@@ -2478,9 +2478,32 @@ def check(
                 Path("/etc/cdi/nvidia.yaml"),
                 Path("/var/run/cdi/nvidia.yaml"),
             ]
-            cdi_found = any(p.exists() for p in cdi_paths)
+            cdi_found = None
+            for p in cdi_paths:
+                if p.exists():
+                    cdi_found = p
+                    break
             if cdi_found:
                 ok("CDI spec found for Podman GPU support")
+                # Check CDI spec driver version matches installed driver
+                try:
+                    cdi_text = cdi_found.read_text()
+                    # nvidia-smi driver version from earlier check
+                    smi_result = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    if smi_result.returncode == 0:
+                        smi_driver = smi_result.stdout.strip().split("\n")[0].strip()
+                        if smi_driver and smi_driver in cdi_text:
+                            ok(f"CDI spec matches driver {smi_driver}")
+                        elif smi_driver:
+                            warn(
+                                f"CDI spec may be stale (driver is {smi_driver})",
+                                "Regenerate: sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml",
+                            )
+                except Exception:
+                    pass  # Non-critical check
             else:
                 fail(
                     "No CDI spec found for Podman",
