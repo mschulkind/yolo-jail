@@ -834,6 +834,31 @@ def generate_agents_md(
             "Do NOT install packages via apt, nix-env, or other package managers.",
             "Run `yolo config-ref` for the full configuration reference.",
             "",
+            "## Resource Management",
+            "",
+            "The jail may have hard resource limits set by the human operator (memory, CPU, PIDs).",
+            "These are kernel-enforced — exceeding memory triggers OOM kill, exceeding PIDs prevents",
+            "new processes. You cannot change container-level limits, but you can constrain your own",
+            "sub-processes:",
+            "",
+            "| Tool | Purpose | Example |",
+            "|------|---------|---------|",
+            "| `nice` | Lower CPU priority | `nice -n 19 python train.py` |",
+            "| `ionice` | Lower I/O priority | `ionice -c 3 python train.py` |",
+            "| `timeout` | Wall-clock limit | `timeout 3600 python train.py` |",
+            "| `ulimit` | Per-process limits | `ulimit -v 4000000` (4GB virtual mem) |",
+            "",
+            "For long-running jobs (training, builds), combine limits:",
+            "```bash",
+            "nice -n 10 timeout 7200 python train.py",
+            "```",
+            "",
+            "To request resource limit changes, edit `/workspace/yolo-jail.jsonc`:",
+            "```json",
+            '  "resources": {"memory": "8g", "cpus": 4, "pids_limit": 4096}',
+            "```",
+            "Then run `yolo check --no-build` and ask the human to restart the jail.",
+            "",
             "## First Session — Handover",
             "",
             "If this is your first session in this jail, invoke the **jail-startup** skill.",
@@ -1185,6 +1210,7 @@ KNOWN_TOP_LEVEL_CONFIG_KEYS = {
     "mcp_presets",
     "devices",
     "gpu",
+    "resources",
 }
 KNOWN_NETWORK_KEYS = {"mode", "ports", "forward_host_ports"}
 KNOWN_SECURITY_KEYS = {"blocked_tools"}
@@ -1194,7 +1220,9 @@ KNOWN_LSP_SERVER_KEYS = {"command", "args", "fileExtensions"}
 KNOWN_MCP_SERVER_KEYS = {"command", "args"}
 KNOWN_DEVICE_KEYS = {"usb", "description", "cgroup_rule"}
 KNOWN_GPU_KEYS = {"enabled", "devices", "capabilities"}
+KNOWN_RESOURCES_KEYS = {"memory", "cpus", "pids_limit"}
 USB_ID_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$")
+MEMORY_RE = re.compile(r"^\d+[bkmgBKMG]?$")
 
 
 def _report_unknown_keys(
@@ -1574,6 +1602,55 @@ def _validate_config(
                                 f"Valid: {', '.join(sorted(valid_caps))}"
                             )
 
+    # Resources config validation
+    resources = config.get("resources")
+    if resources is not None:
+        if not isinstance(resources, dict):
+            errors.append("config.resources: expected an object")
+        else:
+            _report_unknown_keys(
+                resources, KNOWN_RESOURCES_KEYS, "config.resources", errors
+            )
+            memory = resources.get("memory")
+            if memory is not None:
+                if not isinstance(memory, str):
+                    errors.append(
+                        "config.resources.memory: expected a string (e.g. '8g', '512m')"
+                    )
+                elif not MEMORY_RE.match(memory):
+                    errors.append(
+                        "config.resources.memory: invalid format. "
+                        "Use a number with optional suffix: b, k, m, g (e.g. '8g', '512m')"
+                    )
+            cpus = resources.get("cpus")
+            if cpus is not None:
+                if isinstance(cpus, (int, float)):
+                    if cpus <= 0:
+                        errors.append(
+                            "config.resources.cpus: must be a positive number"
+                        )
+                elif isinstance(cpus, str):
+                    try:
+                        val = float(cpus)
+                        if val <= 0:
+                            errors.append(
+                                "config.resources.cpus: must be a positive number"
+                            )
+                    except ValueError:
+                        errors.append(
+                            "config.resources.cpus: expected a number (e.g. 4, 2.5, '0.5')"
+                        )
+                else:
+                    errors.append(
+                        "config.resources.cpus: expected a number (e.g. 4, 2.5, '0.5')"
+                    )
+            pids_limit = resources.get("pids_limit")
+            if pids_limit is not None:
+                if not isinstance(pids_limit, int) or pids_limit <= 0:
+                    errors.append(
+                        "config.resources.pids_limit: expected a positive integer"
+                    )
+
     return errors, warnings
 
 
@@ -1746,6 +1823,13 @@ def init():
   //   "enabled": true,
   //   "devices": "all",          // "all", "0", "0,1", or "GPU-<uuid>"
   //   "capabilities": "compute,utility"
+  // }
+
+  // Container resource limits (hard cgroup constraints).
+  // "resources": {
+  //   "memory": "8g",            // Max memory (b/k/m/g suffix). OOM-killed if exceeded.
+  //   "cpus": 4,                 // CPU limit (decimal). e.g. 4, 2.5, "0.5"
+  //   "pids_limit": 4096         // Max processes. Prevents fork bombs.
   // }
 }
 """
@@ -2041,6 +2125,26 @@ def config_ref():
     Run [bold]yolo check[/bold] to verify GPU readiness.
     Subject to config change safety (human approval required).
 
+  [bold]resources[/bold] (object): Container resource limits.
+    Sets hard cgroup constraints on the jail container via Docker/Podman flags.
+    These limits are enforced by the kernel — the jail cannot exceed them.
+    • [bold]memory[/bold] (string): Maximum memory. Format: number + suffix (b/k/m/g).
+      Examples: "8g" (8 GB), "512m" (512 MB), "2g".
+      Maps to --memory flag. OOM-killed if exceeded.
+    • [bold]cpus[/bold] (number|string): CPU limit as a decimal. Default: no limit.
+      Examples: 4 (four cores), 2.5 (two and a half cores), "0.5" (half a core).
+      Maps to --cpus flag (CFS quota).
+    • [bold]pids_limit[/bold] (integer): Maximum number of processes. Default: no limit.
+      Prevents fork bombs and runaway process creation.
+      Maps to --pids-limit flag.
+
+    [bold]In-jail sub-process limits[/bold]:
+    Agents inside the jail can further constrain individual processes using
+    cgroup v2 (if the container runtime delegates the cgroup) or standard
+    Unix tools: nice/renice (CPU priority), ionice (I/O priority),
+    timeout (wall-clock limit), ulimit (per-process limits).
+    Subject to config change safety (human approval required).
+
 [bold cyan]EXAMPLE CONFIG[/bold cyan]
 
   {
@@ -2066,6 +2170,11 @@ def config_ref():
       "enabled": true,
       "devices": "all",
       "capabilities": "compute,utility"
+    },
+    "resources": {
+      "memory": "8g",
+      "cpus": 4,
+      "pids_limit": 4096
     },
     "network": {
       "mode": "bridge",
@@ -3299,6 +3408,25 @@ def run(
         console.print(
             f"[dim]GPU passthrough: devices={gpu_devices}, capabilities={gpu_capabilities}[/dim]"
         )
+
+    # Resource limits from config
+    resources_config = config.get("resources", {})
+    if resources_config:
+        res_parts = []
+        memory = resources_config.get("memory")
+        if memory:
+            docker_cmd.extend(["--memory", memory])
+            res_parts.append(f"memory={memory}")
+        cpus = resources_config.get("cpus")
+        if cpus is not None:
+            docker_cmd.extend(["--cpus", str(cpus)])
+            res_parts.append(f"cpus={cpus}")
+        pids_limit = resources_config.get("pids_limit")
+        if pids_limit is not None:
+            docker_cmd.extend(["--pids-limit", str(pids_limit)])
+            res_parts.append(f"pids={pids_limit}")
+        if res_parts:
+            console.print(f"[dim]Resource limits: {', '.join(res_parts)}[/dim]")
 
     # Copy host nvim config (resolving symlinks) so ctrl-g uses the user's config.
     # We copy instead of bind-mounting because dotfile managers (stow, etc.) create
