@@ -858,6 +858,65 @@ def exec_bash(command: str):
 
 
 # ---------------------------------------------------------------------------
+# Published port localhost fixup (iptables DNAT)
+# ---------------------------------------------------------------------------
+
+
+def setup_published_port_localnet():
+    """Add iptables DNAT rules so published ports reach services bound to 127.0.0.1.
+
+    Container runtimes forward published-port traffic to the container's network
+    interface (eth0), not loopback.  Services that bind to 127.0.0.1 therefore
+    never see it.  Combined with route_localnet=1 (set by cli.py via --sysctl),
+    PREROUTING DNAT rules redirect arriving traffic to 127.0.0.1 — making
+    published ports work regardless of the bind address inside the jail.
+
+    Reads YOLO_PUBLISHED_PORTS (JSON array of "PORT/PROTO" strings).
+    Silently skips if iptables is unavailable (e.g. Docker without NET_ADMIN).
+    """
+    raw = os.environ.get("YOLO_PUBLISHED_PORTS", "")
+    if not raw:
+        return
+
+    try:
+        ports = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        print(f"Warning: invalid YOLO_PUBLISHED_PORTS: {raw}", file=sys.stderr)
+        return
+
+    if not ports:
+        return
+
+    iptables_bin = shutil.which("iptables")
+    if not iptables_bin:
+        return
+
+    for entry in ports:
+        parts = str(entry).split("/")
+        port = parts[0]
+        proto = parts[1] if len(parts) > 1 else "tcp"
+        try:
+            subprocess.run(
+                [
+                    iptables_bin,
+                    "-t", "nat",
+                    "-A", "PREROUTING",
+                    "-p", proto,
+                    "--dport", port,
+                    "-j", "DNAT",
+                    "--to-destination", f"127.0.0.1:{port}",
+                ],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception as e:
+            print(
+                f"Warning: iptables DNAT for port {port}/{proto}: {e}",
+                file=sys.stderr,
+            )
+
+
+# ---------------------------------------------------------------------------
 # Host port forwarding (container side)
 # ---------------------------------------------------------------------------
 
@@ -987,6 +1046,8 @@ def main():
     _perf("configure_copilot")
     configure_gemini()
     _perf("configure_gemini")
+    setup_published_port_localnet()
+    _perf("published_port_localnet")
     start_container_port_forwarding()
     _perf("port_forwarding")
 

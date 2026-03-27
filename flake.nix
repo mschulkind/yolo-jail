@@ -244,6 +244,7 @@
             pkgs.delta
             pkgs.fzf
             pkgs.uv
+            pkgs.iptables     # For DNAT rules (published port → localhost fixup)
             pkgs.socat        # For host port forwarding into the jail
             pkgs.nix          # For building nix images inside jail
             pkgs.podman       # For nested container support

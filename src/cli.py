@@ -2473,6 +2473,18 @@ def check(
         # Runtime-specific checks
         effective_runtime, _ = _runtime_for_check(config)
         if effective_runtime == "podman":
+            # GPU+Podman requires runc (CDI device injection fails with crun,
+            # see https://github.com/containers/podman/issues/27483)
+            runc_path = shutil.which("runc")
+            if runc_path:
+                ok("runc found (required for Podman GPU passthrough)")
+            else:
+                fail(
+                    "runc not found",
+                    "GPU passthrough requires runc (CDI fails with crun). "
+                    "Install runc: https://github.com/opencontainers/runc/releases",
+                )
+
             # Check CDI spec exists
             cdi_paths = [
                 Path("/etc/cdi/nvidia.yaml"),
@@ -3107,17 +3119,28 @@ def run(
                 ]
             )
         elif gpu_enabled:
-            # GPU passthrough: CDI device injection fails with crun (the
-            # default OCI runtime) and custom user namespaces. Use runc and
-            # keep-id to avoid both issues. No /dev/fuse or SYS_ADMIN needed
-            # since nested podman-in-podman is disabled when GPU is active.
-            # See: https://github.com/containers/podman/issues/27483
+            # GPU passthrough: CDI device injection fails with crun and custom
+            # user namespaces (https://github.com/containers/podman/issues/27483).
+            # Use runc to avoid the CDI+crun incompatibility, and identity UID/GID
+            # mapping (same as non-GPU) instead of keep-id. keep-id forces podman
+            # to shift UIDs across every file in every image layer — with a large
+            # image (100 layers, multi-GB) and no native shifting support this
+            # causes 10+ minute container startup. Identity mapping needs no
+            # shifting since container UIDs match the namespace UIDs as stored.
+            # No /dev/fuse or SYS_ADMIN needed since nested podman-in-podman is
+            # disabled when GPU is active.
             docker_cmd.extend(
                 [
                     "--security-opt",
                     "label=disable",
-                    "--userns",
-                    "keep-id",
+                    "--uidmap",
+                    "0:0:1",
+                    "--uidmap",
+                    "1:1:65536",
+                    "--gidmap",
+                    "0:0:1",
+                    "--gidmap",
+                    "1:1:65536",
                     "--runtime",
                     "runc",
                 ]
@@ -3204,6 +3227,32 @@ def run(
 
     docker_cmd.extend(publish_args)
     docker_cmd.extend(mount_args)
+
+    # Enable iptables DNAT so published ports reach services bound to 127.0.0.1.
+    # Container runtimes forward published-port traffic to the container's eth0,
+    # not loopback — so services listening on localhost never see it.
+    # Podman rootless runs as UID 0 in a user namespace, so iptables works.
+    # Docker uses -u UID:GID (non-root, no NET_ADMIN) so this is Podman-only.
+    # route_localnet allows the kernel to route DNAT'd packets to 127.0.0.1;
+    # the entrypoint adds matching iptables PREROUTING rules.
+    if publish_args and runtime == "podman":
+        docker_cmd.extend(
+            ["--sysctl", "net.ipv4.conf.all.route_localnet=1"]
+        )
+        # Extract container-side ports for the entrypoint's DNAT rules
+        published_ports = []
+        for p in config.get("network", {}).get("ports", []):
+            spec = str(p)
+            proto = "tcp"
+            if "/" in spec:
+                spec, proto = spec.rsplit("/", 1)
+            parts = spec.split(":")
+            container_port = parts[-1]  # always the last element
+            published_ports.append(f"{container_port}/{proto}")
+        if published_ports:
+            docker_cmd.extend(
+                ["-e", f"YOLO_PUBLISHED_PORTS={json.dumps(published_ports)}"]
+            )
 
     # Host port forwarding via Unix sockets
     socket_dir = None
