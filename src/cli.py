@@ -2,6 +2,8 @@ import difflib
 import fcntl
 import os
 import re
+import socket
+import struct
 import subprocess
 import sys
 import json
@@ -10,6 +12,7 @@ import shutil
 import hashlib
 import time
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Union
 import typer
@@ -67,6 +70,8 @@ def _default(
                     tool caches, and configs persist across restarts.
         Identity:   Host git/jj identity is injected automatically.
                     GitHub CLI (gh) is pre-authenticated.
+        Resources:  [bold]yolo-cglimit[/bold] enforces CPU/memory/PID limits on
+                    sub-processes via cgroup v2. See [bold]yolo config-ref[/bold].
 
         NOT shared: ~/.ssh, ~/.gitconfig, cloud credentials, host PATH.
         Blocked:    grep → rg, find → fd (configurable). Set YOLO_BYPASS_SHIMS=1
@@ -586,7 +591,430 @@ def cleanup_port_forwarding(
         shutil.rmtree(socket_dir, ignore_errors=True)
 
 
-DEFAULT_MCP_SERVER_NAMES: List[str] = []
+# ---------------------------------------------------------------------------
+# Host-side cgroup delegate daemon
+# ---------------------------------------------------------------------------
+# Instead of giving the container CAP_SYS_ADMIN to remount /sys/fs/cgroup rw,
+# we run a thin host-side daemon that performs cgroup operations on behalf of
+# the container.  The daemon listens on a Unix socket that is bind-mounted
+# into the jail.  The container-side `yolo-cglimit` client sends JSON
+# requests; the daemon validates them and performs the cgroup writes on the
+# host filesystem where cgroup v2 is writable.
+#
+# Security model:
+#   - All cgroup operations are confined to the container's cgroup subtree
+#   - Cgroup names are strictly validated (alphanumeric + dash/underscore)
+#   - Limit values are range-checked
+#   - PID identity comes from SO_PEERCRED (kernel-attested, unforgeable)
+#   - Every operation is logged to a file for auditability
+# ---------------------------------------------------------------------------
+
+CGD_SOCKET_NAME = "cgroup.sock"
+
+
+def _resolve_container_cgroup(cname: str, runtime: str) -> Optional[Path]:
+    """Discover the host-side cgroup path for a running container.
+
+    Returns the absolute Path to the container's cgroup directory on the host
+    cgroup v2 filesystem, or None if it cannot be determined.
+    """
+    try:
+        if runtime == "podman":
+            # podman inspect returns the cgroup path (relative to cgroup root)
+            result = subprocess.run(
+                ["podman", "inspect", "--format", "{{.State.CgroupPath}}", cname],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                cg_path = result.stdout.strip()
+                # Podman with systemd cgroup manager returns paths like
+                # "user.slice/user-1000.slice/..." — these are already absolute
+                # within /sys/fs/cgroup.
+                candidate = Path("/sys/fs/cgroup") / cg_path
+                if candidate.exists():
+                    return candidate
+                # Some podman versions return the scope name only
+                # Try to find it via the container's init PID
+        # Fallback for both Docker and Podman: use init PID's /proc cgroup
+        fmt = "{{.State.Pid}}" if runtime == "docker" else "{{.State.Pid}}"
+        result = subprocess.run(
+            [runtime, "inspect", "--format", fmt, cname],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        pid = int(result.stdout.strip())
+        if pid <= 0:
+            return None
+        # Read /proc/<pid>/cgroup — format: "0::/path/to/cgroup"
+        proc_cgroup = Path(f"/proc/{pid}/cgroup")
+        if not proc_cgroup.exists():
+            return None
+        for line in proc_cgroup.read_text().splitlines():
+            parts = line.split(":", 2)
+            if len(parts) == 3 and parts[0] == "0":
+                cg_rel = parts[2].lstrip("/")
+                candidate = Path("/sys/fs/cgroup") / cg_rel
+                if candidate.exists():
+                    return candidate
+    except Exception:
+        pass
+    return None
+
+
+def _validate_cgroup_name(name: str) -> bool:
+    """Validate that a cgroup name is safe (no path traversal)."""
+    return (
+        bool(re.match(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$", name)) and ".." not in name
+    )
+
+
+def _parse_memory_value(val: str) -> Optional[int]:
+    """Parse a human-readable memory value to bytes.  Returns None on invalid input."""
+    val = val.strip().lower()
+    try:
+        if val.endswith("g"):
+            return int(float(val[:-1]) * 1073741824)
+        if val.endswith("m"):
+            return int(float(val[:-1]) * 1048576)
+        if val.endswith("k"):
+            return int(float(val[:-1]) * 1024)
+        return int(val)
+    except (ValueError, OverflowError):
+        return None
+
+
+def _cgroup_delegate_handler(
+    conn: socket.socket,
+    container_cgroup: Path,
+    log_file,
+):
+    """Handle a single cgroup delegate request from the container.
+
+    Protocol: single-line JSON request, single-line JSON response.
+    """
+    try:
+        data = b""
+        while b"\n" not in data and len(data) < 4096:
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        if not data:
+            return
+
+        request = json.loads(data.decode("utf-8", errors="replace"))
+        op = request.get("op", "")
+
+        # Get the host-PID of the caller via SO_PEERCRED (kernel-attested)
+        try:
+            cred = conn.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+            )
+            peer_pid, peer_uid, peer_gid = struct.unpack("3i", cred)
+        except (OSError, struct.error):
+            peer_pid = 0
+
+        # Log every request for auditability
+        log_line = f"op={op} peer_pid={peer_pid} request={json.dumps(request)}"
+        print(log_line, file=log_file, flush=True)
+
+        if op == "status":
+            # Check if delegation is available
+            agent_cg = container_cgroup / "agent"
+            controllers = ""
+            if agent_cg.exists():
+                try:
+                    controllers = (agent_cg / "cgroup.controllers").read_text().strip()
+                except OSError:
+                    pass
+            response = {
+                "ok": True,
+                "delegated": agent_cg.exists(),
+                "controllers": controllers,
+                "cgroup": str(container_cgroup),
+            }
+
+        elif op == "create_and_join":
+            name = request.get("name", "")
+            if not _validate_cgroup_name(name):
+                response = {"ok": False, "error": f"Invalid cgroup name: {name!r}"}
+            elif peer_pid <= 0:
+                response = {"ok": False, "error": "Could not determine caller PID"}
+            else:
+                response = _cgd_create_and_join(
+                    container_cgroup, name, request, peer_pid, log_file
+                )
+
+        elif op == "destroy":
+            name = request.get("name", "")
+            if not _validate_cgroup_name(name):
+                response = {"ok": False, "error": f"Invalid cgroup name: {name!r}"}
+            else:
+                response = _cgd_destroy(container_cgroup, name, log_file)
+
+        else:
+            response = {"ok": False, "error": f"Unknown operation: {op!r}"}
+
+        conn.sendall((json.dumps(response) + "\n").encode())
+        print(f"  response={json.dumps(response)}", file=log_file, flush=True)
+
+    except Exception as exc:
+        try:
+            conn.sendall((json.dumps({"ok": False, "error": str(exc)}) + "\n").encode())
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def _cgd_ensure_agent_cgroup(container_cgroup: Path, log_file) -> Optional[Path]:
+    """Ensure the agent cgroup subtree exists with controllers enabled.
+
+    Returns the path to the agent cgroup, or None on failure.
+    """
+    agent_cg = container_cgroup / "agent"
+    init_cg = container_cgroup / "init"
+
+    if agent_cg.exists():
+        return agent_cg
+
+    try:
+        init_cg.mkdir(exist_ok=True)
+        agent_cg.mkdir(exist_ok=True)
+    except OSError as e:
+        print(f"  ERROR creating cgroup dirs: {e}", file=log_file, flush=True)
+        return None
+
+    # Move all existing processes to 'init' (cgroup v2 no-internal-process constraint)
+    try:
+        procs = (container_cgroup / "cgroup.procs").read_text().strip().split()
+        for pid in procs:
+            try:
+                (init_cg / "cgroup.procs").write_text(pid)
+            except OSError:
+                pass  # Process may have exited or be a kthread
+    except OSError:
+        pass
+
+    # Enable controllers on container root → agent subtree
+    for cg in [container_cgroup, agent_cg]:
+        try:
+            available = (cg / "cgroup.controllers").read_text().strip().split()
+            wanted = [c for c in ["cpu", "memory", "pids"] if c in available]
+            if wanted:
+                ctrl = " ".join(f"+{c}" for c in wanted)
+                (cg / "cgroup.subtree_control").write_text(ctrl)
+        except OSError:
+            pass
+
+    return agent_cg
+
+
+def _cgd_create_and_join(
+    container_cgroup: Path,
+    name: str,
+    request: dict,
+    peer_pid: int,
+    log_file,
+) -> dict:
+    """Create a child cgroup under agent/, set limits, and move the caller into it."""
+    agent_cg = _cgd_ensure_agent_cgroup(container_cgroup, log_file)
+    if agent_cg is None:
+        return {"ok": False, "error": "Failed to set up agent cgroup hierarchy"}
+
+    job_cg = agent_cg / name
+    try:
+        job_cg.mkdir(exist_ok=True)
+    except OSError as e:
+        return {"ok": False, "error": f"Cannot create cgroup {name}: {e}"}
+
+    errors = []
+
+    # CPU limit: percentage of all CPUs → cpu.max (quota period)
+    cpu_pct = request.get("cpu_pct")
+    if cpu_pct is not None:
+        try:
+            pct = int(cpu_pct)
+            if pct < 1 or pct > 100 * os.cpu_count():
+                errors.append(f"cpu_pct out of range: {pct}")
+            else:
+                nproc = os.cpu_count() or 1
+                quota = pct * 1000 * nproc
+                (job_cg / "cpu.max").write_text(f"{quota} 100000")
+        except (ValueError, OSError) as e:
+            errors.append(f"cpu.max: {e}")
+
+    # Memory limit
+    memory = request.get("memory")
+    if memory is not None:
+        mem_bytes = _parse_memory_value(str(memory))
+        if mem_bytes is None or mem_bytes < 1048576:  # min 1MB
+            errors.append(f"Invalid memory value: {memory}")
+        else:
+            try:
+                (job_cg / "memory.max").write_text(str(mem_bytes))
+            except OSError as e:
+                errors.append(f"memory.max: {e}")
+
+    # PID limit
+    pids = request.get("pids")
+    if pids is not None:
+        try:
+            pids_val = int(pids)
+            if pids_val < 1 or pids_val > 1000000:
+                errors.append(f"pids out of range: {pids_val}")
+            else:
+                (job_cg / "pids.max").write_text(str(pids_val))
+        except (ValueError, OSError) as e:
+            errors.append(f"pids.max: {e}")
+
+    # Move the caller into the new cgroup (peer_pid is already host-namespace)
+    try:
+        (job_cg / "cgroup.procs").write_text(str(peer_pid))
+    except OSError as e:
+        return {
+            "ok": False,
+            "error": f"Cannot move PID {peer_pid} into cgroup: {e}",
+            "limit_errors": errors,
+        }
+
+    cg_root = Path("/sys/fs/cgroup")
+    try:
+        cg_path = str(job_cg.relative_to(cg_root))
+    except ValueError:
+        cg_path = str(job_cg)
+    result = {"ok": True, "cgroup": cg_path}
+    if errors:
+        result["warnings"] = errors
+    return result
+
+
+def _cgd_destroy(container_cgroup: Path, name: str, log_file) -> dict:
+    """Remove a child cgroup (must be empty of processes)."""
+    agent_cg = container_cgroup / "agent"
+    job_cg = agent_cg / name
+    if not job_cg.exists():
+        return {"ok": True}  # Already gone — idempotent
+    try:
+        # Check for remaining processes
+        procs = (job_cg / "cgroup.procs").read_text().strip()
+        if procs:
+            return {
+                "ok": False,
+                "error": f"Cgroup {name} still has processes: {procs}",
+            }
+        job_cg.rmdir()
+        return {"ok": True}
+    except OSError as e:
+        return {"ok": False, "error": f"Cannot remove cgroup {name}: {e}"}
+
+
+def start_cgroup_delegate(
+    cname: str, runtime: str, socket_dir: Path
+) -> Optional[threading.Thread]:
+    """Start the host-side cgroup delegate daemon.
+
+    Listens on a Unix socket in socket_dir.  Returns the daemon thread, or
+    None if cgroup v2 is not available on this host.
+    """
+    # Quick sanity: is cgroup v2 available on the host?
+    if not Path("/sys/fs/cgroup/cgroup.controllers").exists():
+        return None
+
+    socket_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = socket_dir / CGD_SOCKET_NAME
+    sock_path.unlink(missing_ok=True)
+
+    log_dir = GLOBAL_STORAGE / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_dir / f"{cname}-cgd.log", "a")
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(str(sock_path))
+    sock_path.chmod(0o777)  # Container runs as mapped UID — must be accessible
+    srv.listen(8)
+    srv.settimeout(1.0)  # Allow periodic shutdown checks
+
+    container_cgroup: Optional[Path] = None
+    container_cgroup_lock = threading.Lock()
+    shutdown = threading.Event()
+
+    def serve():
+        nonlocal container_cgroup
+        while not shutdown.is_set():
+            try:
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            # Lazy-resolve container cgroup on first request
+            with container_cgroup_lock:
+                if container_cgroup is None:
+                    container_cgroup = _resolve_container_cgroup(cname, runtime)
+                    if container_cgroup:
+                        print(
+                            f"Resolved container cgroup: {container_cgroup}",
+                            file=log_file,
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "WARNING: Could not resolve container cgroup",
+                            file=log_file,
+                            flush=True,
+                        )
+            if container_cgroup is None:
+                try:
+                    conn.sendall(
+                        (
+                            json.dumps(
+                                {
+                                    "ok": False,
+                                    "error": "Container cgroup not yet available",
+                                }
+                            )
+                            + "\n"
+                        ).encode()
+                    )
+                    conn.close()
+                except Exception:
+                    pass
+                continue
+
+            _cgroup_delegate_handler(conn, container_cgroup, log_file)
+        srv.close()
+        log_file.close()
+
+    t = threading.Thread(target=serve, daemon=True, name=f"cgd-{cname}")
+    t._shutdown_event = shutdown  # type: ignore[attr-defined]
+    t._socket = srv  # type: ignore[attr-defined]
+    t.start()
+
+    # Give the socket a moment to be ready
+    time.sleep(0.05)
+    return t
+
+
+def stop_cgroup_delegate(
+    thread: Optional[threading.Thread], socket_dir: Optional[Path]
+):
+    """Stop the cgroup delegate daemon and clean up."""
+    if thread is not None:
+        shutdown = getattr(thread, "_shutdown_event", None)
+        if shutdown:
+            shutdown.set()
+        thread.join(timeout=3)
+    if socket_dir and socket_dir.exists():
+        shutil.rmtree(socket_dir, ignore_errors=True)
+
+
 VALID_MCP_PRESETS = {"chrome-devtools", "sequential-thinking"}
 DEFAULT_MISE_TOOLS = {"neovim": "stable"}
 
@@ -839,9 +1267,11 @@ def generate_agents_md(
             "The jail may have hard resource limits set by the human operator (memory, CPU, PIDs).",
             "These are kernel-enforced — exceeding memory triggers OOM kill, exceeding PIDs prevents",
             "new processes. You cannot change container-level limits, but you can enforce hard limits",
-            "on your own sub-processes using cgroup v2 delegation:",
+            "on your own sub-processes using `yolo-cglimit`:",
             "",
             "### yolo-cglimit (recommended for hard limits)",
+            "",
+            "Located at `~/.local/bin/yolo-cglimit` (on PATH). Run `yolo-cglimit --help` for usage.",
             "",
             "```bash",
             "# Limit a training job to 75% of all CPUs",
@@ -858,7 +1288,18 @@ def generate_agents_md(
             "```",
             "",
             "These limits are enforced by the kernel via cgroup v2 — they cannot be exceeded.",
-            "If cgroup delegation is unavailable, `yolo-cglimit` will print an error.",
+            "The tool communicates with a host-side daemon over a Unix socket; no elevated",
+            "privileges are needed inside the jail. If the daemon is unavailable, `yolo-cglimit`",
+            "will print an error with guidance.",
+            "",
+            "**How it works**: The yolo CLI runs a cgroup delegate daemon on the host alongside",
+            "the container. When you call `yolo-cglimit`, it sends a JSON request to the daemon",
+            "via `/tmp/yolo-cgd/cgroup.sock`. The daemon creates a child cgroup in the container's",
+            "cgroup tree, sets limits, and moves your process into it using SO_PEERCRED for secure",
+            "PID identity. All operations are logged for auditability.",
+            "",
+            "**Podman is the primary supported runtime** for cgroup delegation. Docker support",
+            "is best-effort.",
             "",
             "### Soft limits (always available)",
             "",
@@ -2160,13 +2601,18 @@ def config_ref():
       Maps to --pids-limit flag.
 
     [bold]In-jail sub-process limits (cgroup v2 delegation)[/bold]:
-    The jail sets up cgroup v2 delegation so agents can enforce hard resource
-    limits on sub-processes. Use the [bold]yolo-cglimit[/bold] helper:
+    A host-side cgroup delegate daemon runs alongside the container and
+    performs all privileged cgroup operations on behalf of agents inside the
+    jail.  No CAP_SYS_ADMIN or writable cgroup mount is needed inside the
+    container — the daemon validates every request and operates securely on
+    the host cgroup filesystem via a Unix socket.
+    Use the [bold]yolo-cglimit[/bold] helper inside the jail:
       yolo-cglimit --cpu 75 -- python train.py           # 75% of all CPUs
       yolo-cglimit --cpu 50 --memory 2g -- make -j8      # 50% CPU + 2GB RAM
       yolo-cglimit --pids 100 -- ./script.sh             # Max 100 processes
-    Requires CAP_SYS_ADMIN and --cgroupns=private (enabled automatically).
-    Falls back to nice/timeout/ulimit if cgroup delegation is unavailable.
+    The daemon is started automatically by the yolo CLI.  Podman is the
+    primary supported runtime; Docker support is best-effort.
+    Falls back to nice/timeout/ulimit if delegation is unavailable.
     Subject to config change safety (human approval required).
 
 [bold cyan]EXAMPLE CONFIG[/bold cyan]
@@ -3229,8 +3675,6 @@ def run(
     # Docker needs explicit UID mapping; podman rootless maps container root to host user
     if runtime == "docker":
         docker_cmd.extend(["-u", f"{os.getuid()}:{os.getgid()}"])
-        # SYS_ADMIN for cgroup v2 delegation (remount /sys/fs/cgroup rw)
-        docker_cmd.extend(["--cap-add", "SYS_ADMIN"])
 
     # Detect if we're already inside a container
     in_container = Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
@@ -3262,7 +3706,7 @@ def run(
             # image (100 layers, multi-GB) and no native shifting support this
             # causes 10+ minute container startup. Identity mapping needs no
             # shifting since container UIDs match the namespace UIDs as stored.
-            # SYS_ADMIN is needed for cgroup v2 delegation (remount cgroup rw).
+            # SYS_ADMIN is needed for nested containers (podman-in-podman).
             docker_cmd.extend(
                 [
                     "--security-opt",
@@ -3396,6 +3840,10 @@ def run(
         docker_cmd.extend(
             ["-e", f"YOLO_FORWARD_HOST_PORTS={json.dumps(forward_host_ports)}"]
         )
+
+    # Host-side cgroup delegate: Unix socket for safe cgroup operations
+    cgd_socket_dir = Path(f"/tmp/yolo-cgd-{cname}")
+    docker_cmd.extend(["-v", f"{cgd_socket_dir}:/tmp/yolo-cgd:rw"])
 
     # Device passthrough from config
     for dev in config.get("devices", []):
@@ -3632,6 +4080,10 @@ def run(
     if socket_dir:
         socat_procs = start_host_port_forwarding(forward_host_ports, cname, socket_dir)
 
+    # Start host-side cgroup delegate daemon BEFORE the container so the
+    # socket exists when the entrypoint or agent runs yolo-cglimit.
+    cgd_thread = start_cgroup_delegate(cname, runtime, cgd_socket_dir)
+
     # Use Popen so we can release the workspace lock once the container is
     # confirmed running.  Any concurrent yolo process waiting on the lock will
     # re-check and find our container, then exec into it.
@@ -3645,6 +4097,7 @@ def run(
             "[dim]Run `yolo check` to validate runtime availability before restarting.[/dim]"
         )
         cleanup_port_forwarding(socat_procs, socket_dir)
+        stop_cgroup_delegate(cgd_thread, cgd_socket_dir)
         lock_file.close()
         sys.exit(1)
     for _ in range(20):
@@ -3656,8 +4109,9 @@ def run(
     proc.wait()
     result = proc
 
-    # Clean up host-side socat processes and socket directory
+    # Clean up host-side socat processes, cgroup delegate, and socket directories
     cleanup_port_forwarding(socat_procs, socket_dir)
+    stop_cgroup_delegate(cgd_thread, cgd_socket_dir)
 
     if profile and _profile_times:
         _profile_times["container_exited"] = _time.monotonic()

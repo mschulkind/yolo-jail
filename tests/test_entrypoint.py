@@ -537,8 +537,22 @@ class TestMiseConfig:
         assert 'python = "3.12"' in content
         # Missing base tools added
         assert 'go = "latest"' in content
-        assert 'gemini = "latest"' in content
-        assert '"npm:@github/copilot" = "latest"' in content
+        # copilot and gemini are NOT in mise base_tools (managed by bootstrap npm install)
+        assert '"npm:@github/copilot"' not in content
+        assert "gemini" not in content
+
+    def test_removes_retired_tools(self, jail_home):
+        """Retired tools (copilot/gemini) are removed from existing mise configs."""
+        entrypoint.MISE_CONFIG_DIR.mkdir(parents=True)
+        (entrypoint.MISE_CONFIG_DIR / "config.toml").write_text(
+            '[tools]\nnode = "22"\ngemini = "latest"\n"npm:@github/copilot" = "latest"\n'
+        )
+        entrypoint.generate_mise_config()
+        content = (entrypoint.MISE_CONFIG_DIR / "config.toml").read_text()
+        assert 'node = "22"' in content
+        # Retired tools should be removed
+        assert "gemini" not in content
+        assert "npm:@github/copilot" not in content
 
 
 # -- Bootstrap script --
@@ -552,7 +566,8 @@ class TestBootstrapScript:
         assert "mcp-language-server" in script
         assert "showboat" in script
         assert (
-            "npm install -g @google/gemini-cli@latest @github/copilot@latest" in script
+            "npm install -g --prefer-online @google/gemini-cli@latest @github/copilot@latest"
+            in script
         )
         assert os.access(jail_home / ".yolo-bootstrap.sh", os.X_OK)
 
@@ -1073,16 +1088,15 @@ class TestCglimitScript:
         entrypoint.generate_cglimit_script()
         script = jail_home / ".local" / "bin" / "yolo-cglimit"
         content = script.read_text()
-        # Verify key features of the script
-        assert "#!/bin/bash" in content
-        assert "cpu.max" in content
-        assert "memory.max" in content
-        assert "pids.max" in content
-        assert "cgroup.procs" in content
-        assert "/sys/fs/cgroup/agent" in content
+        # Now a Python script that talks to host-side cgroup daemon via socket
+        assert "#!/usr/bin/env python3" in content
+        assert "yolo-cgd/cgroup.sock" in content
+        assert "create_and_join" in content
         assert "--cpu" in content
         assert "--memory" in content
         assert "--pids" in content
+        assert "SO_PEERCRED" in content
+        assert "os.execvp" in content
         assert "--name" in content
 
     def test_cglimit_script_idempotent(self, jail_home):
@@ -1092,54 +1106,44 @@ class TestCglimitScript:
         assert script.exists()
 
     def test_cglimit_cpu_formula(self, jail_home):
-        """Verify the CPU quota formula: PCT * 1000 * nproc / 100000 period."""
+        """Verify the cglimit script sends cpu_pct to the host daemon."""
         entrypoint.generate_cglimit_script()
         content = (jail_home / ".local" / "bin" / "yolo-cglimit").read_text()
-        # The formula: quota=$(( CPU_PCT * 1000 * nproc )), period=100000
-        # This means 75% of all CPUs on an 8-core = 75 * 1000 * 8 = 600000 / 100000 = 6.0 cores
-        assert "CPU_PCT * 1000 * nproc" in content
-        assert "period=100000" in content
+        # The script sends cpu_pct to the host daemon, which computes the quota
+        assert "cpu_pct" in content
+        assert "send_request" in content
 
 
 class TestCgroupDelegation:
-    """Test cgroup v2 delegation setup."""
+    """Test cgroup v2 delegation setup (host-side daemon model)."""
 
-    def test_skips_when_no_cgroup_root(self, jail_home, monkeypatch):
-        """Should silently skip when /sys/fs/cgroup doesn't exist."""
-        monkeypatch.setattr(entrypoint, "CGROUP_ROOT", jail_home / "no-such-dir")
-        monkeypatch.setattr(
-            entrypoint, "CGROUP_AGENT", jail_home / "no-such-dir" / "agent"
-        )
-        # Should not raise
-        entrypoint.setup_cgroup_delegation()
+    def test_reports_available_when_socket_exists(self, jail_home, tmp_path, capsys):
+        """Should report 'available' when the daemon socket exists."""
+        sock = tmp_path / "cgroup.sock"
+        sock.touch()
+        import entrypoint as ep
 
-    def test_skips_when_no_controllers(self, jail_home, monkeypatch, tmp_path):
-        """Should skip when cgroup.controllers doesn't exist (not cgroup v2)."""
-        cg_root = tmp_path / "cgroup"
-        cg_root.mkdir()
-        # No cgroup.controllers file
-        monkeypatch.setattr(entrypoint, "CGROUP_ROOT", cg_root)
-        monkeypatch.setattr(entrypoint, "CGROUP_AGENT", cg_root / "agent")
-        entrypoint.setup_cgroup_delegation()
-        # Should not create agent dir
-        assert not (cg_root / "agent").exists()
+        original = ep.CGD_SOCKET
+        ep.CGD_SOCKET = sock
+        try:
+            ep.setup_cgroup_delegation()
+            captured = capsys.readouterr()
+            assert "available" in captured.err
+        finally:
+            ep.CGD_SOCKET = original
 
-    def test_idempotent_moves_pid_to_existing_agent(
-        self, jail_home, monkeypatch, tmp_path
-    ):
-        """When agent cgroup already exists, just move current PID into it."""
-        cg_root = tmp_path / "cgroup"
-        cg_root.mkdir()
-        agent_dir = cg_root / "agent"
-        agent_dir.mkdir()
-        procs_file = agent_dir / "cgroup.procs"
-        procs_file.write_text("")
+    def test_reports_unavailable_when_no_socket(self, jail_home, tmp_path, capsys):
+        """Should report 'not available' when daemon socket doesn't exist."""
+        import entrypoint as ep
 
-        monkeypatch.setattr(entrypoint, "CGROUP_ROOT", cg_root)
-        monkeypatch.setattr(entrypoint, "CGROUP_AGENT", agent_dir)
-
-        # The write to cgroup.procs will fail (not real cgroup), but should not raise
-        entrypoint.setup_cgroup_delegation()
+        original = ep.CGD_SOCKET
+        ep.CGD_SOCKET = tmp_path / "no-such-socket"
+        try:
+            ep.setup_cgroup_delegation()
+            captured = capsys.readouterr()
+            assert "not available" in captured.err
+        finally:
+            ep.CGD_SOCKET = original
 
 
 class TestMainFunction:

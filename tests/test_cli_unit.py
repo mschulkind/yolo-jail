@@ -51,6 +51,13 @@ from cli import (  # noqa: E402
     _load_jsonc_file,
     _merge_lists,
     ConfigError,
+    _validate_cgroup_name,
+    _parse_memory_value,
+    _cgd_ensure_agent_cgroup,
+    _cgd_create_and_join,
+    _cgd_destroy,
+    start_cgroup_delegate,
+    stop_cgroup_delegate,
 )
 
 
@@ -1390,3 +1397,125 @@ class TestEstimateImageSize:
             )
             result = _estimate_image_size("/nix/store/test", sentinel)
             assert result == 987654321
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Test: Cgroup delegate daemon helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestCgroupValidation:
+    """Test cgroup name validation and memory parsing."""
+
+    def test_valid_names(self):
+        assert _validate_cgroup_name("job-1234")
+        assert _validate_cgroup_name("training")
+        assert _validate_cgroup_name("my_job.v2")
+        assert _validate_cgroup_name("a")
+
+    def test_invalid_names(self):
+        assert not _validate_cgroup_name("")
+        assert not _validate_cgroup_name("../escape")
+        assert not _validate_cgroup_name("/absolute")
+        assert not _validate_cgroup_name(".hidden")
+        assert not _validate_cgroup_name("-dash-start")
+        assert not _validate_cgroup_name("a" * 65)  # Too long
+        assert not _validate_cgroup_name("has space")
+        assert not _validate_cgroup_name("has/slash")
+
+    def test_parse_memory_bytes(self):
+        assert _parse_memory_value("1073741824") == 1073741824
+
+    def test_parse_memory_suffix_g(self):
+        assert _parse_memory_value("2g") == 2 * 1073741824
+
+    def test_parse_memory_suffix_m(self):
+        assert _parse_memory_value("512m") == 512 * 1048576
+
+    def test_parse_memory_suffix_k(self):
+        assert _parse_memory_value("1024k") == 1024 * 1024
+
+    def test_parse_memory_invalid(self):
+        assert _parse_memory_value("not-a-number") is None
+        assert _parse_memory_value("") is None
+
+
+class TestCgroupDaemonOps:
+    """Test cgroup delegate daemon operations against a fake cgroup tree."""
+
+    def _make_cgroup_tree(self, tmp_path):
+        """Create a fake cgroup hierarchy for testing."""
+        cg = tmp_path / "cgroup"
+        cg.mkdir()
+        (cg / "cgroup.controllers").write_text("cpu memory pids\n")
+        (cg / "cgroup.procs").write_text("")
+        (cg / "cgroup.subtree_control").write_text("")
+        return cg
+
+    def test_ensure_agent_cgroup_creates_hierarchy(self, tmp_path):
+        cg = self._make_cgroup_tree(tmp_path)
+        log = open(os.devnull, "w")
+        result = _cgd_ensure_agent_cgroup(cg, log)
+        assert result is not None
+        assert (cg / "agent").is_dir()
+        assert (cg / "init").is_dir()
+
+    def test_ensure_agent_cgroup_idempotent(self, tmp_path):
+        cg = self._make_cgroup_tree(tmp_path)
+        log = open(os.devnull, "w")
+        r1 = _cgd_ensure_agent_cgroup(cg, log)
+        r2 = _cgd_ensure_agent_cgroup(cg, log)
+        assert r1 == r2
+
+    def test_destroy_nonexistent_is_ok(self, tmp_path):
+        cg = self._make_cgroup_tree(tmp_path)
+        (cg / "agent").mkdir()
+        log = open(os.devnull, "w")
+        result = _cgd_destroy(cg, "no-such-job", log)
+        assert result["ok"]
+
+    def test_create_and_join_invalid_name(self, tmp_path):
+        cg = self._make_cgroup_tree(tmp_path)
+        log = open(os.devnull, "w")
+        # _cgd_create_and_join is called by the handler after name validation,
+        # but let's test the daemon helper directly
+        _cgd_ensure_agent_cgroup(cg, log)
+        # Direct call with valid name — PID validation is in handler, not here.
+        # On fake fs, write will succeed (no real cgroup.procs semantics),
+        # so this should return ok=True.
+        result = _cgd_create_and_join(cg, "test-job", {}, 0, log)
+        assert result["ok"]
+
+    def test_create_and_join_creates_job_dir(self, tmp_path):
+        cg = self._make_cgroup_tree(tmp_path)
+        log = open(os.devnull, "w")
+        _cgd_ensure_agent_cgroup(cg, log)
+        # PID write will fail (fake fs), but directory should be created
+        _cgd_create_and_join(cg, "test-job", {"cpu_pct": 50}, 999, log)
+        assert (cg / "agent" / "test-job").is_dir()
+        # Result will show error from trying to write to fake cgroup.procs
+        # but that's expected — the important thing is the dir was created
+
+
+class TestCgroupDaemonSocket:
+    """Test start/stop lifecycle of the cgroup delegate daemon."""
+
+    def test_start_stop_lifecycle(self, tmp_path):
+        """Daemon starts and stops cleanly."""
+        socket_dir = tmp_path / "cgd"
+        # Mock _resolve_container_cgroup since no real container
+        with patch("cli._resolve_container_cgroup", return_value=None):
+            thread = start_cgroup_delegate("test-cname", "podman", socket_dir)
+        if thread is None:
+            pytest.skip("cgroup v2 not available on this host")
+        assert thread.is_alive()
+        assert (socket_dir / "cgroup.sock").exists()
+        stop_cgroup_delegate(thread, socket_dir)
+        assert not thread.is_alive()
+
+    def test_start_returns_none_without_cgroupv2(self, tmp_path):
+        """Returns None when cgroup v2 is not available."""
+        socket_dir = tmp_path / "cgd"
+        with patch("pathlib.Path.exists", return_value=False):
+            result = start_cgroup_delegate("test", "podman", socket_dir)
+        assert result is None

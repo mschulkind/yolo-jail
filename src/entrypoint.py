@@ -249,9 +249,10 @@ fc-cache -f >/dev/null 2>&1
 
 # Keep agent CLIs current in the npm-global prefix that the jail prioritizes on PATH.
 # Their built-in self-updaters are disabled in jail config/launchers, so startup owns
-# the update step instead.
+# the update step instead.  --prefer-online forces npm to check the registry instead
+# of trusting its local metadata cache (which can keep stale @latest tag resolutions).
 if command -v npm >/dev/null; then
-    if ! YOLO_BYPASS_SHIMS=1 npm install -g @google/gemini-cli@latest @github/copilot@latest; then
+    if ! YOLO_BYPASS_SHIMS=1 npm install -g --prefer-online @google/gemini-cli@latest @github/copilot@latest; then
         echo "Warning: failed to update gemini/copilot via npm; continuing with installed versions" >&2
     fi
 fi
@@ -346,14 +347,20 @@ def generate_mise_config():
     except (ValueError, TypeError):
         injected_tools = {}
 
-    # Base tools always present in the jail
+    # Base tools always present in the jail.
+    # NOTE: copilot and gemini are NOT managed by mise — the bootstrap script
+    # handles their installation via npm install -g to avoid mise's version
+    # cache preventing updates to @latest.
     base_tools = {
         "node": "22",
         "python": "3.13",
         "go": "latest",
-        "gemini": "latest",
-        '"npm:@github/copilot"': "latest",
     }
+
+    # Tools that used to be in base_tools but are now bootstrap-managed.
+    # Remove from existing configs to avoid stale mise-cached versions
+    # shadowing the always-fresh npm global installs.
+    retired_tools = ['"npm:@github/copilot"', "gemini"]
 
     if not config_path.exists():
         MISE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -368,10 +375,19 @@ def generate_mise_config():
     # Update existing config:
     # - base_tools: add if missing (don't overwrite user customizations)
     # - injected_tools: always add or update (explicit overrides from config)
+    # - retired_tools: remove if present (moved to bootstrap npm install)
     import re
 
     content = config_path.read_text()
     changed = False
+
+    # Remove retired tools (now managed by bootstrap npm install, not mise)
+    for tool in retired_tools:
+        pattern = rf'^{re.escape(tool)}\s*=\s*"[^"]*"\n?'
+        new_content = re.sub(pattern, "", content, flags=re.MULTILINE)
+        if new_content != content:
+            content = new_content
+            changed = True
 
     # Ensure all base tools are present (add missing ones only)
     for tool, version in base_tools.items():
@@ -831,230 +847,167 @@ def configure_gemini():
 
 
 # ---------------------------------------------------------------------------
-# 10. Cgroup v2 delegation (in-jail resource management)
+# 10. Cgroup delegation via host-side daemon (socket client)
 # ---------------------------------------------------------------------------
+# The host runs a cgroup delegate daemon that listens on a Unix socket at
+# /tmp/yolo-cgd/cgroup.sock.  The container-side yolo-cglimit sends JSON
+# requests to create child cgroups, set limits, and move processes.  This
+# avoids needing CAP_SYS_ADMIN or rw cgroup mounts inside the container.
+# All privileged cgroup operations happen on the host, with strict validation.
 
-CGROUP_ROOT = Path("/sys/fs/cgroup")
-CGROUP_INIT = CGROUP_ROOT / "init"
-CGROUP_AGENT = CGROUP_ROOT / "agent"
+CGD_SOCKET = Path("/tmp/yolo-cgd/cgroup.sock")
 
 
 def setup_cgroup_delegation():
-    """Make cgroup v2 writable and set up delegation for in-jail resource management.
+    """Check if cgroup delegation is available via the host-side daemon.
 
-    This enables agents to create child cgroups under /sys/fs/cgroup/agent/
-    to enforce CPU, memory, and PID limits on sub-processes.
+    The host-side cgroup delegate daemon (started by cli.py) listens on a
+    Unix socket mounted at /tmp/yolo-cgd/cgroup.sock.  This function just
+    verifies the socket exists — all actual cgroup work is done by the host
+    daemon when yolo-cglimit sends requests.
 
-    The setup:
-    1. Remount /sys/fs/cgroup as read-write (requires CAP_SYS_ADMIN + private cgroupns)
-    2. Create 'init' and 'agent' child cgroups
-    3. Move all existing processes to 'init' (cgroup v2 "no internal process" constraint)
-    4. Enable cpu, memory, pids controllers on root and agent subtrees
-    5. Move current process to 'agent' so exec'd command inherits it
-
-    Idempotent: skips if already set up (e.g. exec into existing container).
-    Silent on failure: falls back to nice/timeout/ulimit in non-delegated jails.
+    Silent on absence: falls back to nice/timeout/ulimit in non-delegated jails.
     """
-    if not CGROUP_ROOT.exists():
-        return
-
-    # Check if already delegated (exec into existing container)
-    if CGROUP_AGENT.exists():
-        # Just move current process into the agent cgroup
-        try:
-            (CGROUP_AGENT / "cgroup.procs").write_text(str(os.getpid()))
-        except OSError:
-            pass
-        return
-
-    # Check if cgroup v2 (unified hierarchy)
-    try:
-        controllers_path = CGROUP_ROOT / "cgroup.controllers"
-        if not controllers_path.exists():
-            return
-    except OSError:
-        return
-
-    # Step 1: Remount cgroup as read-write
-    try:
-        subprocess.run(
-            ["mount", "-o", "remount,rw", "/sys/fs/cgroup"],
-            capture_output=True,
-            timeout=5,
+    if CGD_SOCKET.exists():
+        print("  cgroup delegate: available (host-side daemon)", file=sys.stderr)
+    else:
+        print(
+            "  cgroup delegate: not available (no host daemon socket)", file=sys.stderr
         )
-        # Verify it's writable
-        test_dir = CGROUP_ROOT / ".yolo-test"
-        try:
-            test_dir.mkdir()
-            test_dir.rmdir()
-        except OSError:
-            return  # Still read-only, bail out silently
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return  # mount command failed or not available
-
-    # Step 2: Create child cgroups
-    try:
-        CGROUP_INIT.mkdir(exist_ok=True)
-        CGROUP_AGENT.mkdir(exist_ok=True)
-    except OSError:
-        return
-
-    # Step 3: Move all existing processes to 'init' cgroup
-    # (cgroup v2 requires no processes in a cgroup that has subtree_control enabled)
-    try:
-        procs = (CGROUP_ROOT / "cgroup.procs").read_text().strip().split()
-        init_procs = CGROUP_INIT / "cgroup.procs"
-        for pid in procs:
-            try:
-                init_procs.write_text(pid)
-            except OSError:
-                pass  # Process may have exited or be unmovable (kthread)
-    except OSError:
-        return
-
-    # Step 4: Enable controllers on root subtree
-    try:
-        available = (CGROUP_ROOT / "cgroup.controllers").read_text().strip().split()
-        wanted = [c for c in ["cpu", "memory", "pids"] if c in available]
-        if wanted:
-            control_str = " ".join(f"+{c}" for c in wanted)
-            (CGROUP_ROOT / "cgroup.subtree_control").write_text(control_str)
-    except OSError:
-        pass  # Non-fatal: some controllers may not be delegatable
-
-    # Step 5: Enable controllers on agent subtree (so child cgroups get them)
-    try:
-        available = (CGROUP_AGENT / "cgroup.controllers").read_text().strip().split()
-        wanted = [c for c in ["cpu", "memory", "pids"] if c in available]
-        if wanted:
-            control_str = " ".join(f"+{c}" for c in wanted)
-            (CGROUP_AGENT / "cgroup.subtree_control").write_text(control_str)
-    except OSError:
-        pass
-
-    # Step 6: Move current process to 'agent' cgroup
-    try:
-        (CGROUP_AGENT / "cgroup.procs").write_text(str(os.getpid()))
-    except OSError:
-        pass
 
 
 def generate_cglimit_script():
-    """Generate yolo-cglimit helper for agents to limit sub-process resources.
+    """Generate yolo-cglimit helper that delegates to the host-side cgroup daemon.
 
     Usage: yolo-cglimit [--cpu PCT] [--memory LIMIT] [--pids LIMIT] [--name NAME] -- COMMAND...
-    Creates a child cgroup under /sys/fs/cgroup/agent/<name>, sets limits, and execs.
+    Sends a request to the host-side daemon via Unix socket, which creates
+    a child cgroup, sets limits, and moves the caller's process into it.
     """
     script_dir = HOME / ".local" / "bin"
     script_dir.mkdir(parents=True, exist_ok=True)
     script_path = script_dir / "yolo-cglimit"
 
-    script_path.write_text(r"""#!/bin/bash
-# yolo-cglimit — Run a command under cgroup v2 resource limits.
-#
-# Usage: yolo-cglimit [OPTIONS] -- COMMAND [ARGS...]
-#
-# Options:
-#   --cpu PCT       CPU limit as percentage of ALL CPUs (e.g. 75 = 75% of total CPU)
-#   --memory LIMIT  Memory limit (e.g. 512m, 2g, 1073741824)
-#   --pids LIMIT    Max number of processes
-#   --name NAME     Cgroup name (default: auto-generated from PID)
-#
-# Examples:
-#   yolo-cglimit --cpu 75 -- python train.py           # 75% of all CPUs
-#   yolo-cglimit --cpu 50 --memory 2g -- make -j8      # 50% CPU + 2GB RAM
-#   yolo-cglimit --pids 100 -- ./fork-heavy-script.sh  # Max 100 processes
-#
-# Requires cgroup v2 delegation (enabled automatically in YOLO Jail).
+    # Python script that talks to the host daemon via Unix socket.
+    # Uses only stdlib (socket, json, os, sys) — no pip deps.
+    script_path.write_text(r'''#!/usr/bin/env python3
+"""yolo-cglimit — Run a command under cgroup v2 resource limits.
 
-set -euo pipefail
+Usage: yolo-cglimit [OPTIONS] -- COMMAND [ARGS...]
 
-CGROUP_AGENT="/sys/fs/cgroup/agent"
-CPU_PCT=""
-MEMORY=""
-PIDS=""
-NAME=""
+Options:
+  --cpu PCT       CPU limit as percentage of ALL CPUs (e.g. 75 = 75% of total)
+  --memory LIMIT  Memory limit (e.g. 512m, 2g, 1073741824)
+  --pids LIMIT    Max number of processes
+  --name NAME     Cgroup name (default: auto-generated from PID)
 
-# Parse arguments
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --cpu) CPU_PCT="$2"; shift 2 ;;
-        --memory) MEMORY="$2"; shift 2 ;;
-        --pids) PIDS="$2"; shift 2 ;;
-        --name) NAME="$2"; shift 2 ;;
-        --) shift; break ;;
-        -h|--help)
-            sed -n '2,/^$/{ s/^# //; s/^#//; p; }' "$0"
-            exit 0
-            ;;
-        *) echo "Unknown option: $1" >&2; exit 1 ;;
-    esac
-done
+Examples:
+  yolo-cglimit --cpu 75 -- python train.py           # 75% of all CPUs
+  yolo-cglimit --cpu 50 --memory 2g -- make -j8      # 50% CPU + 2GB RAM
+  yolo-cglimit --pids 100 -- ./fork-heavy-script.sh  # Max 100 processes
 
-if [[ $# -eq 0 ]]; then
-    echo "Error: no command specified. Usage: yolo-cglimit [OPTIONS] -- COMMAND" >&2
-    exit 1
-fi
+Resource limits are enforced by the kernel via cgroup v2 and cannot be exceeded.
+The host-side daemon handles all privileged cgroup operations securely.
+"""
+import json
+import os
+import socket
+import sys
 
-# Verify cgroup delegation is available
-if [[ ! -d "$CGROUP_AGENT" ]] || [[ ! -w "$CGROUP_AGENT" ]]; then
-    echo "Error: cgroup delegation not available. /sys/fs/cgroup/agent/ is missing or read-only." >&2
-    echo "Hint: cgroup delegation requires CAP_SYS_ADMIN and --cgroupns=private." >&2
-    exit 1
-fi
+CGD_SOCKET = "/tmp/yolo-cgd/cgroup.sock"
 
-# Generate cgroup name
-if [[ -z "$NAME" ]]; then
-    NAME="job-$$"
-fi
-CG_PATH="$CGROUP_AGENT/$NAME"
 
-# Create child cgroup
-mkdir -p "$CG_PATH"
+def send_request(request: dict) -> dict:
+    """Send a JSON request to the host-side cgroup delegate daemon."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(CGD_SOCKET)
+        sock.sendall((json.dumps(request) + "\n").encode())
+        data = b""
+        while b"\n" not in data and len(data) < 8192:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return json.loads(data.decode())
+    finally:
+        sock.close()
 
-# Helper: parse memory suffixes to bytes
-parse_memory() {
-    local val="$1"
-    case "${val,,}" in
-        *g) echo $(( ${val%[gG]} * 1073741824 )) ;;
-        *m) echo $(( ${val%[mM]} * 1048576 )) ;;
-        *k) echo $(( ${val%[kK]} * 1024 )) ;;
-        *b) echo "${val%[bB]}" ;;
-        *)  echo "$val" ;;
-    esac
-}
 
-# Set CPU limit (cpu.max: quota period_us)
-# PCT% of all CPUs = (PCT * 1000 * nproc) quota per 100000 period
-if [[ -n "$CPU_PCT" ]]; then
-    nproc=$(nproc)
-    quota=$(( CPU_PCT * 1000 * nproc ))
-    period=100000
-    echo "$quota $period" > "$CG_PATH/cpu.max" 2>/dev/null || \
-        echo "Warning: could not set cpu.max" >&2
-fi
+def main():
+    cpu_pct = None
+    memory = None
+    pids = None
+    name = None
+    command = []
 
-# Set memory limit
-if [[ -n "$MEMORY" ]]; then
-    bytes=$(parse_memory "$MEMORY")
-    echo "$bytes" > "$CG_PATH/memory.max" 2>/dev/null || \
-        echo "Warning: could not set memory.max" >&2
-fi
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        if args[i] == "--cpu" and i + 1 < len(args):
+            cpu_pct = int(args[i + 1])
+            i += 2
+        elif args[i] == "--memory" and i + 1 < len(args):
+            memory = args[i + 1]
+            i += 2
+        elif args[i] == "--pids" and i + 1 < len(args):
+            pids = int(args[i + 1])
+            i += 2
+        elif args[i] == "--name" and i + 1 < len(args):
+            name = args[i + 1]
+            i += 2
+        elif args[i] == "--":
+            command = args[i + 1:]
+            break
+        elif args[i] in ("-h", "--help"):
+            print(__doc__)
+            sys.exit(0)
+        else:
+            print(f"Unknown option: {args[i]}", file=sys.stderr)
+            sys.exit(1)
 
-# Set PID limit
-if [[ -n "$PIDS" ]]; then
-    echo "$PIDS" > "$CG_PATH/pids.max" 2>/dev/null || \
-        echo "Warning: could not set pids.max" >&2
-fi
+    if not command:
+        print("Error: no command specified. Usage: yolo-cglimit [OPTIONS] -- COMMAND",
+              file=sys.stderr)
+        sys.exit(1)
 
-# Move self into the cgroup and exec
-echo $$ > "$CG_PATH/cgroup.procs" 2>/dev/null || {
-    echo "Error: could not move process into cgroup" >&2
-    exit 1
-}
+    if not os.path.exists(CGD_SOCKET):
+        print("Error: cgroup delegation not available — host daemon socket not found.",
+              file=sys.stderr)
+        print("This requires the jail to be started with the yolo CLI (which runs the",
+              file=sys.stderr)
+        print("host-side cgroup delegate daemon automatically).", file=sys.stderr)
+        sys.exit(1)
 
-exec "$@"
-""")
+    # Build the request
+    request = {"op": "create_and_join", "name": name or f"job-{os.getpid()}"}
+    if cpu_pct is not None:
+        request["cpu_pct"] = cpu_pct
+    if memory is not None:
+        request["memory"] = memory
+    if pids is not None:
+        request["pids"] = pids
+
+    try:
+        resp = send_request(request)
+    except Exception as e:
+        print(f"Error: failed to contact cgroup daemon: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not resp.get("ok"):
+        print(f"Error: {resp.get('error', 'unknown error')}", file=sys.stderr)
+        sys.exit(1)
+
+    if resp.get("warnings"):
+        for w in resp["warnings"]:
+            print(f"Warning: {w}", file=sys.stderr)
+
+    # exec the command — we're already in the cgroup (daemon moved us via SO_PEERCRED)
+    os.execvp(command[0], command)
+
+
+if __name__ == "__main__":
+    main()
+''')
     script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC)
 
 
