@@ -4039,7 +4039,7 @@ def run(
         # Wrap each phase with timing output for profiling
         final_internal_cmd = (
             "exec 3>&2; "  # save stderr
-            f"_t0=$(date +%s%N); {setup_script} >/dev/null 2>&1; "
+            f"_t0=$(date +%s%N); {setup_script} >/dev/null; "
             "_t1=$(date +%s%N); "
             f"{mise_activate}; "
             "_t2=$(date +%s%N); "
@@ -4067,7 +4067,7 @@ def run(
         )
     else:
         final_internal_cmd = (
-            f"{setup_script} >/dev/null 2>&1 && {mise_activate}; {target_cmd}"
+            f"{setup_script} >/dev/null && {mise_activate}; {target_cmd}"
         )
 
     docker_cmd.append(final_internal_cmd)

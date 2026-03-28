@@ -252,9 +252,21 @@ fc-cache -f >/dev/null 2>&1
 # the update step instead.  --prefer-online forces npm to check the registry instead
 # of trusting its local metadata cache (which can keep stale @latest tag resolutions).
 if command -v npm >/dev/null; then
-    if ! YOLO_BYPASS_SHIMS=1 npm install -g --prefer-online @google/gemini-cli@latest @github/copilot@latest; then
-        echo "Warning: failed to update gemini/copilot via npm; continuing with installed versions" >&2
+    if ! YOLO_BYPASS_SHIMS=1 npm install -g --prefer-online @google/gemini-cli@latest @github/copilot@latest 2>&1; then
+        echo "Warning: failed to update gemini/copilot via npm; retrying once..." >&2
+        sleep 2
+        YOLO_BYPASS_SHIMS=1 npm install -g --prefer-online @google/gemini-cli@latest @github/copilot@latest 2>&1 || \
+            echo "Warning: copilot/gemini install failed after retry; continuing with installed versions" >&2
     fi
+    # Verify the binaries actually exist — npm can succeed without creating bin links
+    # if the package is already installed at the same version.
+    for bin in copilot gemini; do
+        if ! [ -x "$NPM_CONFIG_PREFIX/bin/$bin" ]; then
+            echo "Warning: $bin binary missing after npm install; attempting reinstall..." >&2
+            YOLO_BYPASS_SHIMS=1 npm install -g --prefer-online --force @github/copilot@latest @google/gemini-cli@latest 2>&1 || true
+            break
+        fi
+    done
 fi
 
 # Install binaries if missing.
