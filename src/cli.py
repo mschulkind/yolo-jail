@@ -1535,7 +1535,7 @@ def _add_loaded_path(sentinel: Path, store_path: str):
 
 def auto_load_image(
     repo_root: Path,
-    extra_packages: List[Union[str, dict]] = None,
+    extra_packages: Optional[List[Union[str, dict]]] = None,
     runtime: str = "docker",
 ):
     """Cheaply check if the nix image needs to be reloaded into the container runtime."""
@@ -1703,6 +1703,8 @@ def load_config(
     return merge_config(user_config, workspace_config)
 
 
+DEFAULT_HOST_CLAUDE_FILES = ["settings.json"]
+
 KNOWN_TOP_LEVEL_CONFIG_KEYS = {
     "runtime",
     "repo_path",
@@ -1717,6 +1719,7 @@ KNOWN_TOP_LEVEL_CONFIG_KEYS = {
     "devices",
     "gpu",
     "resources",
+    "host_claude_files",
 }
 KNOWN_NETWORK_KEYS = {"mode", "ports", "forward_host_ports"}
 KNOWN_SECURITY_KEYS = {"blocked_tools"}
@@ -1893,6 +1896,21 @@ def _validate_config(
                 if not resolved_host.exists():
                     warnings.append(
                         f"{path}: host path does not exist and will be skipped: {resolved_host}"
+                    )
+
+    host_claude_files = config.get("host_claude_files")
+    if host_claude_files is not None:
+        if not isinstance(host_claude_files, list):
+            errors.append("config.host_claude_files: expected a list of strings")
+        else:
+            for idx, entry in enumerate(host_claude_files):
+                if not isinstance(entry, str):
+                    errors.append(
+                        f"config.host_claude_files[{idx}]: expected a string"
+                    )
+                elif "/" in entry or "\\" in entry:
+                    errors.append(
+                        f"config.host_claude_files[{idx}]: must be a filename, not a path"
                     )
 
     network = config.get("network")
@@ -2535,6 +2553,17 @@ def config_ref():
     Search package names: https://search.nixos.org/packages
     Image rebuilds only when this list changes.
     Nix caches builds — identical configs across jails share cached results.
+
+  [bold]host_claude_files[/bold] (array of strings): Host ~/.claude/ files to sync into the jail.
+    Each entry is a filename (not a path) relative to ~/.claude/.
+    Files are mounted read-only at /ctx/host-claude/ and copied into the jail's
+    ~/.claude/ on startup. For settings.json, host settings are deep-merged with
+    YOLO-required overrides (YOLO wins on conflicts).
+    The fileSuggestion script referenced in host settings.json is auto-discovered
+    and synced (if it lives under ~/.claude/) — no need to list it explicitly.
+    Default: ["settings.json"]
+    Set to [] to disable host claude file syncing.
+    Example: ["settings.json", "keybindings.json"]
 
   [bold]mounts[/bold] (array of strings): Extra host paths mounted read-only.
     Simple path → mounted at /ctx/<basename>
@@ -3560,6 +3589,7 @@ def run(
     lsp_servers = config.get("lsp_servers", {})
     mcp_servers = config.get("mcp_servers", {})
     mcp_presets = config.get("mcp_presets", [])
+    host_claude_files = config.get("host_claude_files", DEFAULT_HOST_CLAUDE_FILES)
     auto_load_image(repo_root, extra_packages=extra_packages or None, runtime=runtime)
 
     # Resolve host mise path — share the same data dir so venv paths match.
@@ -4060,6 +4090,55 @@ def run(
             docker_cmd.extend(
                 ["-v", f"{host_dotfiles_skills}:{host_dotfiles_skills}:ro"]
             )
+
+    # Mount host ~/.claude/ files for syncing into the jail.
+    # Auto-discover scripts referenced in host settings.json (fileSuggestion,
+    # statusLine, hooks) and include them if they live under ~/.claude/.
+    host_claude_dir = Path.home() / ".claude"
+    effective_claude_files = list(host_claude_files)
+    host_settings_file = host_claude_dir / "settings.json"
+    if host_settings_file.exists():
+        try:
+            host_settings = json.loads(host_settings_file.read_text())
+            # Collect all command paths referenced in settings
+            script_cmds: List[str] = []
+            for key in ("fileSuggestion", "statusLine"):
+                cmd = (host_settings.get(key) or {}).get("command", "")
+                if cmd:
+                    script_cmds.append(cmd)
+            # Walk hooks: {"EventName": [{"hooks": [{"command": "..."}]}]}
+            for _event, matchers in (host_settings.get("hooks") or {}).items():
+                if not isinstance(matchers, list):
+                    continue
+                for matcher in matchers:
+                    for hook in (matcher.get("hooks") or []):
+                        cmd = hook.get("command", "") if isinstance(hook, dict) else ""
+                        if cmd:
+                            script_cmds.append(cmd)
+            # Add scripts that live under ~/.claude/
+            for cmd in script_cmds:
+                resolved = Path(cmd.replace("~", str(Path.home())))
+                try:
+                    resolved.relative_to(host_claude_dir)
+                    fname = resolved.name
+                    if fname not in effective_claude_files:
+                        effective_claude_files.append(fname)
+                except ValueError:
+                    pass  # script lives outside ~/.claude/, must mount manually
+        except (json.JSONDecodeError, OSError):
+            pass
+    mounted_claude_files = []
+    for fname in effective_claude_files:
+        host_file = host_claude_dir / fname
+        if host_file.exists() and host_file.is_file():
+            docker_cmd.extend(
+                ["-v", f"{host_file}:/ctx/host-claude/{fname}:ro"]
+            )
+            mounted_claude_files.append(fname)
+    if mounted_claude_files:
+        docker_cmd.extend(
+            ["-e", f"YOLO_HOST_CLAUDE_FILES={json.dumps(mounted_claude_files)}"]
+        )
 
     # Generate per-workspace AGENTS.md / CLAUDE.md (separate for each agent to
     # respect user-level ~/.copilot/AGENTS.md, ~/.gemini/AGENTS.md, ~/.claude/CLAUDE.md)

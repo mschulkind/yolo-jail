@@ -455,6 +455,15 @@ except Exception:
 # ---------------------------------------------------------------------------
 
 
+def _toml_key(key: str) -> str:
+    """Quote a TOML key if it contains characters that aren't valid in bare keys."""
+    import re as _re
+
+    if _re.fullmatch(r"[A-Za-z0-9_-]+", key):
+        return key
+    return f'"{key}"'
+
+
 def generate_mise_config():
     """Write global mise config, injecting tools from YOLO_MISE_TOOLS."""
     config_path = MISE_CONFIG_DIR / "config.toml"
@@ -491,9 +500,9 @@ def generate_mise_config():
         MISE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         lines = ["[tools]"]
         for tool, version in base_tools.items():
-            lines.append(f'{tool} = "{version}"')
+            lines.append(f'{_toml_key(tool)} = "{version}"')
         for tool, version in injected_tools.items():
-            lines.append(f'{tool} = "{version}"')
+            lines.append(f'{_toml_key(tool)} = "{version}"')
         config_path.write_text("\n".join(lines) + "\n")
         return
 
@@ -516,23 +525,25 @@ def generate_mise_config():
 
     # Ensure all base tools are present (add missing ones only)
     for tool, version in base_tools.items():
-        pattern = rf'^{re.escape(tool)}\s*=\s*"[^"]*"'
+        tk = _toml_key(tool)
+        pattern = rf'^"?{re.escape(tool)}"?\s*=\s*"[^"]*"'
         if not re.search(pattern, content, re.MULTILINE):
-            content = content.rstrip("\n") + f'\n{tool} = "{version}"\n'
+            content = content.rstrip("\n") + f'\n{tk} = "{version}"\n'
             changed = True
 
     # Injected tools always override
     for tool, version in injected_tools.items():
-        pattern = rf'^{re.escape(tool)}\s*=\s*"[^"]*"'
+        tk = _toml_key(tool)
+        pattern = rf'^"?{re.escape(tool)}"?\s*=\s*"[^"]*"'
         if re.search(pattern, content, re.MULTILINE):
             new_content = re.sub(
-                pattern, f'{tool} = "{version}"', content, flags=re.MULTILINE
+                pattern, f'{tk} = "{version}"', content, flags=re.MULTILINE
             )
             if new_content != content:
                 content = new_content
                 changed = True
         else:
-            content = content.rstrip("\n") + f'\n{tool} = "{version}"\n'
+            content = content.rstrip("\n") + f'\n{tk} = "{version}"\n'
             changed = True
 
     if changed:
@@ -1047,6 +1058,42 @@ def _install_claude_plugins(plugin_map: dict, lsp_servers: dict):
             pass  # non-fatal — plugin will be installed on next boot
 
 
+def _sync_host_claude_files():
+    """Copy host ~/.claude/ files into the jail, except settings.json (merged separately)."""
+    import json as _json
+
+    host_claude_files = _json.loads(os.environ.get("YOLO_HOST_CLAUDE_FILES", "[]"))
+    host_claude_dir = Path("/ctx/host-claude")
+
+    for fname in host_claude_files:
+        if fname == "settings.json":
+            continue  # handled by configure_claude() via deep-merge
+        src = host_claude_dir / fname
+        dst = CLAUDE_DIR / fname
+        if src.exists():
+            try:
+                shutil.copy2(str(src), str(dst))
+            except OSError as e:
+                print(f"Warning: could not copy host claude file {fname}: {e}",
+                      file=sys.stderr)
+
+
+def _load_host_claude_settings() -> dict:
+    """Load host settings.json from /ctx/host-claude/ if available."""
+    import json as _json
+
+    host_claude_files = _json.loads(os.environ.get("YOLO_HOST_CLAUDE_FILES", "[]"))
+    if "settings.json" not in host_claude_files:
+        return {}
+    host_settings_path = Path("/ctx/host-claude/settings.json")
+    if not host_settings_path.exists():
+        return {}
+    try:
+        return _json.loads(host_settings_path.read_text())
+    except (ValueError, OSError):
+        return {}
+
+
 def configure_claude():
     """Set up Claude Code: settings.json (permissions, plugins) + ~/.claude.json (MCP)."""
     CLAUDE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1056,8 +1103,14 @@ def configure_claude():
 
     configured_servers = _load_mcp_servers()
 
+    # Sync non-settings host claude files first
+    _sync_host_claude_files()
+
     try:
         # --- settings.json: permissions, preferences, plugins ---
+        # Start from host settings (deep-merge base), then layer YOLO overrides
+        host_settings = _load_host_claude_settings()
+
         if settings_path.exists():
             try:
                 settings = json.loads(settings_path.read_text())
@@ -1065,6 +1118,17 @@ def configure_claude():
                 settings = {}
         else:
             settings = {}
+
+        # Deep-merge: host settings provide the base, existing jail settings
+        # override, then YOLO-required keys override everything below.
+        for key, val in host_settings.items():
+            if key not in settings:
+                settings[key] = val
+            elif isinstance(val, dict) and isinstance(settings[key], dict):
+                # Merge dicts one level deep (host fills gaps)
+                for k, v in val.items():
+                    if k not in settings[key]:
+                        settings[key][k] = v
 
         # Remove any stale mcpServers from settings.json (moved to ~/.claude.json)
         settings.pop("mcpServers", None)

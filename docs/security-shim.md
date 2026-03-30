@@ -168,7 +168,7 @@ CONTAINER (untrusted)
   │     ├── Bootstrap script (install tools)
   │     └── yolo-cglimit (Python socket client)
   │
-  └── Agent (copilot, gemini, user commands)
+  └── Agent (claude, copilot, gemini, user commands)
         ├── Full workspace read/write
         ├── Network egress
         ├── Tool installation (npm, pip, mise)

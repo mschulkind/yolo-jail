@@ -87,6 +87,7 @@ Inside the jail, authenticate with your tools once:
 ```bash
 gh auth login          # GitHub CLI
 gemini login           # Google Gemini CLI
+# Claude Code authenticates via API key or OAuth on first run
 ```
 
 Tokens are stored in `~/.local/share/yolo-jail/home/` on the host and persist across jail restarts. You do **not** need to re-authenticate each time.
@@ -101,6 +102,7 @@ Tokens are stored in `~/.local/share/yolo-jail/home/` on the host and persist ac
 
 ```bash
 yolo                       # Interactive shell
+yolo -- claude             # Start Claude Code in YOLO mode
 yolo -- copilot            # Start Copilot (--yolo auto-injected)
 yolo -- gemini             # Start Gemini (--yolo auto-injected)
 yolo -- bash -c "make"     # Run a specific command
@@ -348,7 +350,7 @@ Set a preset server to `null` in `mcp_servers` to disable it even when listed in
 
 ## LSP Servers
 
-YOLO Jail configures LSP (Language Server Protocol) servers for both Copilot and Gemini. Three servers are always available:
+YOLO Jail configures LSP (Language Server Protocol) servers for Claude Code, Copilot, and Gemini. Three servers are always available:
 
 | Language | Server | Extensions |
 |----------|--------|------------|
@@ -376,6 +378,7 @@ Workspace servers are merged with defaults — you can add new ones or override 
 
 ### How It Works
 
+- **Claude Code** receives LSP servers via plugins or MCP
 - **Copilot** receives native LSP config via `~/.copilot/lsp-config.json`
 - **Gemini** receives LSP servers wrapped as MCP servers via `mcp-language-server`
 - Servers are spawned on-demand when agents analyze matching file types
@@ -588,10 +591,11 @@ Use an AWS Deep Learning AMI (DLAMI) — drivers and toolkit come pre-installed.
 
 | Data | Location (Host) | Shared? |
 |------|-----------------|---------|
-| Auth tokens (gh, gemini) | `~/.local/share/yolo-jail/home/` | All jails |
+| Auth tokens (gh, gemini, claude) | `~/.local/share/yolo-jail/home/` | All jails |
 | Installed tools (npm, go) | `~/.local/share/yolo-jail/home/` | All jails |
 | Mise tools & runtimes | `~/.local/share/mise/` | All jails + host |
 | Bash history | `<workspace>/.yolo/home/bash_history` | Per workspace |
+| Claude sessions | `<workspace>/.yolo/home/claude-projects/` | Per workspace |
 | Copilot sessions | `<workspace>/.yolo/home/copilot-sessions/` | Per workspace |
 | Gemini history | `<workspace>/.yolo/home/gemini-history/` | Per workspace |
 | SSH keys | `<workspace>/.yolo/home/ssh/` | Per workspace |
@@ -690,7 +694,7 @@ The CLI needs the source for nix image builds. Either:
 
 **MCP server not working**
 - Verify the preset is enabled in `mcp_presets`
-- Check logs: `~/.copilot/logs/` (Copilot) or `~/.cache/gemini-cli/logs/` (Gemini)
+- Check logs: `~/.copilot/logs/` (Copilot), `~/.cache/gemini-cli/logs/` (Gemini), or `~/.claude/logs/` (Claude)
 - Inside jail, view logs:
   ```bash
   tail -100 ~/.copilot/logs/$(ls -1t ~/.copilot/logs | head -1)

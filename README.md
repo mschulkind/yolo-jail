@@ -3,15 +3,15 @@
 [![CI](https://github.com/mschulkind/yolo-jail/actions/workflows/ci.yml/badge.svg)](https://github.com/mschulkind/yolo-jail/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-A secure, isolated container environment for AI agents (Copilot, Gemini CLI) to safely modify codebases without compromising host security or identity. Supports both Docker and Podman runtimes.
+A secure, isolated container environment for AI agents (Claude Code, Copilot, Gemini CLI) to safely modify codebases without compromising host security or identity. Supports both Docker and Podman runtimes.
 
 ## Why?
 
-AI coding agents like GitHub Copilot and Google Gemini CLI have a `--yolo` mode that lets them run shell commands without confirmation. This is powerful but dangerous — agents can access your SSH keys, cloud credentials, git identity, and anything else on your machine.
+AI coding agents like Claude Code, GitHub Copilot, and Google Gemini CLI have a `--yolo` mode that lets them run shell commands without confirmation. This is powerful but dangerous — agents can access your SSH keys, cloud credentials, git identity, and anything else on your machine.
 
 **YOLO Jail** lets you run agents in YOLO mode safely by isolating them in a container with:
 - ❌ No access to `~/.ssh/`, `~/.gitconfig`, or cloud credentials
-- ✅ Separate auth (`gh auth login` and `gemini login` inside the jail)
+- ✅ Separate auth (`gh auth login`, `gemini login`, etc. inside the jail)
 - ✅ Your codebase mounted read-write at `/workspace`
 - ✅ Persistent tool state across restarts
 - ✅ Pre-configured MCP servers, LSP servers, and modern CLI tools
@@ -62,6 +62,7 @@ cd ~/code/my-project
 yolo
 
 # Or run a command directly
+yolo -- claude           # Claude Code in YOLO mode
 yolo -- copilot          # Copilot with --yolo auto-injected
 yolo -- gemini           # Gemini with --yolo auto-injected
 
@@ -98,6 +99,7 @@ Inside the jail, authenticate with your tools:
 ```bash
 gh auth login          # GitHub CLI
 gemini login           # Google Gemini CLI
+# Claude Code authenticates via API key or OAuth — see User Guide
 ```
 
 These tokens are stored in `~/.local/share/yolo-jail/home/` and persist across jail restarts.
@@ -130,7 +132,7 @@ Run `yolo config-ref` for the full configuration reference.
 ## Security
 
 - **Strict Isolation**: No access to host `~/.ssh/`, `~/.gitconfig`, or cloud credentials
-- **Separate Auth**: Run `gh auth login` and `gemini login` inside the jail once
+- **Separate Auth**: Run `gh auth login`, `gemini login`, etc. inside the jail once
 - **User Mapping**: Files created in the jail are owned by your host user (matching UID/GID)
 - **Blocked Tools**: Configurable list of tools that return clear error messages
 - **Config Safety**: Changes to `yolo-jail.jsonc` require human confirmation at next startup — agents cannot silently modify the jail environment. See [docs/config-safety.md](docs/config-safety.md).
