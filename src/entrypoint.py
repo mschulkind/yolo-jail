@@ -1074,8 +1074,10 @@ def _sync_host_claude_files():
             try:
                 shutil.copy2(str(src), str(dst))
             except OSError as e:
-                print(f"Warning: could not copy host claude file {fname}: {e}",
-                      file=sys.stderr)
+                print(
+                    f"Warning: could not copy host claude file {fname}: {e}",
+                    file=sys.stderr,
+                )
 
 
 def _load_host_claude_settings() -> dict:

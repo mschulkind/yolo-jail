@@ -26,6 +26,18 @@ app = typer.Typer(
 )
 
 
+def _version_callback(value: bool):
+    if value:
+        from importlib.metadata import version as pkg_version
+
+        try:
+            v = pkg_version("yolo-jail")
+        except Exception:
+            v = "unknown"
+        typer.echo(f"yolo-jail {v}")
+        raise typer.Exit()
+
+
 @app.callback()
 def _default(
     ctx: typer.Context,
@@ -39,6 +51,13 @@ def _default(
         False,
         "--profile",
         help="Show detailed startup performance timing after command exits",
+    ),
+    version: bool = typer.Option(
+        False,
+        "--version",
+        help="Show version and exit",
+        callback=_version_callback,
+        is_eager=True,
     ),
 ):
     """[bold]YOLO Jail[/bold] — Secure container environment for AI agents.
@@ -1905,9 +1924,7 @@ def _validate_config(
         else:
             for idx, entry in enumerate(host_claude_files):
                 if not isinstance(entry, str):
-                    errors.append(
-                        f"config.host_claude_files[{idx}]: expected a string"
-                    )
+                    errors.append(f"config.host_claude_files[{idx}]: expected a string")
                 elif "/" in entry or "\\" in entry:
                     errors.append(
                         f"config.host_claude_files[{idx}]: must be a filename, not a path"
@@ -4111,7 +4128,7 @@ def run(
                 if not isinstance(matchers, list):
                     continue
                 for matcher in matchers:
-                    for hook in (matcher.get("hooks") or []):
+                    for hook in matcher.get("hooks") or []:
                         cmd = hook.get("command", "") if isinstance(hook, dict) else ""
                         if cmd:
                             script_cmds.append(cmd)
@@ -4131,9 +4148,7 @@ def run(
     for fname in effective_claude_files:
         host_file = host_claude_dir / fname
         if host_file.exists() and host_file.is_file():
-            docker_cmd.extend(
-                ["-v", f"{host_file}:/ctx/host-claude/{fname}:ro"]
-            )
+            docker_cmd.extend(["-v", f"{host_file}:/ctx/host-claude/{fname}:ro"])
             mounted_claude_files.append(fname)
     if mounted_claude_files:
         docker_cmd.extend(
