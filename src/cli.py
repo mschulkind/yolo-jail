@@ -28,14 +28,85 @@ app = typer.Typer(
 
 def _version_callback(value: bool):
     if value:
-        from importlib.metadata import version as pkg_version
+        v = _git_describe_version()
+        if v is None:
+            from importlib.metadata import version as pkg_version
 
-        try:
-            v = pkg_version("yolo-jail")
-        except Exception:
-            v = "unknown"
+            try:
+                v = pkg_version("yolo-jail")
+            except Exception:
+                v = "unknown"
         typer.echo(f"yolo-jail {v}")
         raise typer.Exit()
+
+
+def _git_describe_version() -> "str | None":
+    """Derive a version string from ``git describe --tags --dirty --always``.
+
+    Returns a cleaned version such as ``0.1.0``, ``0.1.0+3.gabcdef1``, or
+    ``0.1.0+3.gabcdef1.dirty``.  Returns *None* when git is unavailable or
+    the command fails (e.g. not a git checkout).
+    """
+    try:
+        repo_root = _resolve_repo_root()
+    except Exception:
+        repo_root = Path(__file__).resolve().parent.parent
+
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--dirty", "--always"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            cwd=repo_root,
+        )
+        if result.returncode != 0:
+            return None
+        raw = result.stdout.strip()
+    except Exception:
+        return None
+
+    # Strip leading 'v' (e.g. v0.1.0 -> 0.1.0)
+    if raw.startswith("v"):
+        raw = raw[1:]
+
+    # git format: 0.1.0-3-gabcdef1-dirty  ->  0.1.0+3.gabcdef1.dirty
+    # Exactly on tag: 0.1.0              ->  0.1.0
+    # Dirty on tag:   0.1.0-dirty        ->  0.1.0.dirty
+    parts = raw.split("-")
+
+    # Find the boundary between the version and the extra components.
+    # Semantic versions contain hyphens too (e.g. 1.0.0-rc.1), so we look
+    # for the first part that is purely numeric (commit count) following at
+    # least one version-like segment.
+    # Strategy: walk from the end, collecting known suffixes.
+    dirty = False
+    if parts[-1] == "dirty":
+        dirty = True
+        parts = parts[:-1]
+
+    # Check if the last part is a git abbreviated hash (g<hex>)
+    commit_hash = None
+    commit_count = None
+    if len(parts) >= 2 and parts[-1].startswith("g") and parts[-2].isdigit():
+        commit_hash = parts[-1]
+        commit_count = parts[-2]
+        parts = parts[:-2]
+
+    base_version = "-".join(parts)
+
+    suffix_parts: list[str] = []
+    if commit_count is not None and commit_hash is not None:
+        suffix_parts.append(commit_count)
+        suffix_parts.append(commit_hash)
+    if dirty:
+        suffix_parts.append("dirty")
+
+    if suffix_parts:
+        # Use '+' to separate base version from build metadata, '.' between
+        # metadata components.
+        return f"{base_version}+{'.'.join(suffix_parts)}"
+    return base_version
 
 
 @app.callback()

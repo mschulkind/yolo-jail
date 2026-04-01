@@ -1552,6 +1552,7 @@ def _run_monkeypatch(monkeypatch, tmp_path):
     monkeypatch.setattr("cli.AGENTS_DIR", tmp_path / "agents")
     monkeypatch.setattr("cli.BUILD_DIR", tmp_path / "build")
     monkeypatch.setattr("cli.USER_CONFIG_PATH", tmp_path / "user-config.jsonc")
+    monkeypatch.setattr("time.sleep", lambda _: None)
     for d in (
         "home",
         "mise",
