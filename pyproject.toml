@@ -29,10 +29,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mschulkind/yolo-jail"
-Repository = "https://github.com/mschulkind/yolo-jail"
-Documentation = "https://github.com/mschulkind/yolo-jail/blob/main/docs/USER_GUIDE.md"
-Issues = "https://github.com/mschulkind/yolo-jail/issues"
+Homepage = "https://github.com/mschulkind-oss/yolo-jail"
+Repository = "https://github.com/mschulkind-oss/yolo-jail"
+Documentation = "https://github.com/mschulkind-oss/yolo-jail/blob/main/docs/USER_GUIDE.md"
+Issues = "https://github.com/mschulkind-oss/yolo-jail/issues"
 
 [project.scripts]
 yolo = "src.cli:main"
