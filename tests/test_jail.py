@@ -1,4 +1,6 @@
+import hashlib
 import os
+import re
 import subprocess
 import json
 from pathlib import Path
@@ -7,6 +9,34 @@ import pytest
 REPO_ROOT = Path(__file__).parent.parent.resolve()
 
 pytestmark = pytest.mark.slow
+
+
+def _container_name_for_workspace(workspace: Path) -> str:
+    """Mirror cli.py's container_name_for_workspace for cleanup."""
+    name = workspace.resolve().name
+    safe = re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")[:40]
+    if not safe:
+        safe = "jail"
+    h = hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()[:8]
+    return f"yolo-{safe}-{h}"
+
+
+def _force_remove_container(project_dir: Path):
+    """Force-remove the jail container for a project directory."""
+    runtime = os.environ.get("YOLO_RUNTIME", "podman")
+    cname = _container_name_for_workspace(project_dir)
+    subprocess.run(
+        [runtime, "rm", "-f", cname],
+        capture_output=True,
+        timeout=10,
+    )
+    # Also try old hash-only naming scheme for pre-existing containers
+    h = hashlib.sha256(str(project_dir.resolve()).encode()).hexdigest()[:12]
+    subprocess.run(
+        [runtime, "rm", "-f", f"yolo-{h}"],
+        capture_output=True,
+        timeout=10,
+    )
 
 
 def _skip_if_cgroup_readonly():
@@ -41,32 +71,42 @@ def temp_project(tmp_path):
     with open(project_dir / "yolo-jail.jsonc", "w") as f:
         json.dump(config, f)
 
-    return project_dir
+    yield project_dir
+
+    # Teardown: force-remove any leftover container
+    _force_remove_container(project_dir)
 
 
 def run_yolo(project_dir, command, timeout=120):
-    """Run a shell command inside the jail via login shell (bash -lc)."""
-    result = subprocess.run(
-        [
-            "uv",
-            "run",
-            "--project",
-            str(REPO_ROOT),
-            "python",
-            str(REPO_ROOT / "src" / "cli.py"),
-            "run",
-            "--",
-            "bash",
-            "-lc",
-            command,
-        ],
-        cwd=str(project_dir),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env={**os.environ, "TERM": "dumb"},
-    )
-    return result
+    """Run a shell command inside the jail via login shell (bash -lc).
+
+    On timeout, force-removes the container to prevent orphaned zombies.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--project",
+                str(REPO_ROOT),
+                "python",
+                str(REPO_ROOT / "src" / "cli.py"),
+                "run",
+                "--",
+                "bash",
+                "-lc",
+                command,
+            ],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "TERM": "dumb"},
+        )
+        return result
+    except subprocess.TimeoutExpired:
+        _force_remove_container(project_dir)
+        raise
 
 
 def run_yolo_cli(project_dir, *args, timeout=120):
@@ -97,25 +137,29 @@ def run_yolo_direct(project_dir, *args, timeout=120):
     wrapped in bash -lc, so it exercises the non-login PATH setup in the
     entrypoint (the path that caused `copilot: command not found`).
     """
-    result = subprocess.run(
-        [
-            "uv",
-            "run",
-            "--project",
-            str(REPO_ROOT),
-            "python",
-            str(REPO_ROOT / "src" / "cli.py"),
-            "run",
-            "--",
-            *args,
-        ],
-        cwd=str(project_dir),
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        env={**os.environ, "TERM": "dumb"},
-    )
-    return result
+    try:
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--project",
+                str(REPO_ROOT),
+                "python",
+                str(REPO_ROOT / "src" / "cli.py"),
+                "run",
+                "--",
+                *args,
+            ],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env={**os.environ, "TERM": "dumb"},
+        )
+        return result
+    except subprocess.TimeoutExpired:
+        _force_remove_container(project_dir)
+        raise
 
 
 def test_blocked_tool_curl(temp_project):

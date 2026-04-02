@@ -187,8 +187,8 @@ class TestContainerNaming:
         ws = tmp_path / "my-project"
         ws.mkdir()
         name = container_name_for_workspace(ws)
-        assert name.startswith("yolo-")
-        assert len(name) == 5 + 12  # "yolo-" + 12 hex chars
+        assert name.startswith("yolo-my-project-")
+        assert len(name.rsplit("-", 1)[-1]) == 8  # 8 hex char suffix
 
     def test_same_workspace_same_name(self, tmp_path):
         ws = tmp_path / "project"

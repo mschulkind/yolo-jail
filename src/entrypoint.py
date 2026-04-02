@@ -1514,7 +1514,10 @@ def generate_yolo_wrapper():
     script_path = SHIM_DIR / "yolo"
     # Use uv run with --no-build to get deps (typer, rich, pyjson5) without
     # trying to build the editable install (which fails on the read-only mount).
+    # UV_PROJECT_ENVIRONMENT points the venv to a writable location since
+    # /opt/yolo-jail is a read-only mount and uv can't create .venv there.
     script_path.write_text(f"""#!/bin/bash
+export UV_PROJECT_ENVIRONMENT="/tmp/yolo-jail-venv"
 exec uv run --no-build --project "{repo_root}" python "{repo_root}/src/cli.py" "$@"
 """)
     script_path.chmod(0o755)

@@ -47,6 +47,8 @@ def _git_describe_version() -> "str | None":
     ``0.1.0+3.gabcdef1.dirty``.  Returns *None* when git is unavailable or
     the command fails (e.g. not a git checkout).
     """
+    # First try live git (works in dev / editable installs)
+    raw = None
     try:
         repo_root = _resolve_repo_root()
     except Exception:
@@ -60,10 +62,21 @@ def _git_describe_version() -> "str | None":
             timeout=5,
             cwd=repo_root,
         )
-        if result.returncode != 0:
-            return None
-        raw = result.stdout.strip()
+        if result.returncode == 0:
+            raw = result.stdout.strip()
     except Exception:
+        pass
+
+    # Fall back to baked-in version from wheel build
+    if raw is None:
+        try:
+            from src._version import GIT_DESCRIBE
+
+            raw = GIT_DESCRIBE
+        except Exception:
+            return None
+
+    if raw is None:
         return None
 
     # Strip leading 'v' (e.g. v0.1.0 -> 0.1.0)
@@ -549,9 +562,18 @@ def _runtime(config: Dict[str, Any] = None) -> str:
 
 
 def container_name_for_workspace(workspace: Path) -> str:
-    """Deterministic container name from workspace path."""
-    h = hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()[:12]
-    return f"yolo-{h}"
+    """Deterministic container name from workspace path.
+
+    Uses the directory name for readability (e.g. yolo-tillr) with a short
+    hash suffix to handle collisions (e.g. two dirs both named 'app').
+    """
+    name = workspace.resolve().name
+    # Sanitize for container naming: lowercase, alphanumeric + hyphens
+    safe = re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")[:40]
+    if not safe:
+        safe = "jail"
+    h = hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()[:8]
+    return f"yolo-{safe}-{h}"
 
 
 def find_running_container(name: str, runtime: str = "docker") -> Optional[str]:
@@ -3354,7 +3376,7 @@ def check(
                     "--filter",
                     "name=^yolo-",
                     "--format",
-                    "{{.Names}}",
+                    "{{.Names}}\t{{.RunningFor}}",
                 ],
                 capture_output=True,
                 text=True,
@@ -3362,7 +3384,44 @@ def check(
             )
             containers = [c for c in result.stdout.strip().split("\n") if c]
             if containers:
-                ok(f"{len(containers)} jail(s) running: {', '.join(containers)}")
+                orphaned_jails = []
+                ok(f"{len(containers)} jail(s) running")
+                for line in containers:
+                    parts = line.split("\t")
+                    cname = parts[0]
+                    running_for = parts[1] if len(parts) > 1 else ""
+                    workspace = _get_container_workspace(cname, detected_runtime)
+                    ws_exists = (
+                        Path(workspace).is_dir() if workspace != "unknown" else True
+                    )
+                    reason = None
+                    if not ws_exists:
+                        reason = "workspace gone"
+                    else:
+                        reason = _check_container_stuck(cname, detected_runtime)
+                    if reason:
+                        marker = f" [red]({reason})[/red]"
+                        orphaned_jails.append((cname, running_for, workspace, reason))
+                    else:
+                        marker = ""
+                    console.print(f"    {cname} → {workspace}{marker}")
+                if orphaned_jails:
+                    warn(
+                        f"{len(orphaned_jails)} orphaned jail(s)",
+                        "These containers are stuck or have lost their workspace",
+                    )
+                    console.print()
+                    answer = console.input(
+                        f"  [bold yellow]Stop {len(orphaned_jails)} orphaned jail(s)? [y/N][/bold yellow] "
+                    )
+                    if answer.strip().lower() in ("y", "yes"):
+                        for cname, _, _, _ in orphaned_jails:
+                            subprocess.run(
+                                [detected_runtime, "rm", "-f", cname],
+                                capture_output=True,
+                            )
+                            cleanup_container_tracking(cname)
+                            console.print(f"    [green]Stopped {cname}[/green]")
             else:
                 ok("No jails currently running")
         except Exception:
@@ -4131,6 +4190,17 @@ def run(
     effective_pids = pids_limit if pids_limit is not None else 32768
     docker_cmd.extend(["--pids-limit", str(effective_pids)])
     res_parts.append(f"pids={effective_pids}")
+    # Print version at startup for log capture
+    v = _git_describe_version()
+    if v is None:
+        from importlib.metadata import version as pkg_version
+
+        try:
+            v = pkg_version("yolo-jail")
+        except Exception:
+            v = "unknown"
+    print(f"yolo-jail {v}", file=sys.stderr)
+
     if res_parts:
         print(f"Resource limits: {', '.join(res_parts)}", file=sys.stderr)
 
@@ -4385,6 +4455,71 @@ def run(
     sys.exit(result.returncode)
 
 
+def _check_container_stuck(name: str, runtime: str) -> "str | None":
+    """Check if a container is stuck in provisioning by inspecting its process tree.
+
+    Returns a reason string if stuck, None if healthy.
+    """
+    try:
+        result = subprocess.run(
+            [runtime, "top", name, "-eo", "comm"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode != 0:
+            return None
+        procs = [p.strip() for p in result.stdout.strip().splitlines()[1:] if p.strip()]
+        if not procs:
+            return "no processes"
+        # A healthy container has user commands running (claude, copilot, bash shell, etc.)
+        # A stuck container's leaf processes are provisioning tools
+        provisioning_commands = {"uv", "mise", "pip", "npm"}
+        # Check if ALL non-init processes are provisioning-related
+        user_procs = [
+            p
+            for p in procs
+            if p not in provisioning_commands
+            and p not in ("bash", "sh", "podman-init", "yolo-entrypo", "sleep", "sed")
+        ]
+        if not user_procs:
+            return "stuck in provisioning"
+    except Exception:
+        pass
+    return None
+
+
+def _get_container_workspace(name: str, runtime: str) -> str:
+    """Get the workspace path for a running container via inspect or tracking file."""
+    # Try tracking file first (fast)
+    tracking_file = CONTAINER_DIR / name
+    if tracking_file.exists():
+        ws = tracking_file.read_text().strip()
+        if ws:
+            return ws
+    # Fall back to inspecting the container's YOLO_HOST_DIR env var
+    try:
+        result = subprocess.run(
+            [
+                runtime,
+                "inspect",
+                name,
+                "--format",
+                "{{range .Config.Env}}{{println .}}{{end}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if line.startswith("YOLO_HOST_DIR="):
+                    return line.split("=", 1)[1]
+    except Exception:
+        pass
+    return "unknown"
+
+
 @app.command()
 def ps():
     """List running YOLO jail containers."""
@@ -4396,29 +4531,60 @@ def ps():
             "--filter",
             "name=^yolo-",
             "--format",
-            "table {{.Names}}\t{{.Status}}\t{{.RunningFor}}",
+            "{{.Names}}\t{{.Status}}\t{{.RunningFor}}",
         ],
         capture_output=True,
         text=True,
     )
-    if result.stdout.strip():
-        typer.echo(result.stdout.strip())
-        # Show workspace mappings, clean up stale tracking files
-        for tracking_file in (
-            sorted(CONTAINER_DIR.iterdir()) if CONTAINER_DIR.exists() else []
-        ):
-            name = tracking_file.name
-            if find_running_container(name, runtime=runtime):
-                workspace_path = tracking_file.read_text().strip()
-                typer.echo(f"  {name} → {workspace_path}")
-            else:
-                cleanup_container_tracking(name)
-    else:
+    lines = result.stdout.strip().splitlines() if result.stdout.strip() else []
+
+    if not lines:
         typer.echo("No running jails.")
         # Clean up all stale tracking files
         if CONTAINER_DIR.exists():
             for tracking_file in CONTAINER_DIR.iterdir():
                 cleanup_container_tracking(tracking_file.name)
+        return
+
+    # Parse container info and resolve workspaces
+    containers = []
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            name, status, running_for = parts[0], parts[1], parts[2]
+            workspace = _get_container_workspace(name, runtime)
+            containers.append((name, status, running_for, workspace))
+
+    # Clean up stale tracking files
+    running_names = {c[0] for c in containers}
+    if CONTAINER_DIR.exists():
+        for tracking_file in CONTAINER_DIR.iterdir():
+            if tracking_file.name not in running_names:
+                cleanup_container_tracking(tracking_file.name)
+
+    # Display as a table
+    if containers:
+        w_name = max(len(c[0]) for c in containers)
+        w_status = max(len(c[1]) for c in containers)
+        header = f"{'CONTAINER':<{w_name}}  {'STATUS':<{w_status}}  WORKSPACE"
+        typer.echo(header)
+        for name, status, _running_for, workspace in containers:
+            typer.echo(f"{name:<{w_name}}  {status:<{w_status}}  {workspace}")
+
+    # Warn about orphaned/stuck jails
+    problems = []
+    for name, _status, _running_for, workspace in containers:
+        if workspace != "unknown" and not Path(workspace).is_dir():
+            problems.append((name, "workspace gone"))
+        else:
+            reason = _check_container_stuck(name, runtime)
+            if reason:
+                problems.append((name, reason))
+    if problems:
+        typer.echo(f"\n⚠  {len(problems)} problem jail(s):")
+        for name, reason in problems:
+            typer.echo(f"  {name}  ({reason})")
+        typer.echo("\n  Run 'yolo doctor' to clean up")
 
 
 @app.command()

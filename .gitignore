@@ -11,3 +11,4 @@ __pycache__/
 probe.log
 dist/
 build/
+src/_version.py
