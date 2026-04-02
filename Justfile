@@ -53,7 +53,7 @@ build:
 
 # Install yolo as a standalone tool (decoupled from source tree)
 install: build
-    uv tool install dist/*.whl --force
+    uv tool install --force "$(ls -1 dist/*.whl | head -1)"
 
 # Build + install (deploy the yolo CLI)
 deploy: install
