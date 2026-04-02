@@ -1512,15 +1512,20 @@ def generate_yolo_wrapper():
     repo_root = os.environ.get("YOLO_REPO_ROOT", "/opt/yolo-jail")
     SHIM_DIR.mkdir(parents=True, exist_ok=True)
     script_path = SHIM_DIR / "yolo"
-    # Use uv run with --no-build to get deps (typer, rich, pyjson5) without
-    # trying to build the editable install (which fails on the read-only mount).
-    # UV_PROJECT_ENVIRONMENT points the venv to a writable location since
-    # /opt/yolo-jail is a read-only mount and uv can't create .venv there.
+    # Use --no-project with explicit --with deps so uv doesn't need to find
+    # or build the project (which fails on read-only /opt/yolo-jail mount and
+    # when CWD is outside the project tree).
     script_path.write_text(f"""#!/bin/bash
-export UV_PROJECT_ENVIRONMENT="/tmp/yolo-jail-venv"
-exec uv run --no-build --project "{repo_root}" python "{repo_root}/src/cli.py" "$@"
+exec uv run --no-project --with typer --with rich --with "pyjson5>=2.0.0" \
+  -- python "{repo_root}/src/cli.py" "$@"
 """)
     script_path.chmod(0o755)
+
+    # Remove stale yolo wrapper from .local/bin if present — it was generated
+    # by older entrypoint versions and lacks the --no-project fix.
+    stale = HOME / ".local" / "bin" / "yolo"
+    if stale.exists() and stale.is_file():
+        stale.unlink()
 
 
 # ---------------------------------------------------------------------------
