@@ -1512,11 +1512,10 @@ def generate_yolo_wrapper():
     repo_root = os.environ.get("YOLO_REPO_ROOT", "/opt/yolo-jail")
     SHIM_DIR.mkdir(parents=True, exist_ok=True)
     script_path = SHIM_DIR / "yolo"
-    # Use python directly (not uv run --project) because the repo mount is
-    # read-only and uv would try to build an editable install.  The shared
-    # mise Python already has the patched finder + deps from `just setup`.
+    # Use uv run with --no-build to get deps (typer, rich, pyjson5) without
+    # trying to build the editable install (which fails on the read-only mount).
     script_path.write_text(f"""#!/bin/bash
-exec python "{repo_root}/src/cli.py" "$@"
+exec uv run --no-build --project "{repo_root}" python "{repo_root}/src/cli.py" "$@"
 """)
     script_path.chmod(0o755)
 
