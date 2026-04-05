@@ -725,138 +725,6 @@ def configure_jj():
 # ---------------------------------------------------------------------------
 
 
-def _write_builtin_skills(jail_skills: Path):
-    """Write built-in skills that are available in every jail."""
-    skill_dir = jail_skills / "jail-startup"
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text("""\
----
-name: jail-startup
-description: First-run skill for agents entering a YOLO Jail. Reads the handover document left by the outer agent and orients you to the jail environment. Invoke this skill immediately when starting a new session inside a jail.
----
-
-# Jail Startup
-
-You are running inside a **YOLO Jail** — an isolated container environment.
-This skill helps you pick up where the previous (outer) agent left off.
-
-## Step 1: Read the Handover Document
-
-The outer agent was REQUIRED to write a handover document before you were
-launched. Read it now:
-
-**Primary location:** `.yolo/handover.md` (i.e., `/workspace/.yolo/handover.md`)
-
-If it exists, read it carefully — it contains:
-- What the outer agent was working on
-- What remains to be done
-- Key decisions and rationale
-- Files to look at first
-- Gotchas and context you need
-
-If the file does NOT exist, tell the human:
-> "No handover document found at `.yolo/handover.md`. The outer agent should
-> have created one. Can you tell me what I should be working on?"
-
-## Step 2: Orient Yourself
-
-Key facts about your environment:
-- **Workspace** is at `/workspace` — this is the SAME directory as on the host (bind-mounted read-write). Changes you make are immediately visible on the host.
-- **Internet** is available. You can curl, pip install, npm install, etc.
-- **Home** is `/home/agent` — shared across ALL jail workspaces. Auth tokens, tool caches, and configs persist here.
-- **Tools**: git, rg, fd, bat, jq, nvim, curl, gh, uv, mise, tmux, and more.
-- **Runtimes**: Node.js, Python, Go (managed by mise).
-- **Blocked tools**: Some tools may be shimmed (e.g., grep → rg). Check AGENTS.md or run `ls ~/.yolo-shims/` if you hit unexpected blocks. Set `YOLO_BYPASS_SHIMS=1` for scripts that need originals.
-- **No pagers**: `PAGER=cat`. Never pipe to `less` or `more`.
-- Run `yolo config-ref` for full configuration and environment reference.
-
-## Step 3: Execute
-
-After reading the handover document, proceed with the tasks described in it.
-You have full capability — treat this as your primary working environment.
-""")
-
-
-def merge_skills():
-    """Sync built-in + host + workspace skills into agent skills dirs."""
-    host_skills_path = os.environ.get("YOLO_HOST_GEMINI_SKILLS", "")
-
-    for agent_dir in [COPILOT_DIR, GEMINI_DIR, CLAUDE_DIR]:
-        jail_skills = agent_dir / "skills"
-        if jail_skills.exists():
-            # Restore write permission before rmtree (we chmod -w on previous runs)
-            _make_writable(jail_skills)
-            shutil.rmtree(jail_skills, ignore_errors=True)
-        jail_skills.mkdir(parents=True, exist_ok=True)
-
-        # Built-in skills (lowest priority — can be overridden)
-        _write_builtin_skills(jail_skills)
-
-        # Host user-level skills
-        if host_skills_path:
-            _copy_skill_dirs(Path(host_skills_path), jail_skills)
-
-        # Workspace skills (take precedence) — check .copilot, .gemini, and .claude
-        for ws_dir in [
-            "/workspace/.copilot/skills",
-            "/workspace/.gemini/skills",
-            "/workspace/.claude/skills",
-        ]:
-            ws_skills = Path(ws_dir)
-            if ws_skills.is_dir():
-                _copy_skill_dirs(ws_skills, jail_skills)
-
-        # Make skills read-only so agents can't modify them
-        _make_readonly(jail_skills)
-
-
-def _copy_skill_dirs(src: Path, dst: Path):
-    """Copy skill subdirectories from src to dst, following symlinks."""
-    if not src.is_dir():
-        return
-    import stat
-
-    for item in src.iterdir():
-        if item.is_dir():
-            target = dst / item.name
-            if target.exists():
-                # Restore write permissions (may have been made read-only)
-                dst.chmod(dst.stat().st_mode | stat.S_IWUSR)
-                _make_writable(target)
-                shutil.rmtree(target, ignore_errors=True)
-            # dirs_exist_ok handles races where another jail recreated the
-            # dir between our rmtree and copytree.
-            shutil.copytree(item, target, symlinks=False, dirs_exist_ok=True)
-
-
-def _make_readonly(path: Path):
-    """Recursively remove write permission from a directory tree."""
-    import stat
-
-    for root, dirs, files in os.walk(path):
-        for f in files:
-            fp = Path(root) / f
-            fp.chmod(fp.stat().st_mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
-        for d in dirs:
-            dp = Path(root) / d
-            dp.chmod(dp.stat().st_mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
-    path.chmod(path.stat().st_mode & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
-
-
-def _make_writable(path: Path):
-    """Recursively restore write permission on a directory tree."""
-    import stat
-
-    path.chmod(path.stat().st_mode | stat.S_IWUSR)
-    for root, dirs, files in os.walk(path):
-        for d in dirs:
-            dp = Path(root) / d
-            dp.chmod(dp.stat().st_mode | stat.S_IWUSR)
-        for f in files:
-            fp = Path(root) / f
-            fp.chmod(fp.stat().st_mode | stat.S_IWUSR)
-
-
 # ---------------------------------------------------------------------------
 # 8. Copilot config (MCP + LSP)
 # ---------------------------------------------------------------------------
@@ -1678,8 +1546,8 @@ def main():
         _perf("configure_git")
         configure_jj()
         _perf("configure_jj")
-        merge_skills()
-        _perf("merge_skills")
+        # Skills are mounted :ro by cli.py — no entrypoint action needed.
+        _perf("skills_skipped")
         configure_copilot()
         _perf("configure_copilot")
         configure_gemini()

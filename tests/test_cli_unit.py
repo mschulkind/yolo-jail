@@ -18,6 +18,8 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from typer.testing import CliRunner  # noqa: E402
 
+import cli as cli  # noqa: E402
+
 from cli import (  # noqa: E402
     _check_preset_null_conflicts,
     _effective_mcp_server_names,
@@ -26,6 +28,7 @@ from cli import (  # noqa: E402
     _merge_mise_tools,
     _normalize_blocked_tools,
     _parse_port_forwards,
+    _prepare_skills,
     _read_loaded_paths,
     _add_loaded_path,
     _report_unknown_keys,
@@ -1091,6 +1094,71 @@ class TestGenerateAgentsMd:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Test: Skills preparation
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestPrepareSkills:
+    def test_builtin_skill_created(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli, "AGENTS_DIR", tmp_path / "agents")
+        result = _prepare_skills("test-cname", tmp_path)
+        for agent in ("copilot", "gemini", "claude"):
+            skill = result / f"skills-{agent}" / "jail-startup" / "SKILL.md"
+            assert skill.exists()
+            assert "Jail Startup" in skill.read_text()
+
+    def test_host_skills_merged(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli, "AGENTS_DIR", tmp_path / "agents")
+        host_home = tmp_path / "home"
+        monkeypatch.setattr(Path, "home", lambda: host_home)
+        (host_home / ".gemini" / "skills" / "my-skill").mkdir(parents=True)
+        (host_home / ".gemini" / "skills" / "my-skill" / "SKILL.md").write_text(
+            "host skill"
+        )
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        result = _prepare_skills("test-cname", workspace)
+        for agent in ("copilot", "gemini", "claude"):
+            content = (result / f"skills-{agent}" / "my-skill" / "SKILL.md").read_text()
+            assert content == "host skill"
+
+    def test_workspace_skills_override_host(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli, "AGENTS_DIR", tmp_path / "agents")
+        host_home = tmp_path / "home"
+        monkeypatch.setattr(Path, "home", lambda: host_home)
+        (host_home / ".gemini" / "skills" / "shared").mkdir(parents=True)
+        (host_home / ".gemini" / "skills" / "shared" / "SKILL.md").write_text(
+            "host version"
+        )
+        workspace = tmp_path / "workspace"
+        (workspace / ".gemini" / "skills" / "shared").mkdir(parents=True)
+        (workspace / ".gemini" / "skills" / "shared" / "SKILL.md").write_text(
+            "workspace version"
+        )
+        result = _prepare_skills("test-cname", workspace)
+        content = (result / "skills-gemini" / "shared" / "SKILL.md").read_text()
+        assert content == "workspace version"
+
+    def test_stale_skills_cleaned(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(cli, "AGENTS_DIR", tmp_path / "agents")
+        host_home = tmp_path / "home"
+        monkeypatch.setattr(Path, "home", lambda: host_home)
+        (host_home / ".gemini" / "skills" / "old-skill").mkdir(parents=True)
+        (host_home / ".gemini" / "skills" / "old-skill" / "SKILL.md").write_text("old")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        result = _prepare_skills("test-cname", workspace)
+        assert (result / "skills-gemini" / "old-skill").exists()
+        import shutil
+
+        shutil.rmtree(host_home / ".gemini" / "skills" / "old-skill")
+        (host_home / ".gemini" / "skills" / "new-skill").mkdir(parents=True)
+        (host_home / ".gemini" / "skills" / "new-skill" / "SKILL.md").write_text("new")
+        result = _prepare_skills("test-cname", workspace)
+        assert not (result / "skills-gemini" / "old-skill").exists()
+        assert (result / "skills-gemini" / "new-skill").exists()
+
+
 # Test: Config change detection
 # ═══════════════════════════════════════════════════════════════════════════════
 

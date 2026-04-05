@@ -733,57 +733,7 @@ class TestAgentLaunchers:
         assert '"$REAL_BIN" install' in content  # native update command
 
 
-# -- Skills merging --
-
-
-class TestSkillsMerging:
-    def test_host_skills_copied(self, jail_home, monkeypatch, tmp_path):
-        host_skills = tmp_path / "host-skills"
-        (host_skills / "my-skill").mkdir(parents=True)
-        (host_skills / "my-skill" / "SKILL.md").write_text("# My Skill")
-        monkeypatch.setenv("YOLO_HOST_GEMINI_SKILLS", str(host_skills))
-        entrypoint.merge_skills()
-        assert (entrypoint.COPILOT_DIR / "skills" / "my-skill" / "SKILL.md").exists()
-
-    def test_workspace_skills_override(self, jail_home, monkeypatch, tmp_path):
-        # Host skill
-        host_skills = tmp_path / "host-skills"
-        (host_skills / "shared").mkdir(parents=True)
-        (host_skills / "shared" / "SKILL.md").write_text("host version")
-        monkeypatch.setenv("YOLO_HOST_GEMINI_SKILLS", str(host_skills))
-
-        # Workspace skill with same name
-        # Can't create in /workspace for real, so test the logic via a temp workspace
-        ws = tmp_path / "ws-skills"
-        (ws / "shared").mkdir(parents=True)
-        (ws / "shared" / "SKILL.md").write_text("workspace version")
-
-        entrypoint.merge_skills()
-        # At this point host skills are copied. Now manually call _copy_skill_dirs
-        # to simulate workspace override
-        entrypoint._copy_skill_dirs(ws, entrypoint.COPILOT_DIR / "skills")
-        content = (
-            entrypoint.COPILOT_DIR / "skills" / "shared" / "SKILL.md"
-        ).read_text()
-        assert content == "workspace version"
-
-    def test_skills_cleaned_between_runs(self, jail_home, monkeypatch, tmp_path):
-        host_skills = tmp_path / "host-skills"
-        (host_skills / "old-skill").mkdir(parents=True)
-        (host_skills / "old-skill" / "SKILL.md").write_text("old")
-        monkeypatch.setenv("YOLO_HOST_GEMINI_SKILLS", str(host_skills))
-        entrypoint.merge_skills()
-        assert (entrypoint.COPILOT_DIR / "skills" / "old-skill").exists()
-
-        # Now remove from host and re-merge
-        import shutil
-
-        shutil.rmtree(host_skills / "old-skill")
-        (host_skills / "new-skill").mkdir(parents=True)
-        (host_skills / "new-skill" / "SKILL.md").write_text("new")
-        entrypoint.merge_skills()
-        assert not (entrypoint.COPILOT_DIR / "skills" / "old-skill").exists()
-        assert (entrypoint.COPILOT_DIR / "skills" / "new-skill").exists()
+# Skills merging moved to cli.py (_prepare_skills) — see test_cli_unit.py
 
 
 # -- Container-side port forwarding --
@@ -1327,7 +1277,6 @@ class TestMainFunction:
     @patch("entrypoint.configure_claude")
     @patch("entrypoint.configure_gemini")
     @patch("entrypoint.configure_copilot")
-    @patch("entrypoint.merge_skills")
     @patch("entrypoint.configure_jj")
     @patch("entrypoint.configure_git")
     @patch("entrypoint.generate_mcp_wrappers")
@@ -1354,7 +1303,6 @@ class TestMainFunction:
         mock_wrappers,
         mock_git,
         mock_jj,
-        mock_skills,
         mock_copilot,
         mock_gemini,
         mock_claude,
@@ -1386,7 +1334,6 @@ class TestMainFunction:
     @patch("entrypoint.configure_claude")
     @patch("entrypoint.configure_gemini")
     @patch("entrypoint.configure_copilot")
-    @patch("entrypoint.merge_skills")
     @patch("entrypoint.configure_jj")
     @patch("entrypoint.configure_git")
     @patch("entrypoint.generate_mcp_wrappers")
@@ -1413,7 +1360,6 @@ class TestMainFunction:
         mock_wrappers,
         mock_git,
         mock_jj,
-        mock_skills,
         mock_copilot,
         mock_gemini,
         mock_claude,
@@ -1434,7 +1380,6 @@ class TestMainFunction:
     @patch("entrypoint.configure_claude")
     @patch("entrypoint.configure_gemini")
     @patch("entrypoint.configure_copilot")
-    @patch("entrypoint.merge_skills")
     @patch("entrypoint.configure_jj")
     @patch("entrypoint.configure_git")
     @patch("entrypoint.generate_mcp_wrappers")
@@ -1461,7 +1406,6 @@ class TestMainFunction:
         mock_wrappers,
         mock_git,
         mock_jj,
-        mock_skills,
         mock_copilot,
         mock_gemini,
         mock_claude,

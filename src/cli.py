@@ -1489,6 +1489,16 @@ def generate_agents_md(
             "```",
             "Then run `yolo check --no-build` and ask the human to restart the jail.",
             "",
+            "## Skills",
+            "",
+            "Skills directories (`~/.copilot/skills/`, `~/.gemini/skills/`, `~/.claude/skills/`)",
+            "are **read-only** (kernel-enforced). You cannot create or modify skills inside the jail.",
+            "If you attempt to write, you will get a 'Read-only file system' error — this is expected.",
+            "",
+            "To develop a new skill: create it in `/workspace/.copilot/skills/` (or `.gemini/`, `.claude/`),",
+            "test it manually, then ask the human to promote it to their host-level skills directory",
+            "outside the jail. The skill will be available in all jails after the next restart.",
+            "",
             "## First Session — Handover",
             "",
             "If this is your first session in this jail, invoke the **jail-startup** skill.",
@@ -1520,6 +1530,121 @@ def generate_agents_md(
     (agents_dir / "CLAUDE.md").write_text(claude_content)
 
     return agents_dir
+
+
+# ---------------------------------------------------------------------------
+# Skills merging (host-side, for :ro bind mounts)
+# ---------------------------------------------------------------------------
+
+_BUILTIN_JAIL_STARTUP_SKILL = """\
+---
+name: jail-startup
+description: First-run skill for agents entering a YOLO Jail. Reads the handover document left by the outer agent and orients you to the jail environment. Invoke this skill immediately when starting a new session inside a jail.
+---
+
+# Jail Startup
+
+You are running inside a **YOLO Jail** — an isolated container environment.
+This skill helps you pick up where the previous (outer) agent left off.
+
+## Step 1: Read the Handover Document
+
+The outer agent was REQUIRED to write a handover document before you were
+launched. Read it now:
+
+**Primary location:** `.yolo/handover.md` (i.e., `/workspace/.yolo/handover.md`)
+
+If it exists, read it carefully — it contains:
+- What the outer agent was working on
+- What remains to be done
+- Key decisions and rationale
+- Files to look at first
+- Gotchas and context you need
+
+If the file does NOT exist, tell the human:
+> "No handover document found at `.yolo/handover.md`. The outer agent should
+> have created one. Can you tell me what I should be working on?"
+
+## Step 2: Orient Yourself
+
+Key facts about your environment:
+- **Workspace** is at `/workspace` — this is the SAME directory as on the host (bind-mounted read-write). Changes you make are immediately visible on the host.
+- **Internet** is available. You can curl, pip install, npm install, etc.
+- **Home** is `/home/agent` — shared across ALL jail workspaces. Auth tokens, tool caches, and configs persist here.
+- **Tools**: git, rg, fd, bat, jq, nvim, curl, gh, uv, mise, tmux, and more.
+- **Runtimes**: Node.js, Python, Go (managed by mise).
+- **Blocked tools**: Some tools may be shimmed (e.g., grep → rg). Check AGENTS.md or run `ls ~/.yolo-shims/` if you hit unexpected blocks. Set `YOLO_BYPASS_SHIMS=1` for scripts that need originals.
+- **No pagers**: `PAGER=cat`. Never pipe to `less` or `more`.
+- Run `yolo config-ref` for full configuration and environment reference.
+
+## Step 3: Execute
+
+After reading the handover document, proceed with the tasks described in it.
+You have full capability — treat this as your primary working environment.
+"""
+
+
+def _prepare_skills(cname: str, workspace: Path) -> Path:
+    """Prepare merged skills directory on the host for :ro bind mounting.
+
+    Merge order (later overrides earlier):
+      1. Built-in skills (jail-startup)
+      2. Host user-level skills (~/.gemini/skills/, ~/.copilot/skills/, ~/.claude/skills/)
+      3. Workspace skills (<workspace>/.copilot/skills/, .gemini/skills/, .claude/skills/)
+
+    Returns the staging directory containing skills-copilot/, skills-gemini/, skills-claude/.
+    """
+    staging = AGENTS_DIR / cname
+    staging.mkdir(parents=True, exist_ok=True)
+
+    # Collect host user-level skill sources
+    home = Path.home()
+    host_skill_dirs = []
+    for dotdir in (".copilot", ".gemini", ".claude"):
+        p = home / dotdir / "skills"
+        if p.is_dir():
+            host_skill_dirs.append(p)
+
+    # Collect workspace skill sources
+    ws_skill_dirs = []
+    for dotdir in (".copilot", ".gemini", ".claude"):
+        p = workspace / dotdir / "skills"
+        if p.is_dir():
+            ws_skill_dirs.append(p)
+
+    for agent_suffix in ("copilot", "gemini", "claude"):
+        skills_dir = staging / f"skills-{agent_suffix}"
+        # Clean slate each time
+        if skills_dir.exists():
+            shutil.rmtree(skills_dir)
+        skills_dir.mkdir()
+
+        # 1. Built-in skills
+        builtin = skills_dir / "jail-startup"
+        builtin.mkdir()
+        (builtin / "SKILL.md").write_text(_BUILTIN_JAIL_STARTUP_SKILL)
+
+        # 2. Host user-level skills (all agent dirs merged)
+        for src_dir in host_skill_dirs:
+            _copy_skill_subdirs(src_dir, skills_dir)
+
+        # 3. Workspace skills (highest priority, all agent dirs merged)
+        for src_dir in ws_skill_dirs:
+            _copy_skill_subdirs(src_dir, skills_dir)
+
+    return staging
+
+
+def _copy_skill_subdirs(src: Path, dst: Path):
+    """Copy skill subdirectories from src into dst, following symlinks."""
+    if not src.is_dir():
+        return
+    for item in src.iterdir():
+        if item.is_dir():
+            target = dst / item.name
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(item, target, symlinks=False)
 
 
 def _summarize_nix_line(line: str) -> str:
@@ -4289,18 +4414,18 @@ def run(
     # Pass original host mise path for nested jail re-mounting
     docker_cmd.extend(["-e", f"YOLO_OUTER_MISE_PATH={host_mise}"])
 
-    # Mount host user-level copilot/gemini/claude skills so they're available in the jail
-    host_gemini_skills = Path.home() / ".gemini" / "skills"
-    host_dotfiles_skills = Path.home() / ".dotfiles" / "gemini" / "skills"
-
-    if host_gemini_skills.exists() and host_gemini_skills.is_dir():
-        docker_cmd.extend(["-v", f"{host_gemini_skills}:/ctx/host-gemini-skills:ro"])
-        docker_cmd.extend(["-e", "YOLO_HOST_GEMINI_SKILLS=/ctx/host-gemini-skills"])
-
-        if host_dotfiles_skills.exists() and host_dotfiles_skills.is_dir():
-            docker_cmd.extend(
-                ["-v", f"{host_dotfiles_skills}:{host_dotfiles_skills}:ro"]
-            )
+    # Mount merged skills directories read-only (prepared on host side).
+    # Kernel-enforced :ro — agents get "Read-only file system" on write attempts.
+    skills_path = _prepare_skills(cname, workspace)
+    docker_cmd.extend(
+        ["-v", f"{skills_path / 'skills-copilot'}:/home/agent/.copilot/skills:ro"]
+    )
+    docker_cmd.extend(
+        ["-v", f"{skills_path / 'skills-gemini'}:/home/agent/.gemini/skills:ro"]
+    )
+    docker_cmd.extend(
+        ["-v", f"{skills_path / 'skills-claude'}:/home/agent/.claude/skills:ro"]
+    )
 
     # Mount host ~/.claude/ files for syncing into the jail.
     # Auto-discover scripts referenced in host settings.json (fileSuggestion,
