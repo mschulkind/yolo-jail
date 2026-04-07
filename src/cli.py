@@ -1274,12 +1274,21 @@ def _seed_agent_dir(src: Path, dst: Path):
 
 
 def _migrate_old_overlay(old: Path, new: Path):
-    """Copy data from a pre-refactor per-workspace overlay dir into the new location."""
+    """Merge data from a pre-refactor per-workspace overlay dir into the new location.
+
+    Copies files that don't already exist in the target.  Existing files in
+    ``new`` are never overwritten so user data created post-refactor wins.
+    """
     if not old.is_dir() or not any(old.iterdir()):
         return
-    if new.exists() and any(new.iterdir()):
-        return  # already has data — don't overwrite
-    shutil.copytree(old, new, dirs_exist_ok=True)
+    new.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(old, new, dirs_exist_ok=True, copy_function=_copy_if_missing)
+
+
+def _copy_if_missing(src: str, dst: str):
+    """shutil copy_function that skips existing files."""
+    if not Path(dst).exists():
+        shutil.copy2(src, dst)
 
 
 def generate_agents_md(
