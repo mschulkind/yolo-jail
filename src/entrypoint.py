@@ -957,6 +957,8 @@ def _sync_host_claude_files():
         if src.exists():
             try:
                 shutil.copy2(str(src), str(dst))
+            except shutil.SameFileError:
+                pass  # nested jail — src and dst are the same inode
             except OSError as e:
                 print(
                     f"Warning: could not copy host claude file {fname}: {e}",
@@ -1527,18 +1529,23 @@ def main():
     generate_mise_config()
     _perf("generate_mise_config")
 
-    # Copy host nvim config into the writable .config/ overlay
+    # Copy host nvim config into the writable .config/ overlay.
+    # In nested jails, src and dst may be the same inode (both point to the
+    # shared .config overlay), so catch shutil.Error and skip silently.
     host_nvim = Path("/ctx/host-nvim-config")
     if host_nvim.is_dir():
         jail_nvim = HOME / ".config" / "nvim"
         jail_nvim.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(
-            host_nvim,
-            jail_nvim,
-            symlinks=False,
-            ignore_dangling_symlinks=True,
-            dirs_exist_ok=True,
-        )
+        try:
+            shutil.copytree(
+                host_nvim,
+                jail_nvim,
+                symlinks=False,
+                ignore_dangling_symlinks=True,
+                dirs_exist_ok=True,
+            )
+        except shutil.Error:
+            pass  # already in place (nested jail, same filesystem)
     _perf("nvim_config")
 
     generate_mcp_wrappers()

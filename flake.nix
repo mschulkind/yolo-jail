@@ -255,7 +255,7 @@
 
           # Create directories needed by nested podman and general operation
           fakeRootCommands = ''
-            mkdir -p ./var/tmp ./run ./var/lib/containers
+            mkdir -p ./var/tmp ./var/cache ./var/log ./run ./var/lib/containers
 
             # Pre-create mountpoint directories for --read-only root filesystem.
             # With --read-only, the OCI runtime cannot create these on the fly.

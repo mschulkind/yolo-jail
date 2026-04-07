@@ -238,7 +238,7 @@ def _default(
         ctx.invoke(run, ctx=ctx, network=network, new=new, profile=profile)
 
 
-JAIL_IMAGE = "yolo-jail:latest"
+JAIL_IMAGE = "localhost/yolo-jail:latest"
 GLOBAL_STORAGE = Path.home() / ".local/share/yolo-jail"
 GLOBAL_HOME = GLOBAL_STORAGE / "home"
 GLOBAL_MISE = GLOBAL_STORAGE / "mise"
@@ -1520,12 +1520,21 @@ def generate_agents_md(
             "",
             "## Testing Changes to yolo-jail",
             "",
+            "The `/workspace` directory is a bind mount of the host's repo. Your edits to",
+            "`src/cli.py` are **immediately visible to the host** — no commit or push needed.",
+            "The host's `yolo` command reads from this shared working tree.",
+            "",
             "When modifying `src/cli.py` or `src/entrypoint.py`, **always verify with a nested",
             "jail** before telling the human to test on the host. Run `yolo -- bash` from inside",
             "this jail to launch a nested jail and confirm your changes work end-to-end.",
             "Container startup errors (mount failures, permission errors, read-only filesystem",
             "conflicts) are only caught by actually running the container — unit tests alone are",
             "not sufficient.",
+            "",
+            "**Important:** Changes to `src/cli.py` take effect on the next `yolo` invocation",
+            "on the host (no rebuild needed). Changes to `src/entrypoint.py` or `flake.nix`",
+            "require `just load && just install` on the host since the entrypoint is baked",
+            "into the Nix image.",
             "",
             "## First Session — Handover",
             "",
@@ -4141,10 +4150,15 @@ def run(
         "/tmp",
         "--tmpfs",
         "/var/tmp",
-        # Podman needs writable storage for nested container operations
+        # Podman needs writable storage, runtime dirs, and shared memory for nested containers.
+        # --read-only-tmpfs=false disables automatic tmpfs mounts (including /dev/shm),
+        # so we must explicitly mount all tmpfs paths podman needs.
         "--tmpfs",
         "/var/lib/containers",
-        "--shm-size=2g",
+        "--tmpfs",
+        "/run",
+        "--tmpfs",
+        "/dev/shm:size=2g",
         "-e",
         "JAIL_HOME=/home/agent",
         "-e",
@@ -4530,6 +4544,13 @@ def run(
     overmind_sock = workspace / ".overmind.sock"
     if overmind_sock.exists():
         docker_cmd.extend(["-v", "/dev/null:/workspace/.overmind.sock:ro"])
+
+    # Mount user-level yolo config so nested jails see the same merged config.
+    # Without this, ~/.config/ is an empty per-workspace overlay and the nested
+    # yolo resolves to empty config, stomping the host's config snapshot.
+    if USER_CONFIG_PATH.is_file():
+        container_config = f"/home/agent/.config/yolo-jail/{USER_CONFIG_PATH.name}"
+        docker_cmd.extend(["-v", f"{USER_CONFIG_PATH}:{container_config}:ro"])
 
     # Pass container-side mise path for nested jail re-mounting.
     # Inside the container, mise is always at /mise regardless of host path.
