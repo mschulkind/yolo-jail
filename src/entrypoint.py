@@ -385,6 +385,8 @@ fc-cache -f >/dev/null 2>&1
 # Install binaries if missing.
 if ! command -v chrome-devtools-mcp >/dev/null; then
     echo "  Installing MCP tools..." >&2
+    # Clean stale npm temp directories that cause ENOTEMPTY on rename
+    find "$NPM_CONFIG_PREFIX/lib/node_modules" -maxdepth 1 -name '.*' -type d 2>/dev/null | xargs rm -rf
     YOLO_BYPASS_SHIMS=1 npm install -g chrome-devtools-mcp @modelcontextprotocol/server-sequential-thinking pyright typescript-language-server typescript
 fi
 
