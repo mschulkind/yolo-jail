@@ -74,27 +74,56 @@ class TestAutoLoadImage:
     @patch("cli._read_loaded_paths", return_value=set())
     @patch("cli._add_loaded_path")
     @patch("cli._estimate_image_size", return_value=100_000_000)
-    def test_streams_image_on_new_path(
+    def test_caches_and_loads_image_on_new_path(
         self, mock_est, mock_add, mock_read, mock_build, tmp_path
     ):
         mock_build.return_value = ("/nix/store/new", [])
 
-        # Mock the streaming pipeline
+        # Mock the streaming to cache file
         stream_proc = MagicMock()
         stream_proc.stdout.read.side_effect = [b"x" * 1024, b""]  # One chunk
         stream_proc.returncode = 0
         stream_proc.wait.return_value = None
 
-        load_proc = MagicMock()
-        load_proc.returncode = 0
-        load_proc.wait.return_value = None
+        load_result = MagicMock(returncode=0, stderr=b"")
 
         with (
             patch("cli.BUILD_DIR", tmp_path),
-            patch("subprocess.Popen", side_effect=[stream_proc, load_proc]),
+            patch("cli.GLOBAL_CACHE", tmp_path / "cache"),
+            patch("subprocess.Popen", return_value=stream_proc),
+            patch("subprocess.run", return_value=load_result),
         ):
             auto_load_image(tmp_path, runtime="docker")
 
+        mock_add.assert_called_once()
+
+    @patch("cli._build_image_store_path")
+    @patch("cli._read_loaded_paths", return_value=set())
+    @patch("cli._add_loaded_path")
+    def test_reuses_cached_tar(self, mock_add, mock_read, mock_build, tmp_path):
+        """When the tar cache file already exists, skip materialization."""
+        mock_build.return_value = ("/nix/store/cached", [])
+
+        # Pre-create the cache file
+        cache_dir = tmp_path / "cache" / "images"
+        cache_dir.mkdir(parents=True)
+        import hashlib
+
+        path_hash = hashlib.sha256(b"/nix/store/cached").hexdigest()[:16]
+        (cache_dir / f"{path_hash}.tar").write_bytes(b"fake tar")
+
+        load_result = MagicMock(returncode=0, stderr=b"")
+
+        with (
+            patch("cli.BUILD_DIR", tmp_path),
+            patch("cli.GLOBAL_CACHE", tmp_path / "cache"),
+            patch("subprocess.Popen") as mock_popen,
+            patch("subprocess.run", return_value=load_result),
+        ):
+            auto_load_image(tmp_path, runtime="docker")
+
+        # Should NOT have streamed (Popen not called for image generation)
+        mock_popen.assert_not_called()
         mock_add.assert_called_once()
 
 

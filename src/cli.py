@@ -1843,6 +1843,60 @@ def _add_loaded_path(sentinel: Path, store_path: str):
     sentinel.write_text("\n".join(paths) + "\n")
 
 
+def _image_cache_path(store_path: str) -> Path:
+    """Return the cached tar file path for a nix store path.
+
+    Images are cached in GLOBAL_CACHE/images/ keyed by a hash of the store path.
+    Using a file lets ``podman load -i`` detect existing layers and skip them,
+    which is ~30x faster than streaming through a pipe when layers are shared
+    across project configs.
+    """
+    cache_dir = GLOBAL_CACHE / "images"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path_hash = hashlib.sha256(store_path.encode()).hexdigest()[:16]
+    return cache_dir / f"{path_hash}.tar"
+
+
+def _materialize_image(store_path: str, cache_file: Path, status) -> int:
+    """Stream the nix image to a cache tar file.  Returns byte count."""
+    sentinel = BUILD_DIR / f"last-load-size"
+    estimated_size = _estimate_image_size(store_path, sentinel)
+
+    status.update("[bold cyan]Materializing image to cache...")
+    stream_proc = subprocess.Popen(
+        [store_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+
+    total_bytes = 0
+    chunk_size = 1024 * 1024  # 1 MB
+    tmp_file = cache_file.with_suffix(".tmp")
+    try:
+        with open(tmp_file, "wb") as f:
+            while True:
+                chunk = stream_proc.stdout.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                total_bytes += len(chunk)
+                progress = _format_progress(total_bytes, estimated_size)
+                status.update(f"[bold cyan]Caching image... {progress}")
+        stream_proc.wait()
+        if stream_proc.returncode != 0:
+            tmp_file.unlink(missing_ok=True)
+            return 0
+        tmp_file.rename(cache_file)
+    except Exception:
+        tmp_file.unlink(missing_ok=True)
+        raise
+
+    # Save size for future estimates
+    size_file = BUILD_DIR / "last-load-size"
+    size_file.write_text(str(total_bytes))
+    return total_bytes
+
+
 def auto_load_image(
     repo_root: Path,
     extra_packages: Optional[List[Union[str, dict]]] = None,
@@ -1868,8 +1922,7 @@ def auto_load_image(
         console.print(
             f"[yellow]Warning: nix build failed:[/yellow]\n[dim]{err_summary}[/dim]"
         )
-        # If the image already exists in the runtime (e.g. pre-loaded inside a jail),
-        # we can still proceed — just skip the load step.
+        # If the image already exists in the runtime, proceed.
         check = subprocess.run(
             [runtime, "image", "inspect", JAIL_IMAGE],
             capture_output=True,
@@ -1877,6 +1930,27 @@ def auto_load_image(
         if check.returncode == 0:
             console.print(f"[yellow]Using existing {JAIL_IMAGE} image.[/yellow]")
             return
+        # No image in runtime — try loading from the most recent cached tar.
+        # This handles nested jails where nix build fails but the host already
+        # cached the image tar in the shared GLOBAL_CACHE.
+        cache_dir = GLOBAL_CACHE / "images"
+        if cache_dir.is_dir():
+            tars = sorted(
+                cache_dir.glob("*.tar"), key=lambda p: p.stat().st_mtime, reverse=True
+            )
+            for tar_file in tars:
+                console.print(
+                    f"[yellow]Loading image from cache: {tar_file.name}[/yellow]"
+                )
+                load_result = subprocess.run(
+                    [runtime, "load", "-i", str(tar_file)],
+                    capture_output=True,
+                )
+                if load_result.returncode == 0:
+                    console.print(
+                        f"[bold green]Done: loaded image from cache[/bold green]"
+                    )
+                    return
         console.print(
             f"[bold red]No existing {JAIL_IMAGE} image found. Cannot start jail.[/bold red]"
         )
@@ -1902,53 +1976,39 @@ def auto_load_image(
             with console.status(
                 f"[bold cyan]Preparing image for {runtime}...", spinner="bouncingBar"
             ) as status:
-                # Estimate size (uses saved size from last stream, or nix closure size)
-                estimated_size = _estimate_image_size(current_path, sentinel)
+                # Materialize the nix image to a cached tar file (or reuse existing).
+                # Using a file lets `podman load -i` detect existing layers and skip
+                # them (~1-2s), vs piping which must transfer all bytes (~30-40s).
+                cache_file = _image_cache_path(current_path)
+                if not cache_file.exists():
+                    total_bytes = _materialize_image(current_path, cache_file, status)
+                    if total_bytes == 0:
+                        console.print(
+                            f"[bold red]Error streaming image to cache.[/bold red]"
+                        )
+                        out_link.unlink(missing_ok=True)
+                        return
+                    mb = total_bytes / (1024 * 1024)
+                    size_str = f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
+                    console.print(f"  [dim]Cached image: {size_str}[/dim]")
 
-                # streamLayeredImage produces a script that outputs the image tar to stdout.
-                # Pipe it directly to `runtime load` — generation and loading run in parallel.
-                status.update(f"[bold cyan]Starting image stream to {runtime}...")
-                stream_proc = subprocess.Popen(
-                    [current_path],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,  # Suppress "Creating layer N..." noise
+                # Load from cached file — podman detects existing layers and skips them
+                status.update(f"[bold cyan]Loading image into {runtime}...")
+                load_result = subprocess.run(
+                    [runtime, "load", "-i", str(cache_file)],
+                    capture_output=True,
                 )
-                load_proc = subprocess.Popen(
-                    [runtime, "load"],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
 
-                total_bytes = 0
-                chunk_size = 1024 * 1024  # 1 MB
-                while True:
-                    chunk = stream_proc.stdout.read(chunk_size)
-                    if not chunk:
-                        break
-                    load_proc.stdin.write(chunk)
-                    total_bytes += len(chunk)
-                    progress = _format_progress(total_bytes, estimated_size)
-                    status.update(f"[bold cyan]Streaming to {runtime}... {progress}")
-                load_proc.stdin.close()
-
-            stream_proc.wait()
-            load_proc.wait()
-
-            if stream_proc.returncode != 0 or load_proc.returncode != 0:
+            if load_result.returncode != 0:
                 console.print(
                     f"[bold red]Error loading image into {runtime}.[/bold red]"
                 )
+                stderr = load_result.stderr.decode().strip()
+                if stderr:
+                    console.print(f"  [dim]{stderr}[/dim]")
             else:
-                mb = total_bytes / (1024 * 1024)
-                size_str = f"{mb / 1024:.1f} GB" if mb >= 1024 else f"{mb:.0f} MB"
-                console.print(
-                    f"[bold green]Done: loaded image ({size_str})[/bold green]"
-                )
                 _add_loaded_path(sentinel, current_path)
-                # Save actual size for accurate future estimates
-                size_file = sentinel.parent / f"{sentinel.name}-size"
-                size_file.write_text(str(total_bytes))
+                console.print(f"[bold green]Done: loaded image[/bold green]")
         except Exception as e:
             console.print(f"[bold red]Error streaming image: {e}[/bold red]")
 
