@@ -4255,6 +4255,10 @@ def run(
         # ~/.cache/mise/lockfiles/, causing deadlocks in nested jails).
         "MISE_CACHE_DIR=/tmp/mise-cache",
         "-e",
+        # Explicitly request the non-freethreaded prebuilt to avoid
+        # "missing lib directory" errors from freethreaded builds.
+        "MISE_PYTHON_PRECOMPILED_FLAVOR=install_only_stripped",
+        "-e",
         "MISE_TRUST=1",
         "-e",
         "MISE_YES=1",
