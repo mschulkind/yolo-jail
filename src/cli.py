@@ -359,8 +359,6 @@ def ensure_global_storage():
     # Only create if missing — existing files from prior runs may have restrictive
     # permissions from container UID mapping; we just need them to exist.
     for fname in [
-        ".bashrc",
-        ".gitconfig",
         ".bash_history",
         ".yolo-bootstrap.sh",
         ".yolo-venv-precreate.sh",
@@ -371,26 +369,44 @@ def ensure_global_storage():
         p = GLOBAL_HOME / fname
         if not p.exists():
             p.touch()
-    # ~/.claude.json must be a symlink into the writable .claude/ overlay dir.
-    # Claude Code uses atomic writes (write-tmp-then-rename), which fails if the
-    # parent dir is :ro.  A symlink lets the rename happen in the writable .claude/ dir.
-    claude_json_link = GLOBAL_HOME / ".claude.json"
-    claude_json_target = Path(".claude") / "claude.json"
-    claude_json_real = GLOBAL_HOME / ".claude" / "claude.json"
-    if claude_json_link.is_symlink():
-        if Path(os.readlink(str(claude_json_link))) != claude_json_target:
-            claude_json_link.unlink()
-            claude_json_link.symlink_to(claude_json_target)
-    elif claude_json_link.exists():
-        # Was a regular file from a prior version — move data to the new
-        # location inside .claude/ so seeding can read it, then symlink.
-        if not claude_json_real.exists():
-            (GLOBAL_HOME / ".claude").mkdir(parents=True, exist_ok=True)
-            shutil.copy2(claude_json_link, claude_json_real)
-        claude_json_link.unlink()
-        claude_json_link.symlink_to(claude_json_target)
+    # Files in the :ro /home/agent/ that need atomic writes (lock-file-then-rename)
+    # must be symlinks into writable overlay dirs.  Without this, tools like git,
+    # Claude Code, and bash fail with EROFS when trying to update these files.
+    _ensure_symlink(
+        GLOBAL_HOME / ".claude.json",
+        Path(".claude") / "claude.json",
+    )
+    # ~/.gitconfig must also be a symlink — git config uses lock-file-then-rename
+    # which fails when the parent dir is :ro.  Point to .config/git/config (the
+    # XDG standard location, already inside the writable .config/ overlay).
+    _ensure_symlink(
+        GLOBAL_HOME / ".gitconfig",
+        Path(".config") / "git" / "config",
+    )
+    # ~/.bashrc — bash doesn't do atomic writes, but some tools that modify it
+    # (e.g. mise activate) might.  Symlink into .config/ for safety.
+    _ensure_symlink(
+        GLOBAL_HOME / ".bashrc",
+        Path(".config") / "bashrc",
+    )
+
+
+def _ensure_symlink(link: Path, target: Path):
+    """Ensure link is a relative symlink to target, migrating regular files."""
+    if link.is_symlink():
+        if Path(os.readlink(str(link))) != target:
+            link.unlink()
+            link.symlink_to(target)
+    elif link.exists():
+        # Migrate data from old regular file to new target location
+        real = link.parent / target
+        if not real.exists():
+            real.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(link, real)
+        link.unlink()
+        link.symlink_to(target)
     else:
-        claude_json_link.symlink_to(claude_json_target)
+        link.symlink_to(target)
 
 
 def _get_project_name() -> str:
@@ -4030,14 +4046,12 @@ def run(
     ]:
         (ws_state / subdir).mkdir(exist_ok=True)
     for fname in [
-        "bashrc",
         "bash_history",
         "yolo-bootstrap.sh",
         "yolo-venv-precreate.sh",
         "yolo-perf.log",
         "yolo-socat.log",
         "yolo-entrypoint.lock",
-        "gitconfig",
     ]:
         (ws_state / fname).touch()
 
@@ -4115,10 +4129,8 @@ def run(
         "-v",
         f"{GLOBAL_CACHE}:/home/agent/.cache",
         # Files: generated scripts, configs, logs
-        "-v",
-        f"{ws_state / 'bashrc'}:/home/agent/.bashrc",
-        "-v",
-        f"{ws_state / 'gitconfig'}:/home/agent/.gitconfig",
+        # (.bashrc and .gitconfig are symlinks into the writable .config/ overlay,
+        # so they don't need separate file bind mounts.)
         "-v",
         f"{ws_state / 'yolo-bootstrap.sh'}:/home/agent/.yolo-bootstrap.sh",
         "-v",

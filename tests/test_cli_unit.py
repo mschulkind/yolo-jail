@@ -964,14 +964,18 @@ class TestEnsureGlobalStorage:
         monkeypatch.setattr("cli.BUILD_DIR", tmp_path / "build")
         ensure_global_storage()
         # Spot-check key file mountpoints
-        assert (home / ".bashrc").is_file()
-        assert (home / ".gitconfig").is_file()
         assert (home / ".yolo-entrypoint.lock").is_file()
-        # .claude.json is a symlink → .claude/claude.json (atomic writes need writable parent)
+        # Files that use atomic writes are symlinks into writable overlay dirs
         assert (home / ".claude.json").is_symlink()
         assert os.readlink(str(home / ".claude.json")) == str(
             Path(".claude") / "claude.json"
         )
+        assert (home / ".gitconfig").is_symlink()
+        assert os.readlink(str(home / ".gitconfig")) == str(
+            Path(".config") / "git" / "config"
+        )
+        assert (home / ".bashrc").is_symlink()
+        assert os.readlink(str(home / ".bashrc")) == str(Path(".config") / "bashrc")
 
     def test_creates_overlay_dir_mountpoints(self, tmp_path, monkeypatch):
         """Directory mountpoints for per-workspace overlays."""
