@@ -1000,8 +1000,10 @@ class TestEnsureGlobalStorage:
         """Pre-existing files with restrictive perms should not cause errors."""
         home = tmp_path / "home"
         home.mkdir()
-        # Simulate a file written by a container with different UID
-        f = home / ".bashrc"
+        # Simulate a file written by a container with different UID.
+        # Use .yolo-entrypoint.lock (a plain file mountpoint, not a symlink target)
+        # so the test exercises the touch-skip path without hitting symlink migration.
+        f = home / ".yolo-entrypoint.lock"
         f.write_text("# old")
         f.chmod(0o000)
         monkeypatch.setattr("cli.GLOBAL_HOME", home)
