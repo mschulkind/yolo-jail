@@ -402,9 +402,15 @@ def _ensure_symlink(link: Path, target: Path):
         real = link.parent / target
         if not real.exists():
             real.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(link, real)
-        link.unlink()
-        link.symlink_to(target)
+            try:
+                shutil.copy2(link, real)
+            except OSError:
+                pass  # unreadable (bad perms from prior container run) — skip data
+        try:
+            link.unlink()
+            link.symlink_to(target)
+        except OSError:
+            pass  # can't replace — leave as-is
     else:
         link.symlink_to(target)
 
@@ -1859,7 +1865,7 @@ def _image_cache_path(store_path: str) -> Path:
 
 def _materialize_image(store_path: str, cache_file: Path, status) -> int:
     """Stream the nix image to a cache tar file.  Returns byte count."""
-    sentinel = BUILD_DIR / f"last-load-size"
+    sentinel = BUILD_DIR / "last-load-size"
     estimated_size = _estimate_image_size(store_path, sentinel)
 
     status.update("[bold cyan]Materializing image to cache...")
@@ -1948,7 +1954,7 @@ def auto_load_image(
                 )
                 if load_result.returncode == 0:
                     console.print(
-                        f"[bold green]Done: loaded image from cache[/bold green]"
+                        "[bold green]Done: loaded image from cache[/bold green]"
                     )
                     return
         console.print(
@@ -1984,7 +1990,7 @@ def auto_load_image(
                     total_bytes = _materialize_image(current_path, cache_file, status)
                     if total_bytes == 0:
                         console.print(
-                            f"[bold red]Error streaming image to cache.[/bold red]"
+                            "[bold red]Error streaming image to cache.[/bold red]"
                         )
                         out_link.unlink(missing_ok=True)
                         return
@@ -2008,7 +2014,7 @@ def auto_load_image(
                     console.print(f"  [dim]{stderr}[/dim]")
             else:
                 _add_loaded_path(sentinel, current_path)
-                console.print(f"[bold green]Done: loaded image[/bold green]")
+                console.print("[bold green]Done: loaded image[/bold green]")
         except Exception as e:
             console.print(f"[bold red]Error streaming image: {e}[/bold red]")
 
