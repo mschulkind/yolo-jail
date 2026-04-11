@@ -647,11 +647,22 @@ def _linux_multilib() -> str:
     return _MAP.get(machine, f"{machine}-linux-gnu")
 
 
+def _is_apple_container(path: str) -> bool:
+    """Return True if the binary at *path* is Apple's container CLI."""
+    try:
+        result = subprocess.run(
+            [path, "--version"], capture_output=True, text=True, timeout=5
+        )
+        return "Apple" in result.stdout or "Apple" in result.stderr
+    except Exception:
+        return False
+
+
 def _runtime(config: Dict[str, Any] = None) -> str:
     """Return container runtime: 'podman', 'docker', or 'container' (Apple).
 
     Auto-detection priority:
-      macOS: container → podman → docker  (prefer native Apple Container)
+      macOS: podman → docker → container  (Apple Container is opt-in)
       Linux: podman → docker              (container CLI is macOS-only)
     """
     env = os.environ.get("YOLO_RUNTIME")
@@ -661,13 +672,16 @@ def _runtime(config: Dict[str, Any] = None) -> str:
         cfg = config.get("runtime")
         if cfg and cfg in ("podman", "docker", "container"):
             return cfg
-    # Platform-aware auto-detection: prefer native runtime first
+    # Platform-aware auto-detection
     if IS_MACOS:
-        candidates = ("container", "podman", "docker")
+        candidates = ("podman", "docker", "container")
     else:
         candidates = ("podman", "docker")
     for rt in candidates:
-        if shutil.which(rt):
+        path = shutil.which(rt)
+        if path:
+            if rt == "container" and not _is_apple_container(path):
+                continue
             return rt
     console.print(
         "[bold red]No container runtime found. Install podman, docker, or Apple's container CLI.[/bold red]"
@@ -706,11 +720,12 @@ def find_running_container(name: str, runtime: str = "docker") -> Optional[str]:
                 if parts and parts[0] == name:
                     return name
             return None
-        result = subprocess.run(
-            [runtime, "ps", "-q", "--filter", f"name=^/{name}$"],
-            capture_output=True,
-            text=True,
-        )
+        else:
+            result = subprocess.run(
+                [runtime, "ps", "-q", "--filter", f"name=^/{name}$"],
+                capture_output=True,
+                text=True,
+            )
     except FileNotFoundError:
         return None
     cid = result.stdout.strip()
@@ -721,9 +736,11 @@ def find_existing_container(name: str, runtime: str = "docker") -> Optional[str]
     """Return container ID if a container with this name exists (running OR stopped)."""
     try:
         if runtime == "container":
-            # Apple Container CLI: 'list' already shows all containers
+            # Apple Container CLI: 'ls' only shows running by default;
+            # use --all to include stopped containers.
+            # --filter is not supported; scan the table output instead.
             result = subprocess.run(
-                ["container", "ls", "--filter", f"name={name}"],
+                ["container", "ls", "--all"],
                 capture_output=True,
                 text=True,
             )
@@ -747,8 +764,9 @@ def _remove_stale_container(name: str, runtime: str = "docker") -> bool:
     """Remove a stopped container. Returns True if removal succeeded."""
     try:
         if runtime == "container":
+            # Apple Container CLI: use 'delete' (aliased as 'rm') with --force
             result = subprocess.run(
-                ["container", "rm", name],
+                ["container", "rm", "--force", name],
                 capture_output=True,
                 text=True,
             )
@@ -766,7 +784,9 @@ def _remove_stale_container(name: str, runtime: str = "docker") -> bool:
         return False
 
 
-def _print_startup_banner(version: str, runtime: str, cname: str, res_parts: "list[str] | None" = None):
+def _print_startup_banner(
+    version: str, runtime: str, cname: str, res_parts: "list[str] | None" = None
+):
     """Print startup info to stderr for debugging and log sharing."""
     host_platform = f"{sys.platform}/{platform.machine()}"
     parts = [f"yolo-jail {version}", host_platform, runtime, cname]
@@ -910,7 +930,18 @@ def _convert_via_daemon(daemon: str, tar_path: str, console, status=None) -> boo
             JAIL_IMAGE,
         ]
     else:
-        save_cmd = [daemon, "save", "-o", oci_tar, JAIL_IMAGE]
+        # docker save produces Docker V2 tar, not OCI. Use skopeo to convert
+        # if available, otherwise fall back to docker save (may fail on Apple
+        # Container which strictly requires OCI format).
+        if shutil.which("skopeo"):
+            save_cmd = [
+                "skopeo",
+                "copy",
+                f"docker-daemon:{JAIL_IMAGE}",
+                f"oci-archive:{oci_tar}",
+            ]
+        else:
+            save_cmd = [daemon, "save", "-o", oci_tar, JAIL_IMAGE]
     save_result = subprocess.run(save_cmd, capture_output=True)
     if save_result.returncode != 0:
         console.print(f"[bold red]Failed to export OCI image from {daemon}.[/bold red]")
@@ -2177,11 +2208,14 @@ def _stream_image_command(store_path: str) -> list[str]:
             # Derive the SSH host from the URI
             ssh_host = builder_uri.replace("ssh-ng://", "").replace("ssh://", "")
             # Copy the closure to the builder
-            subprocess.run(
+            copy_result = subprocess.run(
                 ["nix", "copy", "--to", builder_uri, store_path],
                 capture_output=True,
                 timeout=300,
             )
+            if copy_result.returncode != 0:
+                # nix copy failed — fall back to local execution
+                return [store_path]
             return ["ssh", ssh_host, store_path]
 
     return [store_path]
@@ -2332,6 +2366,8 @@ def auto_load_image(
                     console.print(f"  [dim]Cached image: {size_str}[/dim]")
 
                 # Load from cached file — podman detects existing layers and skips them
+                load_ok = False
+                load_result = None
                 if runtime == "container":
                     load_ok = _load_image_for_apple_container(
                         str(cache_file), console, status
@@ -2915,7 +2951,7 @@ def _runtime_for_check(config: Dict[str, Any]) -> tuple[Optional[str], Optional[
     """Resolve the effective runtime without exiting.
 
     Same platform-aware priority as _runtime():
-      macOS: container → podman → docker
+      macOS: podman → docker → container
       Linux: podman → docker
     """
     env = os.environ.get("YOLO_RUNTIME")
@@ -2931,11 +2967,14 @@ def _runtime_for_check(config: Dict[str, Any]) -> tuple[Optional[str], Optional[
         return None, f"Configured runtime '{cfg}' from yolo-jail.jsonc is not on PATH"
 
     if IS_MACOS:
-        candidates = ("container", "podman", "docker")
+        candidates = ("podman", "docker", "container")
     else:
         candidates = ("podman", "docker")
     for rt in candidates:
-        if shutil.which(rt):
+        path = shutil.which(rt)
+        if path:
+            if rt == "container" and not _is_apple_container(path):
+                continue
             return rt, None
     return None, "No container runtime found on PATH"
 
@@ -3782,9 +3821,7 @@ def check(
 
     if IS_MACOS:
         console.print("[bold]macOS Platform[/bold]")
-        import platform as _platform
-
-        ok(f"Architecture: {_platform.machine()}")
+        ok(f"Architecture: {platform.machine()}")
 
         # Container VM backend check
         for vm_backend in ("colima", "podman"):
@@ -4602,9 +4639,7 @@ def run(
     # `docker run --name <cname>` fails with "container already exists".
     stale_cid = find_existing_container(cname, runtime=runtime)
     if stale_cid:
-        console.print(
-            f"[dim]Removing stale container {cname}...[/dim]"
-        )
+        console.print(f"[dim]Removing stale container {cname}...[/dim]")
         _remove_stale_container(cname, runtime=runtime)
 
     import time as _time
@@ -5654,10 +5689,8 @@ def _get_container_workspace(name: str, runtime: str) -> str:
                 timeout=5,
             )
             if result.returncode == 0:
-                import json as _json
-
                 try:
-                    data = _json.loads(result.stdout)
+                    data = json.loads(result.stdout)
                     # Apple Container inspect returns a dict with config.env
                     env_list = data.get("config", {}).get("env", [])
                     for env_entry in env_list:

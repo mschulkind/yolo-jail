@@ -1,0 +1,73 @@
+name: Nightly macOS Integration
+
+on:
+  schedule:
+    # Run at 06:00 UTC daily (1am EST / 10pm PST)
+    - cron: "0 6 * * *"
+  workflow_dispatch: # Allow manual trigger
+
+permissions:
+  contents: read
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build jail image
+        run: |
+          nix build --impure .#dockerImage
+          ./result > /tmp/jail-image.tar
+
+      - name: Upload jail image
+        uses: actions/upload-artifact@v4
+        with:
+          name: jail-image
+          path: /tmp/jail-image.tar
+          retention-days: 1
+
+  integration-macos:
+    # macOS Intel runners support nested virtualization, so Docker via Colima works.
+    # Note: x86_64 not ARM — tests the macOS code paths, not native ARM performance.
+    runs-on: macos-13
+    needs: build-image
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install Python dependencies
+        run: uv sync --group dev
+
+      - name: Install Docker via Colima
+        run: |
+          brew install --quiet colima docker socat
+          colima start --cpu 2 --memory 4 --disk 30 --mount-type sshfs
+
+      - name: Download jail image
+        uses: actions/download-artifact@v4
+        with:
+          name: jail-image
+          path: /tmp
+
+      - name: Load jail image
+        run: |
+          docker load < /tmp/jail-image.tar
+          docker tag yolo-jail:latest localhost/yolo-jail:latest
+
+      - name: Integration tests (macOS + Docker)
+        run: uv run pytest tests/test_jail.py tests/test_runtime.py -v -k "not podman"
+        env:
+          YOLO_RUNTIME: docker

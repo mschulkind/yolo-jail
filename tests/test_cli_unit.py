@@ -269,6 +269,11 @@ class TestFindExistingContainer:
             mock_run.return_value = MagicMock(stdout="NAME\nyolo-test\n")
             result = find_existing_container("yolo-test", runtime="container")
             assert result == "yolo-test"
+            mock_run.assert_called_once_with(
+                ["container", "ls", "--all"],
+                capture_output=True,
+                text=True,
+            )
 
     def test_podman_runtime(self):
         with patch("subprocess.run") as mock_run:
@@ -284,8 +289,10 @@ class TestFindExistingContainer:
 
 class TestRemoveStaleContainer:
     def test_successful_removal(self, tmp_path):
-        with patch("subprocess.run") as mock_run, \
-             patch("cli.cleanup_container_tracking") as mock_cleanup:
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("cli.cleanup_container_tracking") as mock_cleanup,
+        ):
             mock_run.return_value = MagicMock(returncode=0)
             result = _remove_stale_container("yolo-test", runtime="docker")
             assert result is True
@@ -297,20 +304,24 @@ class TestRemoveStaleContainer:
             mock_cleanup.assert_called_once_with("yolo-test")
 
     def test_failed_removal(self):
-        with patch("subprocess.run") as mock_run, \
-             patch("cli.cleanup_container_tracking") as mock_cleanup:
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("cli.cleanup_container_tracking") as mock_cleanup,
+        ):
             mock_run.return_value = MagicMock(returncode=1)
             result = _remove_stale_container("yolo-test", runtime="docker")
             assert result is False
             mock_cleanup.assert_not_called()
 
     def test_apple_container_runtime(self):
-        with patch("subprocess.run") as mock_run, \
-             patch("cli.cleanup_container_tracking"):
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("cli.cleanup_container_tracking"),
+        ):
             mock_run.return_value = MagicMock(returncode=0)
             _remove_stale_container("yolo-test", runtime="container")
             mock_run.assert_called_once_with(
-                ["container", "rm", "yolo-test"],
+                ["container", "rm", "--force", "yolo-test"],
                 capture_output=True,
                 text=True,
             )
@@ -330,7 +341,9 @@ class TestPrintStartupBanner:
         assert "yolo-test-abc123" in err
 
     def test_banner_with_resource_limits(self, capsys):
-        _print_startup_banner("1.0.0", "docker", "yolo-test-abc123", ["memory=8g", "cpus=4"])
+        _print_startup_banner(
+            "1.0.0", "docker", "yolo-test-abc123", ["memory=8g", "cpus=4"]
+        )
         err = capsys.readouterr().err
         assert "Resource limits: memory=8g, cpus=4" in err
 
@@ -346,13 +359,17 @@ class TestGetYoloVersion:
             assert _get_yolo_version() == "1.2.3"
 
     def test_falls_back_to_pkg_version(self):
-        with patch("cli._git_describe_version", return_value=None), \
-             patch("importlib.metadata.version", return_value="0.9.0"):
+        with (
+            patch("cli._git_describe_version", return_value=None),
+            patch("importlib.metadata.version", return_value="0.9.0"),
+        ):
             assert _get_yolo_version() == "0.9.0"
 
     def test_returns_unknown_on_error(self):
-        with patch("cli._git_describe_version", return_value=None), \
-             patch("importlib.metadata.version", side_effect=Exception("no pkg")):
+        with (
+            patch("cli._git_describe_version", return_value=None),
+            patch("importlib.metadata.version", side_effect=Exception("no pkg")),
+        ):
             assert _get_yolo_version() == "unknown"
 
 

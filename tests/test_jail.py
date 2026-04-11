@@ -516,7 +516,9 @@ def test_venv_symlinks_resolve(temp_project):
 
     # Create symlink using the in-container /mise path, not the host path.
     # The host mise dir is bind-mounted at /mise inside the jail.
-    container_python = Path("/mise/installs/python") / version_dir.name / "bin" / python_bin.name
+    container_python = (
+        Path("/mise/installs/python") / version_dir.name / "bin" / python_bin.name
+    )
 
     venv_dir = temp_project / ".venv" / "bin"
     venv_dir.mkdir(parents=True)
