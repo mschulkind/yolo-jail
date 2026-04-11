@@ -32,14 +32,7 @@ app = typer.Typer(
 
 def _version_callback(value: bool):
     if value:
-        v = _git_describe_version()
-        if v is None:
-            from importlib.metadata import version as pkg_version
-
-            try:
-                v = pkg_version("yolo-jail")
-            except Exception:
-                v = "unknown"
+        v = _get_yolo_version()
         typer.echo(f"yolo-jail {v}")
         raise typer.Exit()
 
@@ -722,6 +715,77 @@ def find_running_container(name: str, runtime: str = "docker") -> Optional[str]:
         return None
     cid = result.stdout.strip()
     return cid if cid else None
+
+
+def find_existing_container(name: str, runtime: str = "docker") -> Optional[str]:
+    """Return container ID if a container with this name exists (running OR stopped)."""
+    try:
+        if runtime == "container":
+            # Apple Container CLI: 'list' already shows all containers
+            result = subprocess.run(
+                ["container", "ls", "--filter", f"name={name}"],
+                capture_output=True,
+                text=True,
+            )
+            for line in result.stdout.strip().splitlines()[1:]:
+                parts = line.split()
+                if parts and parts[0] == name:
+                    return name
+            return None
+        result = subprocess.run(
+            [runtime, "ps", "-a", "-q", "--filter", f"name=^/{name}$"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    cid = result.stdout.strip()
+    return cid if cid else None
+
+
+def _remove_stale_container(name: str, runtime: str = "docker") -> bool:
+    """Remove a stopped container. Returns True if removal succeeded."""
+    try:
+        if runtime == "container":
+            result = subprocess.run(
+                ["container", "rm", name],
+                capture_output=True,
+                text=True,
+            )
+        else:
+            result = subprocess.run(
+                [runtime, "rm", name],
+                capture_output=True,
+                text=True,
+            )
+        if result.returncode == 0:
+            cleanup_container_tracking(name)
+            return True
+        return False
+    except FileNotFoundError:
+        return False
+
+
+def _print_startup_banner(version: str, runtime: str, cname: str, res_parts: "list[str] | None" = None):
+    """Print startup info to stderr for debugging and log sharing."""
+    host_platform = f"{sys.platform}/{platform.machine()}"
+    parts = [f"yolo-jail {version}", host_platform, runtime, cname]
+    print(" | ".join(parts), file=sys.stderr)
+    if res_parts:
+        print(f"Resource limits: {', '.join(res_parts)}", file=sys.stderr)
+
+
+def _get_yolo_version() -> str:
+    """Return the yolo-jail version string."""
+    v = _git_describe_version()
+    if v is None:
+        from importlib.metadata import version as pkg_version
+
+        try:
+            v = pkg_version("yolo-jail")
+        except Exception:
+            v = "unknown"
+    return v
 
 
 def _image_load_cmd(runtime: str, tar_path: str) -> list[str]:
@@ -4450,6 +4514,7 @@ def run(
 
     if existing_cid:
         # Exec into the existing container
+        _print_startup_banner(_get_yolo_version(), runtime, cname)
         console.print(
             f"[bold cyan]Attaching to existing jail [dim]({cname})[/dim]...[/bold cyan]"
         )
@@ -4503,6 +4568,7 @@ def run(
         raced_cid = find_running_container(cname, runtime=runtime)
         if raced_cid:
             lock_file.close()
+            _print_startup_banner(_get_yolo_version(), runtime, cname)
             console.print(
                 f"[bold cyan]Attaching to jail started by another process [dim]({cname})[/dim]...[/bold cyan]"
             )
@@ -4530,6 +4596,16 @@ def run(
                 )
                 sys.exit(1)
             sys.exit(result.returncode)
+
+    # Remove any stopped container with the same name left over from an
+    # unclean shutdown (e.g. OOM-kill, host reboot).  Without this,
+    # `docker run --name <cname>` fails with "container already exists".
+    stale_cid = find_existing_container(cname, runtime=runtime)
+    if stale_cid:
+        console.print(
+            f"[dim]Removing stale container {cname}...[/dim]"
+        )
+        _remove_stale_container(cname, runtime=runtime)
 
     import time as _time
 
@@ -5266,18 +5342,7 @@ def run(
         docker_cmd.extend(["--pids-limit", str(effective_pids)])
         res_parts.append(f"pids={effective_pids}")
     # Print version at startup for log capture
-    v = _git_describe_version()
-    if v is None:
-        from importlib.metadata import version as pkg_version
-
-        try:
-            v = pkg_version("yolo-jail")
-        except Exception:
-            v = "unknown"
-    print(f"yolo-jail {v}", file=sys.stderr)
-
-    if res_parts:
-        print(f"Resource limits: {', '.join(res_parts)}", file=sys.stderr)
+    _print_startup_banner(_get_yolo_version(), runtime, cname, res_parts or None)
 
     # Mount host nvim config read-only for entrypoint to copy into the writable
     # .config/ overlay.  We can't bind-mount directly because dotfile managers
