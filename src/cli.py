@@ -667,14 +667,19 @@ def _runtime_is_connectable(rt: str) -> bool:
         try:
             result = subprocess.run(
                 ["container", "system", "status"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True,
+                text=True,
+                timeout=5,
             )
             return result.returncode == 0 and "running" in result.stdout.lower()
         except Exception:
             return False
     try:
         result = subprocess.run(
-            [rt, "info"], capture_output=True, text=True, timeout=10,
+            [rt, "info"],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         return result.returncode == 0
     except Exception:
@@ -2988,7 +2993,10 @@ def _runtime_for_check(config: Dict[str, Any]) -> tuple[Optional[str], Optional[
         if shutil.which(env):
             if _runtime_is_connectable(env):
                 return env, None
-            return None, f"Configured runtime '{env}' from YOLO_RUNTIME is not connected"
+            return (
+                None,
+                f"Configured runtime '{env}' from YOLO_RUNTIME is not connected",
+            )
         return None, f"Configured runtime '{env}' from YOLO_RUNTIME is not on PATH"
 
     cfg = config.get("runtime")
@@ -2996,7 +3004,10 @@ def _runtime_for_check(config: Dict[str, Any]) -> tuple[Optional[str], Optional[
         if shutil.which(cfg):
             if _runtime_is_connectable(cfg):
                 return cfg, None
-            return None, f"Configured runtime '{cfg}' from yolo-jail.jsonc is not connected"
+            return (
+                None,
+                f"Configured runtime '{cfg}' from yolo-jail.jsonc is not connected",
+            )
         return None, f"Configured runtime '{cfg}' from yolo-jail.jsonc is not on PATH"
 
     if IS_MACOS:

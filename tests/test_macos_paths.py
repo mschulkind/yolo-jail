@@ -668,8 +668,9 @@ class TestAppleContainerRuntime:
         _set_macos(monkeypatch)
         monkeypatch.delenv("YOLO_RUNTIME", raising=False)
         monkeypatch.setattr(cli, "_runtime_is_connectable", lambda rt: True)
-        with patch("shutil.which") as mock_which, patch(
-            "cli._is_apple_container", return_value=True
+        with (
+            patch("shutil.which") as mock_which,
+            patch("cli._is_apple_container", return_value=True),
         ):
             # Only 'container' is on PATH
             mock_which.side_effect = lambda x: (
@@ -682,8 +683,9 @@ class TestAppleContainerRuntime:
         _set_macos(monkeypatch)
         monkeypatch.delenv("YOLO_RUNTIME", raising=False)
         monkeypatch.setattr(cli, "_runtime_is_connectable", lambda rt: True)
-        with patch("shutil.which") as mock_which, patch(
-            "cli._is_apple_container", return_value=True
+        with (
+            patch("shutil.which") as mock_which,
+            patch("cli._is_apple_container", return_value=True),
         ):
             # All three runtimes are on PATH
             mock_which.side_effect = lambda x: (
@@ -710,8 +712,9 @@ class TestAppleContainerRuntime:
         _set_macos(monkeypatch)
         monkeypatch.delenv("YOLO_RUNTIME", raising=False)
         monkeypatch.setattr(cli, "_runtime_is_connectable", lambda rt: True)
-        with patch("shutil.which") as mock_which, patch(
-            "cli._is_apple_container", return_value=True
+        with (
+            patch("shutil.which") as mock_which,
+            patch("cli._is_apple_container", return_value=True),
         ):
             mock_which.side_effect = lambda x: (
                 f"/usr/local/bin/{x}"

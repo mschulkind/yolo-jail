@@ -35,8 +35,9 @@ def test_runtime_config_used_when_no_env():
 def test_runtime_auto_detect_when_no_config():
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("YOLO_RUNTIME", None)
-        with patch("shutil.which") as mock_which, patch(
-            "cli._runtime_is_connectable", return_value=True
+        with (
+            patch("shutil.which") as mock_which,
+            patch("cli._runtime_is_connectable", return_value=True),
         ):
             mock_which.side_effect = lambda x: (
                 "/usr/bin/podman" if x == "podman" else None
