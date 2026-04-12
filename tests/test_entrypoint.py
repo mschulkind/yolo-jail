@@ -530,9 +530,68 @@ class TestClaudeConfig:
         assert "Bash" in perms["allow"]
         assert "Edit" in perms["allow"]
         assert "Read" in perms["allow"]
-        assert "mcp__*" in perms["allow"]
+        # mcp__* is NOT a valid rule — see test_mcp_per_server_rules below.
+        assert "mcp__*" not in perms["allow"]
         assert perms["defaultMode"] == "acceptEdits"
         assert cfg["skipDangerousModePermissionPrompt"] is True
+
+    def test_mcp_per_server_rules(self, jail_home, monkeypatch):
+        """One `mcp__<name>` rule per configured MCP server.
+
+        Claude's permission matcher does strict-equality server-name matching
+        (no glob support), so `"mcp__*"` never matches any real MCP tool call.
+        The entrypoint must enumerate the configured servers and emit one
+        explicit `mcp__<name>` rule per server.  The rule without a
+        double-underscore suffix matches all tools of that server because the
+        matcher treats `toolName === undefined` as "any tool".
+        """
+        monkeypatch.setenv(
+            "YOLO_MCP_PRESETS",
+            json.dumps(["chrome-devtools", "sequential-thinking"]),
+        )
+        entrypoint.configure_claude()
+        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
+        allow = cfg["permissions"]["allow"]
+        # Explicit per-server rules for every preset
+        assert "mcp__chrome-devtools" in allow
+        assert "mcp__sequential-thinking" in allow
+        # And no bogus glob
+        assert "mcp__*" not in allow
+
+    def test_mcp_per_server_rules_with_workspace_override(self, jail_home, monkeypatch):
+        """Workspace-provided MCP servers also get explicit allow rules."""
+        monkeypatch.setenv(
+            "YOLO_MCP_SERVERS",
+            json.dumps({"probe-mcp": {"command": "/workspace/probe-mcp.py"}}),
+        )
+        entrypoint.configure_claude()
+        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
+        assert "mcp__probe-mcp" in cfg["permissions"]["allow"]
+
+    def test_mcp_no_servers_no_mcp_rules(self, jail_home):
+        """With no MCP servers configured, allow list has no mcp__ rules."""
+        entrypoint.configure_claude()
+        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
+        allow = cfg["permissions"]["allow"]
+        mcp_rules = [r for r in allow if r.startswith("mcp__")]
+        assert mcp_rules == []
+
+    def test_workspace_project_auto_approves_mcp(self, jail_home, monkeypatch):
+        """The /workspace project entry has enableAllProjectMcpServers=True.
+
+        Defense in depth against any secondary per-server trust dialog that
+        Claude may fire on first use of an MCP server (separate from the
+        per-tool permission matcher).
+        """
+        monkeypatch.setenv(
+            "YOLO_MCP_PRESETS",
+            json.dumps(["chrome-devtools"]),
+        )
+        entrypoint.configure_claude()
+        claude_json = json.loads((entrypoint.HOME / ".claude.json").read_text())
+        project = claude_json["projects"]["/workspace"]
+        assert project["enableAllProjectMcpServers"] is True
+        assert project["hasTrustDialogAccepted"] is True
 
     def test_auto_update_disabled(self, jail_home):
         """settings.json disables auto-updates (startup bootstrap owns updates)."""

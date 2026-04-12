@@ -1096,13 +1096,25 @@ def configure_claude():
         # YOLO mode permissions — acceptEdits auto-approves tool use.
         # skipDangerousModePermissionPrompt suppresses the one-time confirmation
         # Claude shows when defaultMode is first set in a workspace.
+        #
+        # MCP rules: Claude's permission matcher (`w46` in the 2.1.x binary)
+        # uses strict equality on server name — there is NO glob matching.
+        # `"mcp__*"` parses via `Om()` to {serverName: "*", toolName: undefined}
+        # which then fails the `K.serverName === _.serverName` check against
+        # any real server.  We have to enumerate the configured servers and
+        # emit one `mcp__<name>` rule per server.  The rule with no
+        # double-underscore suffix matches ALL tools of that server because
+        # `Om("mcp__foo")` returns toolName=undefined, and the matcher accepts
+        # `K.toolName === void 0 || K.toolName === "*"` as "any tool".
+        mcp_allow_rules = [f"mcp__{name}" for name in sorted(configured_servers)]
+
         permissions = settings.setdefault("permissions", {})
         permissions["allow"] = [
             "Bash",
             "Edit",
             "Read",
             "WebFetch",
-            "mcp__*",
+            *mcp_allow_rules,
             "Agent(*)",
         ]
         permissions["deny"] = []
@@ -1141,6 +1153,18 @@ def configure_claude():
         for name in previous_managed:
             mcp_servers.pop(name, None)
         mcp_servers.update(configured_servers)
+
+        # Belt-and-suspenders: mark the /workspace project as auto-approving
+        # all its MCP servers.  This suppresses any secondary trust dialog
+        # Claude may fire on first use of a server (`Dx$` in the 2.1.x binary
+        # checks `enableAllProjectMcpServers` before returning "pending").
+        # The permission-rule fix above handles the per-tool prompts; this
+        # handles the per-server trust dialog, if one applies.
+        workspace_project = claude_json.setdefault("projects", {}).setdefault(
+            "/workspace", {}
+        )
+        workspace_project["enableAllProjectMcpServers"] = True
+        workspace_project.setdefault("hasTrustDialogAccepted", True)
 
         claude_json_path.write_text(json.dumps(claude_json, indent=2) + "\n")
         CLAUDE_MANAGED_MCP_PATH.write_text(
