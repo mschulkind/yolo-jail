@@ -1,8 +1,10 @@
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import json
+import sys
 from pathlib import Path
 import pytest
 
@@ -23,7 +25,9 @@ def _container_name_for_workspace(workspace: Path) -> str:
 
 def _force_remove_container(project_dir: Path):
     """Force-remove the jail container for a project directory."""
-    runtime = os.environ.get("YOLO_RUNTIME", "podman")
+    runtime = os.environ.get("YOLO_RUNTIME") or (
+        "docker" if sys.platform == "darwin" and shutil.which("docker") else "podman"
+    )
     cname = _container_name_for_workspace(project_dir)
     subprocess.run(
         [runtime, "rm", "-f", cname],
@@ -457,18 +461,25 @@ def test_workspace_agents_untouched_and_home_agents_present(temp_project):
     assert workspace_agents.read_text() == original
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="Host mise has macOS binaries that cannot execute in the Linux container",
+)
 def test_venv_symlinks_resolve(temp_project):
     """Test that host .venv python symlinks resolve inside the jail."""
-    # Always use /mise as the base if available: it's mounted in all jails (inner and outer).
-    # On the host, fall back to MISE_DATA_DIR or the default mise data dir.
+    # Inside the jail, mise is always mounted at /mise regardless of the host path.
+    # We need to find the python version on the host to know which version dir exists,
+    # then create a symlink using the in-container /mise path.
+
+    # Locate host mise to discover available python versions
     if Path("/mise/installs/python").exists():
-        mise_base = Path("/mise")
+        host_mise_base = Path("/mise")
     else:
-        mise_base = Path(
+        host_mise_base = Path(
             os.environ.get("MISE_DATA_DIR", str(Path.home() / ".local/share/mise"))
         )
 
-    installs = mise_base / "installs" / "python"
+    installs = host_mise_base / "installs" / "python"
     if not installs.exists():
         pytest.skip("No mise python installs found")
 
@@ -503,15 +514,20 @@ def test_venv_symlinks_resolve(temp_project):
     if not python_bin:
         pytest.skip("No python binary in mise install")
 
+    # Create symlink using the in-container /mise path, not the host path.
+    # The host mise dir is bind-mounted at /mise inside the jail.
+    container_python = (
+        Path("/mise/installs/python") / version_dir.name / "bin" / python_bin.name
+    )
+
     venv_dir = temp_project / ".venv" / "bin"
     venv_dir.mkdir(parents=True)
-    (venv_dir / "python").symlink_to(python_bin)
+    (venv_dir / "python").symlink_to(container_python)
 
     result = run_yolo(temp_project, "/workspace/.venv/bin/python --version")
     assert result.returncode == 0, (
-        f"symlink target: {python_bin}, stderr: {result.stderr}"
+        f"symlink target: {container_python}, stderr: {result.stderr}"
     )
-    assert "Python" in result.stdout
     assert "Python" in result.stdout
 
 

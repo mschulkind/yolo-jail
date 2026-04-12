@@ -1439,14 +1439,16 @@ def _port_in_use(port: int) -> bool:
 
 
 def start_container_port_forwarding():
-    """Start container-side socat: TCP-LISTEN on localhost → UNIX-CONNECT to host socket.
+    """Start container-side socat: TCP-LISTEN on localhost → host service.
 
     Reads YOLO_FORWARD_HOST_PORTS (JSON array). For each port, starts a socat
-    that listens on container's 127.0.0.1:PORT and connects to the corresponding
-    Unix socket at /tmp/yolo-fwd/port-PORT.sock (bind-mounted from host).
+    that listens on container's 127.0.0.1:PORT.
 
-    The host side (cli.py) runs a matching socat that bridges the Unix socket to
-    the host's 127.0.0.1:PORT. Together they form a tunnel analogous to SSH -L.
+    Two modes depending on environment:
+    - Unix socket mode (Linux): connects to /tmp/yolo-fwd/port-PORT.sock
+      (bind-mounted from host where host-side socat bridges to host localhost).
+    - TCP gateway mode (macOS): connects to YOLO_FWD_HOST_GATEWAY:PORT
+      directly via TCP (host.docker.internal resolves to the host).
 
     Skips ports already bound (idempotent for container reuse via exec).
     """
@@ -1462,6 +1464,9 @@ def start_container_port_forwarding():
 
     if not ports:
         return
+
+    # Determine forwarding mode
+    host_gateway = os.environ.get("YOLO_FWD_HOST_GATEWAY", "")
 
     log_path = HOME / ".yolo-socat.log"
     log_file = open(log_path, "a")
@@ -1480,20 +1485,26 @@ def start_container_port_forwarding():
         if _port_in_use(local_port):
             continue
 
-        sock_path = FORWARD_SOCKET_DIR / f"port-{local_port}.sock"
-        if not sock_path.exists():
-            print(
-                f"Warning: socket {sock_path} not found for port {local_port}",
-                file=sys.stderr,
-            )
-            continue
+        if host_gateway:
+            # TCP gateway mode: connect directly to host via Docker gateway
+            target = f"TCP:{host_gateway}:{local_port}"
+        else:
+            # Unix socket mode: connect to bind-mounted socket from host
+            sock_path = FORWARD_SOCKET_DIR / f"port-{local_port}.sock"
+            if not sock_path.exists():
+                print(
+                    f"Warning: socket {sock_path} not found for port {local_port}",
+                    file=sys.stderr,
+                )
+                continue
+            target = f"UNIX-CONNECT:{sock_path}"
 
         try:
             subprocess.Popen(
                 [
                     "socat",
                     f"TCP-LISTEN:{local_port},bind=127.0.0.1,fork,reuseaddr",
-                    f"UNIX-CONNECT:{sock_path}",
+                    target,
                 ],
                 stdout=subprocess.DEVNULL,
                 stderr=log_file,

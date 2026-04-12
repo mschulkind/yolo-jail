@@ -1277,6 +1277,7 @@ def _check_monkeypatch(monkeypatch, tmp_path, *, create_dirs=True):
     monkeypatch.setattr("cli.AGENTS_DIR", tmp_path / "agents")
     monkeypatch.setattr("cli.BUILD_DIR", tmp_path / "build")
     monkeypatch.setattr("cli.USER_CONFIG_PATH", tmp_path / "user-config.jsonc")
+    monkeypatch.setattr("cli._runtime_is_connectable", lambda rt: True)
     if create_dirs:
         for d in ("home", "mise", "containers", "agents", "build"):
             (tmp_path / d).mkdir()
@@ -1581,6 +1582,7 @@ def _run_monkeypatch(monkeypatch, tmp_path):
     monkeypatch.setattr("cli.AGENTS_DIR", tmp_path / "agents")
     monkeypatch.setattr("cli.BUILD_DIR", tmp_path / "build")
     monkeypatch.setattr("cli.USER_CONFIG_PATH", tmp_path / "user-config.jsonc")
+    monkeypatch.setattr("cli._runtime_is_connectable", lambda rt: True)
     monkeypatch.setattr("time.sleep", lambda _: None)
     for d in (
         "home",

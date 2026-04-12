@@ -21,6 +21,7 @@ This guide covers everything you need to get started with YOLO Jail and make the
 - [Storage & Persistence](#storage--persistence)
 - [Container Reuse](#container-reuse)
 - [Config Safety](#config-safety)
+- [macOS Platform Notes](#macos-platform-notes)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -32,8 +33,12 @@ This guide covers everything you need to get started with YOLO Jail and make the
 | Tool | Purpose | Install |
 |------|---------|---------|
 | [uv](https://docs.astral.sh/uv/) | Python package manager | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
-| [Nix](https://nixos.org/download/) | Image builder (with flakes) | `sh <(curl -L https://nixos.org/nix/install) --daemon` |
-| [Docker](https://docs.docker.com/) or [Podman](https://podman.io/) | Container runtime | Your package manager |
+| [Nix](https://nixos.org/download/) | Image builder (with flakes) | [Determinate Nix Installer](https://github.com/DeterminateSystems/nix-installer) recommended |
+| [Docker](https://docs.docker.com/), [Podman](https://podman.io/), or [Apple Container](https://github.com/apple/container) | Container runtime | Your package manager |
+
+**Supported platforms:** Linux (x86_64, aarch64) and macOS (Apple Silicon and Intel).
+
+On macOS, containers run in a lightweight Linux VM managed by Docker Desktop, Colima, Podman Machine, or Apple Container. See [docs/macos.md](macos.md) for the macOS-specific setup guide and [docs/platform-comparison.md](platform-comparison.md) for a detailed feature comparison.
 
 ### Install
 
@@ -195,7 +200,7 @@ YOLO Jail is configured via JSONC (JSON with comments) files:
 
 ```jsonc
 {
-  // Container runtime
+  // Container runtime: "podman", "docker", or "container" (Apple Container)
   "runtime": "podman",
 
   // Extra nix packages baked into the image
@@ -471,6 +476,8 @@ YOLO_BYPASS_SHIMS=1 grep -r "pattern" .
 
 ## Device Passthrough
 
+> **macOS note:** Device passthrough is a Linux-only feature. USB devices, raw device paths, and cgroup rules are silently skipped on macOS with a warning.
+
 Pass host devices (USB, serial, etc.) into the jail:
 
 ```jsonc
@@ -493,6 +500,8 @@ Missing devices produce a warning but don't prevent the jail from starting. Devi
 ---
 
 ## GPU Passthrough (NVIDIA)
+
+> **macOS note:** GPU passthrough is not available on macOS. Apple Silicon GPUs use Metal, not CUDA/OpenCL. The `"gpu"` config section is silently skipped with a warning.
 
 Train deep learning models inside the jail using NVIDIA GPUs. Requires the NVIDIA Container Toolkit on the host.
 
@@ -658,6 +667,49 @@ See [docs/config-safety.md](config-safety.md) for the full workflow.
 
 ---
 
+## macOS Platform Notes
+
+YOLO Jail has full macOS support (Apple Silicon and Intel). The container image is always a Linux container — Docker Desktop, Colima, Podman Machine, or Apple Container runs it in a lightweight Linux VM.
+
+### Quick Start (macOS)
+
+```bash
+# Option A: Colima + Docker (recommended for headless/CI Macs)
+brew install colima docker
+colima start --cpu 4 --memory 8 --disk 30 --mount-type virtiofs \
+  --mount "$HOME:w" --mount /private/var/folders:w --mount /private/tmp:w
+
+# Option B: Podman Machine
+brew install podman
+podman machine init --cpus 4 --memory 8192 --disk-size 50
+podman machine start
+
+# Option C: Apple Container (native macOS, per-container resource limits)
+brew install container skopeo
+container system start
+export YOLO_RUNTIME=container
+```
+
+You also need a Nix remote Linux builder for image builds. See [docs/macos.md](macos.md) for full setup instructions.
+
+### What's Different on macOS
+
+| Feature | Linux | macOS Docker/Podman | macOS Apple Container | Notes |
+|---------|-------|---------------------|----------------------|-------|
+| Cgroup limits (`yolo-cglimit`) | ✅ | ❌ | ❌ | Use VM resource controls or AC native limits |
+| Per-container CPU/memory | Via cgroups | ❌ | ✅ (`--cpus`/`--memory`) | AC: native resource limits |
+| GPU passthrough (NVIDIA) | ✅ | ❌ | ❌ | Apple Silicon uses Metal, not CUDA |
+| USB device passthrough | ✅ | ❌ | ❌ | No `/dev/bus/usb` on macOS |
+| Port forwarding | Unix sockets | TCP gateway | Native sockets | AC: `--publish-socket` |
+| UID mapping | `-u UID:GID` | VM handles | VM per container | Automatic |
+| mise tools | Host bind mount | Docker volume | Docker volume | macOS binaries are Mach-O, not ELF |
+| Max bind mounts | Unlimited | Unlimited | ~22 | VZ.framework limit |
+| `yolo doctor` | Linux checks | macOS checks | AC system checks | Runtime-specific diagnostics |
+
+All other features work identically. See [docs/platform-comparison.md](platform-comparison.md) for the complete comparison.
+
+---
+
 ## Troubleshooting
 
 ### Run the Health Check
@@ -713,3 +765,34 @@ The CLI needs the source for nix image builds. Either:
 - Docker: UID/GID mapping is handled via `-u UID:GID`
 - Podman: Rootless UID mapping handles ownership automatically
 - If persistent, check `ls -la ~/.local/share/yolo-jail/home/`
+
+### macOS-Specific Issues
+
+**Podman Machine won't start on headless Mac (EC2, CI)**
+- Apple's Hypervisor.framework may require a GUI session
+- Use Colima + Docker instead: `brew install colima docker && colima start`
+- Set `export YOLO_RUNTIME=docker`
+
+**Nix build hangs or times out**
+- Check `nix store info` responds within 2 seconds
+- If it hangs, kill determinate-nixd and use vanilla daemon: `sudo pkill determinate-nixd && sudo /nix/var/nix/profiles/default/bin/nix-daemon &`
+- Verify the remote builder: `nix store info --store ssh-ng://nix-builder`
+
+**Port forwarding not working on macOS**
+- Docker/Podman: Uses TCP gateway (`host.docker.internal`) instead of Unix sockets — automatic
+- Apple Container: Uses native `--publish-socket` for direct socket forwarding
+- Ensure `socat` is in the container (included by default)
+
+**Apple Container: "virtual machine failed to start"**
+- VZ.framework has a ~22 bind mount limit — YOLO Jail consolidates mounts automatically
+- If you add many custom mounts, you may hit this limit
+
+**Apple Container: image won't load**
+- Apple Container requires OCI-format images — YOLO Jail auto-converts via Docker
+- Ensure Docker (via Colima) is running: `colima start`
+
+**`/tmp` bind mounts fail on macOS**
+- macOS `/tmp` → `/private/tmp` (symlink) — `cli.py` resolves this automatically
+- If using Colima, ensure it was started with `--mount /private/tmp:w`
+
+See [docs/macos.md](macos.md) for the full macOS troubleshooting guide.

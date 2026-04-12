@@ -11,6 +11,20 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
+        # Docker images are always Linux containers.  When building on macOS
+        # (darwin), map to the equivalent Linux system so the image gets native
+        # Linux packages (e.g. aarch64-darwin → aarch64-linux).
+        # Requires a Linux builder in Nix (nix-darwin linux-builder, remote
+        # builder, or Docker-based builder).
+        imageSystem = builtins.replaceStrings ["-darwin"] ["-linux"] system;
+        imagePkgs = nixpkgs.legacyPackages.${imageSystem};
+
+        # Architecture-aware multilib path for LD_LIBRARY_PATH inside the image
+        linuxMultilib =
+          if imageSystem == "x86_64-linux" then "x86_64-linux-gnu"
+          else if imageSystem == "aarch64-linux" then "aarch64-linux-gnu"
+          else "${builtins.head (builtins.split "-" imageSystem)}-linux-gnu";
+
         # Extra packages from project config (passed via YOLO_EXTRA_PACKAGES env var).
         # Three formats:
         #   "strace"                                          → latest from flake nixpkgs
@@ -25,29 +39,29 @@
 
         extraPackages = map (spec:
           if builtins.isString spec then
-            pkgs.${spec}
+            imagePkgs.${spec}
           else if spec ? nixpkgs then
             # Pinned to a specific nixpkgs commit
             let
               pinnedPkgs = import (builtins.fetchTarball {
                 url = "https://github.com/NixOS/nixpkgs/archive/${spec.nixpkgs}.tar.gz";
-              }) { inherit system; };
+              }) { system = imageSystem; };
             in pinnedPkgs.${spec.name}
           else if spec ? version && spec ? url && spec ? hash then
             # Version override: rebuild existing package with different source
-            pkgs.${spec.name}.overrideAttrs (old: {
+            imagePkgs.${spec.name}.overrideAttrs (old: {
               version = spec.version;
-              src = pkgs.fetchurl {
+              src = imagePkgs.fetchurl {
                 url = spec.url;
                 hash = spec.hash;
               };
             })
           else
-            pkgs.${spec.name}
+            imagePkgs.${spec.name}
         ) extraPackageSpecs;
 
-        # Derivation for the shim scripts
-        shims = pkgs.stdenv.mkDerivation {
+        # Derivation for the shim scripts (plain text — built on host, runs in container)
+        shims = imagePkgs.stdenv.mkDerivation {
           name = "yolo-shims";
           src = ./src/shims;
           installPhase = ''
@@ -58,22 +72,24 @@
         };
 
         # Derivation to provide /usr/bin/env and other standard paths
-        binPathLinks = pkgs.runCommand "bin-path-links" {} ''
+        binPathLinks = imagePkgs.runCommand "bin-path-links" {} ''
           mkdir -p $out/usr/bin $out/bin $out/lib64 $out/lib $out/usr/lib $out/etc $out/usr/share/fonts
-          ln -s ${pkgs.coreutils}/bin/env $out/usr/bin/env
-          ln -s ${pkgs.bashInteractive}/bin/bash $out/bin/bash
-          ln -s ${pkgs.bashInteractive}/bin/sh $out/bin/sh
-          ln -s ${pkgs.gawk}/bin/awk $out/bin/awk
-          ln -s ${pkgs.gnused}/bin/sed $out/bin/sed
-          ln -s ${pkgs.gnugrep}/bin/grep $out/bin/grep
-          ln -s ${pkgs.findutils}/bin/find $out/bin/find
-          ln -s ${pkgs.chromium}/bin/chromium $out/usr/bin/chromium
-          ln -s ${pkgs.chromium}/bin/chromium $out/usr/bin/google-chrome
-          ln -s ${pkgs.chromium}/bin/chromium $out/usr/bin/chrome
+          ln -s ${imagePkgs.coreutils}/bin/env $out/usr/bin/env
+          ln -s ${imagePkgs.bashInteractive}/bin/bash $out/bin/bash
+          ln -s ${imagePkgs.bashInteractive}/bin/sh $out/bin/sh
+          ln -s ${imagePkgs.gawk}/bin/awk $out/bin/awk
+          ln -s ${imagePkgs.gnused}/bin/sed $out/bin/sed
+          ln -s ${imagePkgs.gnugrep}/bin/grep $out/bin/grep
+          ln -s ${imagePkgs.findutils}/bin/find $out/bin/find
+          ln -s ${imagePkgs.chromium}/bin/chromium $out/usr/bin/chromium
+          ln -s ${imagePkgs.chromium}/bin/chromium $out/usr/bin/google-chrome
+          ln -s ${imagePkgs.chromium}/bin/chromium $out/usr/bin/chrome
           
-          # Link the dynamic linker for x86_64
-          ln -s ${pkgs.stdenv.cc.bintools.dynamicLinker} $out/lib64/ld-linux-x86-64.so.2
-          ln -s ${pkgs.fontconfig.out}/etc/fonts $out/etc/fonts
+          # Link the dynamic linker at conventional paths (architecture-aware)
+          LINKER_BASENAME=$(basename "${imagePkgs.stdenv.cc.bintools.dynamicLinker}")
+          ln -sf ${imagePkgs.stdenv.cc.bintools.dynamicLinker} $out/lib/$LINKER_BASENAME
+          ln -sf ${imagePkgs.stdenv.cc.bintools.dynamicLinker} $out/lib64/$LINKER_BASENAME
+          ln -s ${imagePkgs.fontconfig.out}/etc/fonts $out/etc/fonts
           
           # Link shared libraries to /lib and /usr/lib for LD_LIBRARY_PATH discovery.
           # Iterates over all packages with lib outputs, including split-output packages
@@ -83,21 +99,21 @@
           # Non-nix binaries (node, npm/pip packages) rely on LD_LIBRARY_PATH=/lib:/usr/lib
           # since they lack RPATH entries pointing into the nix store.
           for dir in $out/lib $out/usr/lib; do
-            for pkg in ${pkgs.glibc} \
-                       ${pkgs.stdenv.cc.cc.lib} \
-                       ${pkgs.zlib} \
-                       ${pkgs.fontconfig.lib} \
-                       ${pkgs.glib.out} \
-                       ${pkgs.pango.out} \
-                       ${pkgs.cairo} \
-                       ${pkgs.harfbuzz} \
-                       ${pkgs.freetype} \
-                       ${pkgs.fribidi} \
-                       ${pkgs.pixman} \
-                       ${pkgs.libpng} \
-                       ${pkgs.expat} \
-                       ${pkgs.pcre2} \
-                       ${pkgs.libffi}; do
+            for pkg in ${imagePkgs.glibc} \
+                       ${imagePkgs.stdenv.cc.cc.lib} \
+                       ${imagePkgs.zlib} \
+                       ${imagePkgs.fontconfig.lib} \
+                       ${imagePkgs.glib.out} \
+                       ${imagePkgs.pango.out} \
+                       ${imagePkgs.cairo} \
+                       ${imagePkgs.harfbuzz} \
+                       ${imagePkgs.freetype} \
+                       ${imagePkgs.fribidi} \
+                       ${imagePkgs.pixman} \
+                       ${imagePkgs.libpng} \
+                       ${imagePkgs.expat} \
+                       ${imagePkgs.pcre2} \
+                       ${imagePkgs.libffi}; do
               if [ -d "$pkg/lib" ]; then
                 for f in "$pkg"/lib/lib*.so*; do
                   [ -f "$f" ] || [ -L "$f" ] || continue
@@ -113,7 +129,7 @@
           # Note: do NOT symlink freefont_ttf — its fonts lack fontconfig classification
           # and 49-sansserif.conf misclassifies FreeMono as sans-serif, beating DejaVu.
           # dejavu-fonts-minimal (transitive dep) handles base fonts correctly.
-          for fontPkg in ${pkgs.noto-fonts-color-emoji}; do
+          for fontPkg in ${imagePkgs.noto-fonts-color-emoji}; do
             if [ -d "$fontPkg/share/fonts" ]; then
               for d in "$fontPkg"/share/fonts/*; do
                 [ -d "$d" ] && ln -s "$d" "$out/usr/share/fonts/$(basename "$d")" 2>/dev/null || true
@@ -131,7 +147,7 @@
           [storage]
           driver = "overlay"
           [storage.options.overlay]
-          mount_program = "${pkgs.fuse-overlayfs}/bin/fuse-overlayfs"
+          mount_program = "${imagePkgs.fuse-overlayfs}/bin/fuse-overlayfs"
           STORAGE
 
           cat > $out/etc/containers/containers.conf <<CONTAINERS
@@ -154,24 +170,24 @@
           REGISTRIES
         '';
 
-        # Derivation for the Python entrypoint
-        entrypointScript = pkgs.writeTextFile {
+        # Derivation for the Python entrypoint (runs inside Linux container)
+        entrypointScript = imagePkgs.writeTextFile {
           name = "yolo-entrypoint-py";
           text = builtins.readFile ./src/entrypoint.py;
           destination = "/lib/yolo-entrypoint.py";
         };
-        entrypoint = pkgs.writeShellScriptBin "yolo-entrypoint" ''
-          exec ${pkgs.python313}/bin/python3 ${entrypointScript}/lib/yolo-entrypoint.py "$@"
+        entrypoint = imagePkgs.writeShellScriptBin "yolo-entrypoint" ''
+          exec ${imagePkgs.python313}/bin/python3 ${entrypointScript}/lib/yolo-entrypoint.py "$@"
         '';
 
         # In-jail yolo CLI wrapper — delegates to the mounted repo via uv
-        yoloCli = pkgs.writeShellScriptBin "yolo" ''
+        yoloCli = imagePkgs.writeShellScriptBin "yolo" ''
           # Use the mounted repo with uv (deps are cached in persistent ~/.cache/uv)
           if [ -d /opt/yolo-jail/src ]; then
             export PYTHONPATH="/opt/yolo-jail''${PYTHONPATH:+:$PYTHONPATH}"
-            exec ${pkgs.uv}/bin/uv run \
+            exec ${imagePkgs.uv}/bin/uv run \
               --no-project \
-              --python ${pkgs.python313}/bin/python3 \
+              --python ${imagePkgs.python313}/bin/python3 \
               --with typer --with rich --with "pyjson5>=2.0.0" \
               -- python3 -c "from src.cli import main; main()" "$@"
           fi
@@ -180,8 +196,8 @@
           exit 1
         '';
 
-        # The Docker Image
-        dockerImage = pkgs.dockerTools.streamLayeredImage {
+        # The Docker Image (always Linux, even when built on macOS)
+        dockerImage = imagePkgs.dockerTools.streamLayeredImage {
           name = "yolo-jail";
           tag = "latest";
           created = "now";
@@ -192,65 +208,65 @@
             shims
             entrypoint
             yoloCli
-            pkgs.bashInteractive
-            pkgs.coreutils-full
-            pkgs.git
-            pkgs.ripgrep
-            pkgs.fd
-            pkgs.curl
-            pkgs.cacert
-            pkgs.mise
-            pkgs.findutils
-            pkgs.which
-            pkgs.nodejs_22
-            pkgs.python3
-            pkgs.gh
-            pkgs.gnused
-            pkgs.gnugrep
-            pkgs.gawk
-            pkgs.gnupatch
-            pkgs.diffutils
-            pkgs.gzip
-            pkgs.bzip2
-            pkgs.xz
-            pkgs.gnutar
-            pkgs.unzip
-            pkgs.zip
-            pkgs.openssh
-            pkgs.strace
-            pkgs.lsof
-            pkgs.file
-            pkgs.gcc
-            pkgs.gnumake
-            pkgs.binutils
-            pkgs.zlib
-            pkgs.chromium   # For both MCP and Playwright
-            pkgs.fontconfig
-            pkgs.noto-fonts-color-emoji  # Emoji font for Chromium rendering
-            pkgs.glibc.bin  # For ldd
-            pkgs.procps     # ps, pgrep, pkill
-            pkgs.net-tools  # netstat
-            pkgs.iproute2   # ss, ip
-            pkgs.iputils    # ping
-            pkgs.dnsutils   # dig, host, nslookup
-            pkgs.htop
+            imagePkgs.bashInteractive
+            imagePkgs.coreutils-full
+            imagePkgs.git
+            imagePkgs.ripgrep
+            imagePkgs.fd
+            imagePkgs.curl
+            imagePkgs.cacert
+            imagePkgs.mise
+            imagePkgs.findutils
+            imagePkgs.which
+            imagePkgs.nodejs_22
+            imagePkgs.python3
+            imagePkgs.gh
+            imagePkgs.gnused
+            imagePkgs.gnugrep
+            imagePkgs.gawk
+            imagePkgs.gnupatch
+            imagePkgs.diffutils
+            imagePkgs.gzip
+            imagePkgs.bzip2
+            imagePkgs.xz
+            imagePkgs.gnutar
+            imagePkgs.unzip
+            imagePkgs.zip
+            imagePkgs.openssh
+            imagePkgs.strace
+            imagePkgs.lsof
+            imagePkgs.file
+            imagePkgs.gcc
+            imagePkgs.gnumake
+            imagePkgs.binutils
+            imagePkgs.zlib
+            imagePkgs.chromium   # For both MCP and Playwright
+            imagePkgs.fontconfig
+            imagePkgs.noto-fonts-color-emoji  # Emoji font for Chromium rendering
+            imagePkgs.glibc.bin  # For ldd
+            imagePkgs.procps     # ps, pgrep, pkill
+            imagePkgs.net-tools  # netstat
+            imagePkgs.iproute2   # ss, ip
+            imagePkgs.iputils    # ping
+            imagePkgs.dnsutils   # dig, host, nslookup
+            imagePkgs.htop
 
-            pkgs.hivemind
-            pkgs.overmind
-            pkgs.tmux
-            pkgs.jq
-            pkgs.bat
-            pkgs.eza
-            pkgs.delta
-            pkgs.fzf
-            pkgs.uv
-            pkgs.iptables     # For DNAT rules (published port → localhost fixup)
-            pkgs.socat        # For host port forwarding into the jail
-            pkgs.nix          # For building nix images inside jail
-            pkgs.podman       # For nested container support
-            pkgs.fuse-overlayfs  # Storage driver for rootless podman
-            pkgs.slirp4netns  # Rootless networking for nested podman
-            pkgs.shadow       # newuidmap/newgidmap for user namespace mapping
+            imagePkgs.hivemind
+            imagePkgs.overmind
+            imagePkgs.tmux
+            imagePkgs.jq
+            imagePkgs.bat
+            imagePkgs.eza
+            imagePkgs.delta
+            imagePkgs.fzf
+            imagePkgs.uv
+            imagePkgs.iptables     # For DNAT rules (published port → localhost fixup)
+            imagePkgs.socat        # For host port forwarding into the jail
+            imagePkgs.nix          # For building nix images inside jail
+            imagePkgs.podman       # For nested container support
+            imagePkgs.fuse-overlayfs  # Storage driver for rootless podman
+            imagePkgs.slirp4netns  # Rootless networking for nested podman
+            imagePkgs.shadow       # newuidmap/newgidmap for user namespace mapping
           ] ++ extraPackages;
 
           # Create directories needed by nested podman and general operation
@@ -274,8 +290,8 @@
             # We explicitly place shims first in PATH
             Env = [ 
               "PATH=${shims}/bin:/bin:/usr/bin" 
-              "SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-              "LD_LIBRARY_PATH=/lib:/usr/lib:/usr/lib/x86_64-linux-gnu"
+              "SSL_CERT_FILE=${imagePkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+              "LD_LIBRARY_PATH=/lib:/usr/lib:/usr/lib/${linuxMultilib}"
               "FONTCONFIG_FILE=/etc/fonts/fonts.conf"
               "FONTCONFIG_PATH=/etc/fonts"
             ];

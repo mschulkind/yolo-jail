@@ -7,11 +7,46 @@ store that doesn't see the outer host's images.
 
 import subprocess
 import shutil
+import sys
 from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).parent.parent.resolve()
 JAIL_IMAGE = "yolo-jail:latest"
+
+
+@pytest.fixture(autouse=True)
+def _simulate_linux_for_unit_tests(request, monkeypatch):
+    """Ensure *unit* tests exercise the Linux code paths regardless of host OS.
+
+    Integration tests (marked ``@pytest.mark.slow``) are left untouched so they
+    run with the real platform flags and whatever ``YOLO_RUNTIME`` the caller
+    set in the environment.
+
+    The CLI's IS_MACOS / IS_LINUX guards change runtime behaviour.  Unit tests
+    are heavily mocked and should test the primary (Linux) code path.  Tests
+    that specifically target macOS behaviour can override this with::
+
+        monkeypatch.setattr("cli.IS_MACOS", True)
+        monkeypatch.setattr("cli.IS_LINUX", False)
+
+    Also clears YOLO_RUNTIME so the mocked tests use their own runtime
+    detection rather than inheriting an env var from the test runner.
+    """
+    is_integration = any(m.name == "slow" for m in request.node.iter_markers())
+    if is_integration:
+        return  # let integration tests use real platform values
+
+    monkeypatch.delenv("YOLO_RUNTIME", raising=False)
+    if sys.platform == "darwin":
+        # Lazily import — cli may not be on sys.path yet for conftest itself
+        try:
+            import cli as _cli
+
+            monkeypatch.setattr(_cli, "IS_MACOS", False)
+            monkeypatch.setattr(_cli, "IS_LINUX", True)
+        except ImportError:
+            pass
 
 
 def _detect_runtime() -> str | None:
@@ -30,13 +65,26 @@ def _image_exists(runtime: str) -> bool:
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _ensure_nix_in_path():
+    """On macOS, ensure /nix/var/nix/profiles/default/bin is in PATH for
+    test subprocesses that invoke cli.py (which calls ``nix build``)."""
+    import os
+
+    nix_bin = "/nix/var/nix/profiles/default/bin"
+    if sys.platform == "darwin" and nix_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = nix_bin + ":" + os.environ.get("PATH", "")
+
+
+@pytest.fixture(scope="session", autouse=True)
 def ensure_jail_image():
     """
     Before any test runs, ensure yolo-jail:latest is loaded into the local container
     runtime. On the host this is a no-op (cli.py handles it). Inside a jail the inner
     podman has an empty image store, so we build via the host nix daemon and load.
     """
-    in_container = Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
+    in_container = sys.platform != "darwin" and (
+        Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
+    )
     if not in_container:
         return  # cli.py already handles this on the host
 

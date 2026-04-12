@@ -26,12 +26,14 @@ AI coding agents like Claude Code, GitHub Copilot, and Google Gemini CLI have a 
 - **Configurable:** Per-project config via `yolo-jail.jsonc`, user defaults via `~/.config/yolo-jail/config.jsonc`
 - **Container Reuse:** Same workspace reuses the same container via `exec`
 - **Runtime Flexible:** Works with both Docker and Podman (prefers Podman)
+- **Cross-Platform:** Full support for Linux and macOS (Apple Silicon and Intel)
 
 ## Prerequisites
 
 - **[uv](https://docs.astral.sh/uv/)** — Python package manager
 - **[Nix](https://nixos.org/download/)** (with flakes enabled)
 - **[Docker](https://docs.docker.com/)** or **[Podman](https://podman.io/)**
+- **Linux** or **macOS** (Apple Silicon and Intel) — see [docs/macos.md](docs/macos.md) for macOS setup
 
 ## Installation
 
@@ -110,7 +112,7 @@ Create a per-project config in `yolo-jail.jsonc`:
 
 ```jsonc
 {
-  "runtime": "podman",              // or "docker"
+  "runtime": "podman",              // or "docker" or "container" (Apple Container)
   "packages": ["strace", "htop"],   // extra nix packages
   "mounts": ["/path/to/ref-repo"],  // extra read-only mounts
   "network": {
@@ -157,6 +159,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 ## Documentation
 
 - [User Guide](docs/USER_GUIDE.md) — Detailed setup, configuration, and troubleshooting
+- [macOS Setup](docs/macos.md) — macOS-specific installation and setup guide
+- [Platform Comparison](docs/platform-comparison.md) — Feature matrix: Linux vs macOS
 - [Config Safety](docs/config-safety.md) — How config change approval works
 - [Storage & Config](docs/storage-and-config.md) — Storage hierarchy and mount layout
 

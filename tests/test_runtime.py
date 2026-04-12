@@ -1,6 +1,8 @@
 """Tests for container runtime selection and multi-runtime support."""
 
+import hashlib
 import os
+import re
 import sys
 import subprocess
 import json
@@ -33,8 +35,15 @@ def test_runtime_config_used_when_no_env():
 def test_runtime_auto_detect_when_no_config():
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("YOLO_RUNTIME", None)
-        result = _runtime({})
-        assert result in ("podman", "docker")
+        with (
+            patch("shutil.which") as mock_which,
+            patch("cli._runtime_is_connectable", return_value=True),
+        ):
+            mock_which.side_effect = lambda x: (
+                "/usr/bin/podman" if x == "podman" else None
+            )
+            result = _runtime({})
+            assert result in ("podman", "docker", "container")
 
 
 def test_runtime_rejects_invalid_env():
@@ -47,8 +56,12 @@ def test_runtime_rejects_invalid_env():
 def test_runtime_rejects_invalid_config():
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("YOLO_RUNTIME", None)
-        result = _runtime({"runtime": "lxc"})
-        assert result in ("podman", "docker")  # Falls through to auto-detect
+        with patch("shutil.which") as mock_which:
+            mock_which.side_effect = lambda x: (
+                "/usr/bin/docker" if x == "docker" else None
+            )
+            result = _runtime({"runtime": "lxc"})
+            assert result in ("podman", "docker", "container")
 
 
 def test_check_help_mentions_every_config_edit():
@@ -211,7 +224,31 @@ AVAILABLE_RUNTIMES = []
 if shutil.which("docker"):
     AVAILABLE_RUNTIMES.append("docker")
 if shutil.which("podman"):
-    AVAILABLE_RUNTIMES.append("podman")
+    # On macOS, podman requires a running VM (Podman Machine).  Only include
+    # it if `podman info` succeeds (confirms the machine is reachable).
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(
+                ["podman", "info"],
+                capture_output=True,
+                timeout=10,
+            ).check_returncode()
+            AVAILABLE_RUNTIMES.append("podman")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            pass  # Podman Machine not running — skip podman tests
+    else:
+        AVAILABLE_RUNTIMES.append("podman")
+if shutil.which("container"):
+    # Apple Container CLI (macOS only). Check that the system is running.
+    try:
+        subprocess.run(
+            ["container", "system", "status"],
+            capture_output=True,
+            timeout=10,
+        ).check_returncode()
+        AVAILABLE_RUNTIMES.append("container")
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+        pass  # Apple Container system not running
 
 
 def run_yolo_with_runtime(project_dir, command, runtime):
@@ -295,3 +332,183 @@ def test_workspace_mount(temp_project, runtime):
     result = run_yolo_with_runtime(temp_project, "ls -d /workspace", runtime)
     assert result.returncode == 0
     assert "/workspace" in result.stdout
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers for stale container tests
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _container_name_for_workspace(workspace: Path) -> str:
+    """Mirror cli.py's container_name_for_workspace for test cleanup."""
+    name = workspace.resolve().name
+    safe = re.sub(r"[^a-z0-9-]", "-", name.lower()).strip("-")[:40]
+    if not safe:
+        safe = "jail"
+    h = hashlib.sha256(str(workspace.resolve()).encode()).hexdigest()[:8]
+    return f"yolo-{safe}-{h}"
+
+
+def _force_remove_container(project_dir: Path, runtime: str):
+    """Force-remove the jail container for a project directory."""
+    cname = _container_name_for_workspace(project_dir)
+    if runtime == "container":
+        subprocess.run(
+            ["container", "rm", "--force", cname],
+            capture_output=True,
+            timeout=10,
+        )
+    else:
+        subprocess.run(
+            [runtime, "rm", "-f", cname],
+            capture_output=True,
+            timeout=10,
+        )
+
+
+def _create_stale_container(project_dir: Path, runtime: str):
+    """Create a stopped container with the jail's name to simulate a stale leftover.
+
+    Runs a trivial command in a named container WITHOUT --rm, so the container
+    remains in 'exited' state after it finishes.
+    """
+    cname = _container_name_for_workspace(project_dir)
+    # First ensure no container with this name exists
+    _force_remove_container(project_dir, runtime)
+    # Create and immediately exit a container (no --rm, so it stays as 'exited')
+    if runtime == "container":
+        # Apple Container: use 'container run' without --rm
+        subprocess.run(
+            ["container", "run", "--name", cname, "alpine:latest", "true"],
+            capture_output=True,
+            timeout=30,
+        )
+    else:
+        subprocess.run(
+            [runtime, "run", "--name", cname, "alpine:latest", "true"],
+            capture_output=True,
+            timeout=30,
+        )
+    return cname
+
+
+def _container_exists(cname: str, runtime: str) -> bool:
+    """Check if a container (running or stopped) exists."""
+    if runtime == "container":
+        result = subprocess.run(
+            ["container", "ls", "--all"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        for line in result.stdout.strip().splitlines()[1:]:
+            parts = line.split()
+            if parts and parts[0] == cname:
+                return True
+        return False
+    else:
+        result = subprocess.run(
+            [runtime, "ps", "-a", "-q", "--filter", f"name=^/{cname}$"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        return bool(result.stdout.strip())
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Integration tests: stale container recovery
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("runtime", AVAILABLE_RUNTIMES)
+def test_stale_container_auto_removed(temp_project, runtime):
+    """When a stopped container with the jail name exists, yolo should remove it
+    and successfully start a new jail."""
+    cname = _create_stale_container(temp_project, runtime)
+    try:
+        # Verify the stale container exists
+        assert _container_exists(cname, runtime), (
+            f"Setup failed: stale container {cname} was not created"
+        )
+
+        # Now run yolo — it should auto-remove the stale container and succeed
+        result = run_yolo_with_runtime(temp_project, "echo recovered", runtime)
+        assert result.returncode == 0, (
+            f"yolo failed with stale container present.\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert "recovered" in result.stdout
+        # Verify the stale removal message appeared
+        assert "Removing stale container" in result.stderr
+    finally:
+        _force_remove_container(temp_project, runtime)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("runtime", AVAILABLE_RUNTIMES)
+def test_stale_container_new_flag(temp_project, runtime):
+    """The --new flag should also handle stale containers."""
+    cname = _create_stale_container(temp_project, runtime)
+    try:
+        assert _container_exists(cname, runtime)
+
+        # Run with --new flag
+        env = {**os.environ, "TERM": "dumb", "YOLO_RUNTIME": runtime}
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--project",
+                str(REPO_ROOT),
+                "python",
+                str(REPO_ROOT / "src" / "cli.py"),
+                "run",
+                "--new",
+                "--",
+                "bash",
+                "-lc",
+                "echo fresh",
+            ],
+            cwd=str(temp_project),
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+        )
+        assert result.returncode == 0, (
+            f"yolo --new failed with stale container.\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+        assert "fresh" in result.stdout
+    finally:
+        _force_remove_container(temp_project, runtime)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Integration tests: startup banner
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("runtime", AVAILABLE_RUNTIMES)
+def test_startup_banner_present(temp_project, runtime):
+    """Startup banner should include version, platform, runtime, and container name."""
+    result = run_yolo_with_runtime(temp_project, "true", runtime)
+    assert result.returncode == 0, (
+        f"yolo failed.\nstdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    banner_line = None
+    for line in result.stderr.splitlines():
+        if line.startswith("yolo-jail "):
+            banner_line = line
+            break
+    assert banner_line is not None, (
+        f"Startup banner not found in stderr:\n{result.stderr}"
+    )
+    # Banner should contain: version | platform | runtime | container name
+    assert "|" in banner_line, f"Banner missing separators: {banner_line}"
+    assert runtime in banner_line, f"Runtime not in banner: {banner_line}"
+    cname = _container_name_for_workspace(temp_project)
+    assert cname in banner_line, f"Container name not in banner: {banner_line}"

@@ -42,6 +42,7 @@ from cli import (  # noqa: E402
     cleanup_port_forwarding,
     container_name_for_workspace,
     ensure_global_storage,
+    find_existing_container,
     find_running_container,
     generate_agents_md,
     load_config,
@@ -50,11 +51,14 @@ from cli import (  # noqa: E402
     _check_config_changes,
     _config_snapshot_path,
     _get_project_name,
+    _get_yolo_version,
     _load_jsonc_file,
     _merge_lists,
     ConfigError,
     _validate_cgroup_name,
     _parse_memory_value,
+    _print_startup_banner,
+    _remove_stale_container,
     _cgd_ensure_agent_cgroup,
     _cgd_create_and_join,
     _cgd_destroy,
@@ -235,6 +239,138 @@ class TestFindRunningContainer:
         with patch("subprocess.run", side_effect=FileNotFoundError):
             result = find_running_container("yolo-test", runtime="docker")
             assert result is None
+
+
+class TestFindExistingContainer:
+    def test_returns_cid_when_stopped(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="abc123def\n")
+            result = find_existing_container("yolo-test", runtime="docker")
+            assert result == "abc123def"
+            mock_run.assert_called_once_with(
+                ["docker", "ps", "-a", "-q", "--filter", "name=^/yolo-test$"],
+                capture_output=True,
+                text=True,
+            )
+
+    def test_returns_none_when_no_container(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="")
+            result = find_existing_container("yolo-test", runtime="docker")
+            assert result is None
+
+    def test_returns_none_on_file_not_found(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            result = find_existing_container("yolo-test", runtime="docker")
+            assert result is None
+
+    def test_apple_container_runtime(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="NAME\nyolo-test\n")
+            result = find_existing_container("yolo-test", runtime="container")
+            assert result == "yolo-test"
+            mock_run.assert_called_once_with(
+                ["container", "ls", "--all"],
+                capture_output=True,
+                text=True,
+            )
+
+    def test_podman_runtime(self):
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="def456\n")
+            result = find_existing_container("yolo-test", runtime="podman")
+            assert result == "def456"
+            mock_run.assert_called_once_with(
+                ["podman", "ps", "-a", "-q", "--filter", "name=^/yolo-test$"],
+                capture_output=True,
+                text=True,
+            )
+
+
+class TestRemoveStaleContainer:
+    def test_successful_removal(self, tmp_path):
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("cli.cleanup_container_tracking") as mock_cleanup,
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+            result = _remove_stale_container("yolo-test", runtime="docker")
+            assert result is True
+            mock_run.assert_called_once_with(
+                ["docker", "rm", "yolo-test"],
+                capture_output=True,
+                text=True,
+            )
+            mock_cleanup.assert_called_once_with("yolo-test")
+
+    def test_failed_removal(self):
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("cli.cleanup_container_tracking") as mock_cleanup,
+        ):
+            mock_run.return_value = MagicMock(returncode=1)
+            result = _remove_stale_container("yolo-test", runtime="docker")
+            assert result is False
+            mock_cleanup.assert_not_called()
+
+    def test_apple_container_runtime(self):
+        with (
+            patch("subprocess.run") as mock_run,
+            patch("cli.cleanup_container_tracking"),
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+            _remove_stale_container("yolo-test", runtime="container")
+            mock_run.assert_called_once_with(
+                ["container", "rm", "--force", "yolo-test"],
+                capture_output=True,
+                text=True,
+            )
+
+    def test_runtime_not_found(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            result = _remove_stale_container("yolo-test", runtime="docker")
+            assert result is False
+
+
+class TestPrintStartupBanner:
+    def test_banner_includes_platform_and_runtime(self, capsys):
+        _print_startup_banner("1.0.0", "podman", "yolo-test-abc123")
+        err = capsys.readouterr().err
+        assert "yolo-jail 1.0.0" in err
+        assert "podman" in err
+        assert "yolo-test-abc123" in err
+
+    def test_banner_with_resource_limits(self, capsys):
+        _print_startup_banner(
+            "1.0.0", "docker", "yolo-test-abc123", ["memory=8g", "cpus=4"]
+        )
+        err = capsys.readouterr().err
+        assert "Resource limits: memory=8g, cpus=4" in err
+
+    def test_banner_no_resource_limits(self, capsys):
+        _print_startup_banner("1.0.0", "docker", "yolo-test-abc123")
+        err = capsys.readouterr().err
+        assert "Resource limits" not in err
+
+
+class TestGetYoloVersion:
+    def test_returns_git_describe_version(self):
+        with patch("cli._git_describe_version", return_value="1.2.3"):
+            assert _get_yolo_version() == "1.2.3"
+
+    def test_falls_back_to_pkg_version(self):
+        with (
+            patch("cli._git_describe_version", return_value=None),
+            patch("importlib.metadata.version", return_value="0.9.0"),
+        ):
+            assert _get_yolo_version() == "0.9.0"
+
+    def test_returns_unknown_on_error(self):
+        with (
+            patch("cli._git_describe_version", return_value=None),
+            patch("importlib.metadata.version", side_effect=Exception("no pkg")),
+        ):
+            assert _get_yolo_version() == "unknown"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -881,9 +1017,10 @@ class TestRuntimeForCheck:
     def test_env_var_on_path(self):
         with patch.dict(os.environ, {"YOLO_RUNTIME": "docker"}):
             with patch("shutil.which", return_value="/usr/bin/docker"):
-                rt, err = _runtime_for_check({})
-                assert rt == "docker"
-                assert err is None
+                with patch("cli._runtime_is_connectable", return_value=True):
+                    rt, err = _runtime_for_check({})
+                    assert rt == "docker"
+                    assert err is None
 
     def test_env_var_not_on_path(self):
         with patch.dict(os.environ, {"YOLO_RUNTIME": "podman"}):
@@ -896,8 +1033,9 @@ class TestRuntimeForCheck:
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("YOLO_RUNTIME", None)
             with patch("shutil.which", return_value="/usr/bin/docker"):
-                rt, err = _runtime_for_check({"runtime": "docker"})
-                assert rt == "docker"
+                with patch("cli._runtime_is_connectable", return_value=True):
+                    rt, err = _runtime_for_check({"runtime": "docker"})
+                    assert rt == "docker"
 
     def test_auto_detect(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -906,8 +1044,9 @@ class TestRuntimeForCheck:
                 "shutil.which",
                 side_effect=lambda x: "/usr/bin/podman" if x == "podman" else None,
             ):
-                rt, err = _runtime_for_check({})
-                assert rt == "podman"
+                with patch("cli._runtime_is_connectable", return_value=True):
+                    rt, err = _runtime_for_check({})
+                    assert rt == "podman"
 
     def test_nothing_found(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -916,6 +1055,14 @@ class TestRuntimeForCheck:
                 rt, err = _runtime_for_check({})
                 assert rt is None
                 assert "No container runtime" in err
+
+    def test_env_var_not_connected(self):
+        with patch.dict(os.environ, {"YOLO_RUNTIME": "podman"}):
+            with patch("shutil.which", return_value="/usr/bin/podman"):
+                with patch("cli._runtime_is_connectable", return_value=False):
+                    rt, err = _runtime_for_check({})
+                    assert rt is None
+                    assert "not connected" in err
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

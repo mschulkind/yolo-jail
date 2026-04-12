@@ -42,9 +42,57 @@ jobs:
       - name: Unit tests
         run: uv run pytest tests/ -v -m "not slow"
 
-  integration:
+  check-macos:
+    runs-on: macos-latest
+    if: >
+      github.event_name == 'push' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install Python dependencies
+        run: uv sync --group dev
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Unit tests (macOS)
+        run: uv run pytest tests/ -v -m "not slow"
+
+  build-image:
     runs-on: ubuntu-latest
     needs: check
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Build jail image
+        run: |
+          nix build --impure .#dockerImage
+          ./result > /tmp/jail-image.tar
+
+      - name: Upload jail image
+        uses: actions/upload-artifact@v4
+        with:
+          name: jail-image
+          path: /tmp/jail-image.tar
+          retention-days: 1
+
+  integration:
+    runs-on: ubuntu-latest
+    needs: build-image
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,12 +113,18 @@ jobs:
       - name: Install Podman and socat
         run: sudo apt-get update && sudo apt-get install -y podman socat
 
-      - name: Build and load jail image
-        run: |
-          nix build --impure .#dockerImage
-          ./result | podman load
+      - name: Download jail image
+        uses: actions/download-artifact@v4
+        with:
+          name: jail-image
+          path: /tmp
+
+      - name: Load jail image
+        run: podman load < /tmp/jail-image.tar
 
       - name: Integration tests
         run: uv run pytest tests/test_jail.py -v
         env:
           YOLO_RUNTIME: podman
+
+
