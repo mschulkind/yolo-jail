@@ -653,7 +653,9 @@ def _is_apple_container(path: str) -> bool:
         result = subprocess.run(
             [path, "--version"], capture_output=True, text=True, timeout=5
         )
-        return "Apple" in result.stdout or "Apple" in result.stderr
+        out = result.stdout + result.stderr
+        # Match "Apple" or the distinctive "container CLI" version banner
+        return "Apple" in out or "container CLI version" in out
     except Exception:
         return False
 
