@@ -266,9 +266,13 @@ def _resolve_repo_root() -> Path:
       5. Error with helpful message
     """
     # 1. Env var (used inside jails, CI, etc.)
+    # Validate the path actually contains source — in nested jails the bind
+    # mount at /opt/yolo-jail may be empty (doesn't propagate from parent).
     env_val = os.environ.get("YOLO_REPO_ROOT")
     if env_val:
-        return Path(env_val).resolve()
+        p = Path(env_val)
+        if (p / "flake.nix").exists() or (p / "src" / "entrypoint.py").exists():
+            return p.resolve()
 
     # 2. Running from source checkout (dev mode)
     source_root = Path(__file__).parent.parent
@@ -311,8 +315,7 @@ def _resolve_repo_root() -> Path:
     # 4. User config
     if USER_CONFIG_PATH.exists():
         try:
-            with open(USER_CONFIG_PATH) as f:
-                cfg = pyjson5.load(f)
+            cfg = pyjson5.loads(USER_CONFIG_PATH.read_text())
             repo_path = cfg.get("repo_path")
             if repo_path:
                 p = Path(repo_path).expanduser().resolve()
@@ -364,6 +367,9 @@ def ensure_global_storage():
         ".yolo-perf.log",
         ".yolo-socat.log",
         ".yolo-entrypoint.lock",
+        # Shared credentials file — all jails mount this rw so /login in any
+        # jail persists for all jails.
+        str(Path(".claude") / ".credentials.json"),
     ]:
         p = GLOBAL_HOME / fname
         if not p.exists():
@@ -547,16 +553,6 @@ def _tmux_setup_jail_pane():
         except Exception:
             pass
 
-    def _tmux_unset(opt):
-        try:
-            subprocess.run(
-                ["tmux", "set-option", "-put", pane, opt],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            pass
-
     # Save old state
     old = {
         opt: _tmux_opt(opt)
@@ -686,7 +682,7 @@ def _runtime_is_connectable(rt: str) -> bool:
         return False
 
 
-def _runtime(config: Dict[str, Any] = None) -> str:
+def _runtime(config: Optional[Dict[str, Any]] = None) -> str:
     """Return container runtime: 'podman', 'docker', or 'container' (Apple).
 
     Auto-detection priority:
@@ -1248,13 +1244,16 @@ def _cgroup_delegate_handler(
         request = json.loads(data.decode("utf-8", errors="replace"))
         op = request.get("op", "")
 
-        # Get the host-PID of the caller via SO_PEERCRED (Linux) or LOCAL_PEERPID (macOS)
+        # Get the host-PID of the caller — only the PID is used; UID/GID
+        # returned alongside it are ignored.
+        # Linux: SO_PEERCRED (returns pid/uid/gid as three ints)
+        # macOS: LOCAL_PEERPID (returns just the pid)
         try:
             if IS_LINUX:
                 cred = conn.getsockopt(
                     socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
                 )
-                peer_pid, peer_uid, peer_gid = struct.unpack("3i", cred)
+                peer_pid = struct.unpack("3i", cred)[0]
             elif IS_MACOS:
                 # macOS: LOCAL_PEERPID (0x002) returns the peer PID
                 LOCAL_PEERPID = 0x002
@@ -1386,10 +1385,10 @@ def _cgd_create_and_join(
     if cpu_pct is not None:
         try:
             pct = int(cpu_pct)
-            if pct < 1 or pct > 100 * os.cpu_count():
+            nproc = os.cpu_count() or 1
+            if pct < 1 or pct > 100 * nproc:
                 errors.append(f"cpu_pct out of range: {pct}")
             else:
-                nproc = os.cpu_count() or 1
                 quota = pct * 1000 * nproc
                 (job_cg / "cpu.max").write_text(f"{quota} 100000")
         except (ValueError, OSError) as e:
@@ -1440,8 +1439,14 @@ def _cgd_create_and_join(
     return result
 
 
-def _cgd_destroy(container_cgroup: Path, name: str, log_file) -> dict:
-    """Remove a child cgroup (must be empty of processes)."""
+def _cgd_destroy(container_cgroup: Path, name: str, _log_file) -> dict:
+    """Remove a child cgroup (must be empty of processes).
+
+    `_log_file` is accepted to match the signature of sibling handlers
+    (`_cgd_create`, `_cgd_status`) that all share a dispatch table; this
+    handler doesn't need to log anything extra beyond the top-level request
+    log line.
+    """
     agent_cg = container_cgroup / "agent"
     job_cg = agent_cg / name
     if not job_cg.exists():
@@ -1645,18 +1650,21 @@ def _host_mise_dir() -> Path:
     return host_mise
 
 
-def _seed_agent_dir(src: Path, dst: Path):
+def _seed_agent_dir(src: Path, dst: Path, *, skip: tuple[str, ...] = ()):
     """Copy auth-related files from GLOBAL_HOME agent dir into per-workspace overlay.
 
     Only copies files that don't already exist in dst — the entrypoint regenerates
     configs on every boot, so we only need to seed auth tokens and similar
     persistent state on first use.  Skips subdirectories (those are created by
     the entrypoint as needed).
+
+    ``skip`` lists filenames that are handled via separate shared mounts (e.g.
+    .credentials.json) and should not be copied into per-workspace state.
     """
     if not src.is_dir():
         return
     for item in src.iterdir():
-        if item.is_file():
+        if item.is_file() and item.name not in skip:
             target = dst / item.name
             if not target.exists():
                 try:
@@ -2269,6 +2277,7 @@ def _materialize_image(store_path: str, cache_file: Path, status) -> int:
     total_bytes = 0
     chunk_size = 1024 * 1024  # 1 MB
     tmp_file = cache_file.with_suffix(".tmp")
+    assert stream_proc.stdout is not None  # PIPE set above; guarantees this is non-None
     try:
         with open(tmp_file, "wb") as f:
             while True:
@@ -2413,7 +2422,7 @@ def auto_load_image(
                     load_ok = load_result.returncode == 0
 
             if not load_ok:
-                if runtime != "container":
+                if runtime != "container" and load_result is not None:
                     console.print(
                         f"[bold red]Error loading image into {runtime}.[/bold red]"
                     )
@@ -2434,8 +2443,7 @@ def _load_jsonc_file(path: Path, label: str, *, strict: bool = False) -> Dict[st
     if not path.exists():
         return {}
     try:
-        with open(path, "r") as f:
-            parsed = pyjson5.load(f)
+        parsed = pyjson5.loads(path.read_text())
         if isinstance(parsed, dict):
             return parsed
         msg = f"{label} must contain a top-level JSON object"
@@ -3408,7 +3416,8 @@ def config_ref():
   [bold]env[/bold] (object): Extra environment variables set inside the jail.
     Keys are variable names, values are strings.
     Merged: user config provides defaults, workspace config overrides.
-    These are set as container-level env vars (visible to all processes).
+    Written to ~/.config/yolo-user-env.sh (sourced by .bashrc and entrypoint).
+    Can be overridden by mise .env or by editing the file inside the jail.
     Example: {"DATABASE_URL": "postgres://localhost/dev", "DEBUG": "1"}
 
   [bold]mounts[/bold] (array of strings): Extra host paths mounted read-only.
@@ -3715,6 +3724,162 @@ def config_ref():
   • Key files to examine first
   Your inner-jail self will be a fresh session without your context.
 """)
+
+
+def _check_claude_token_refresher(repo_root: Optional[Path], ok, warn, fail) -> None:
+    """Verify the host-side Claude OAuth token refresher is healthy.
+
+    Checks (in order, each independent):
+      1. refresher script is present and executable in the repo
+      2. shared credentials file parses and its access token is still valid
+      3. systemd user unit files are installed (if systemctl is available)
+      4. timer is enabled and active
+      5. last service run did not fail
+
+    On a non-systemd host (e.g. macOS), reports only the non-systemd pieces.
+    When run inside a jail, skips entirely — the refresher lives on the host
+    and a jail has no visibility into host systemd, the real GLOBAL_HOME, or
+    the bind-mount source of the credentials file.
+    """
+    if os.environ.get("YOLO_VERSION") is not None:
+        ok("Inside jail — refresher checks skipped (managed by host)")
+        return
+
+    # --- Script presence ---
+    if repo_root is None:
+        warn("Skipping refresher checks", "repo root not resolved")
+        return
+    script = repo_root / "scripts" / "claude-token-refresher.py"
+    if not script.is_file():
+        fail(f"Refresher script missing: {script}")
+        return
+    if not os.access(script, os.X_OK):
+        fail(f"Refresher script not executable: {script}", f"chmod +x {script}")
+    else:
+        ok(f"Refresher script: {script}")
+
+    # --- Credentials file ---
+    creds_path = GLOBAL_HOME / ".claude" / ".credentials.json"
+    if not creds_path.exists():
+        warn(
+            f"No credentials at {creds_path}",
+            "Run `claude` and /login to create — refresher has nothing to refresh yet",
+        )
+    else:
+        try:
+            oauth = json.loads(creds_path.read_text()).get("claudeAiOauth") or {}
+            expires_at_ms = int(oauth.get("expiresAt", 0))
+            if expires_at_ms == 0:
+                warn(f"{creds_path} has no expiresAt", "Re-run /login")
+            else:
+                headroom_secs = expires_at_ms / 1000 - time.time()
+                sub = oauth.get("subscriptionType", "?")
+                if headroom_secs <= 0:
+                    fail(
+                        f"Access token expired {-headroom_secs / 60:.0f}m ago (sub={sub})",
+                        f"Run `claude` /login or force: {script} --force",
+                    )
+                elif headroom_secs < 300:
+                    warn(
+                        f"Access token expires in {headroom_secs / 60:.1f}m (sub={sub})",
+                        "Refresher may be lagging — check journalctl --user -u claude-token-refresher",
+                    )
+                else:
+                    ok(
+                        f"Credentials: sub={sub}, expires in {headroom_secs / 3600:.1f}h"
+                    )
+        except (json.JSONDecodeError, OSError, ValueError, TypeError) as e:
+            fail(f"Could not parse {creds_path}", str(e))
+
+    # --- systemd integration (Linux only) ---
+    if not shutil.which("systemctl"):
+        warn(
+            "systemctl not found — refresher cannot run as a timer on this host",
+            "Run it from cron, launchd, or manually instead",
+        )
+        return
+
+    systemd_dir = Path.home() / ".config" / "systemd" / "user"
+    service_unit = systemd_dir / "claude-token-refresher.service"
+    timer_unit = systemd_dir / "claude-token-refresher.timer"
+    if not service_unit.is_file() or not timer_unit.is_file():
+        fail(
+            "Refresher systemd units not installed",
+            "Run `just deploy` from the yolo-jail repo to install them",
+        )
+        return
+    ok(f"systemd units installed: {systemd_dir}")
+
+    # Check that the service unit's ExecStart actually points at our script.
+    # A stale unit file from a previous checkout at a different path is an
+    # easy-to-miss bug; better to flag it here.
+    try:
+        unit_text = service_unit.read_text()
+        if str(script) not in unit_text:
+            warn(
+                "Service unit ExecStart does not reference current script path",
+                f"Re-run `just deploy` from {repo_root} to refresh the unit",
+            )
+    except OSError:
+        pass
+
+    def _systemctl(args: List[str]) -> "tuple[int, str]":
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", *args],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            return result.returncode, (result.stdout or result.stderr).strip()
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return -1, str(e)
+
+    # --- Timer enabled ---
+    rc, out = _systemctl(["is-enabled", "claude-token-refresher.timer"])
+    if rc == 0 and out == "enabled":
+        ok("Refresher timer enabled")
+    else:
+        fail(
+            f"Refresher timer not enabled (state: {out or 'unknown'})",
+            "systemctl --user enable --now claude-token-refresher.timer",
+        )
+        return
+
+    # --- Timer active ---
+    rc, out = _systemctl(["is-active", "claude-token-refresher.timer"])
+    if rc == 0 and out == "active":
+        ok("Refresher timer active")
+    else:
+        fail(
+            f"Refresher timer not active (state: {out or 'unknown'})",
+            "systemctl --user start claude-token-refresher.timer",
+        )
+        return
+
+    # --- Last service run status ---
+    # is-failed returns 0 if the unit IS failed, nonzero otherwise.
+    rc, out = _systemctl(["is-failed", "claude-token-refresher.service"])
+    if rc == 0 and out == "failed":
+        fail(
+            "Refresher service last run failed",
+            "journalctl --user -u claude-token-refresher -n 30 --no-pager",
+        )
+        return
+    ok("Refresher service has not failed")
+
+    # --- Next scheduled run (informational) ---
+    rc, out = _systemctl(
+        [
+            "show",
+            "claude-token-refresher.timer",
+            "-p",
+            "NextElapseUSecRealtime",
+            "--value",
+        ]
+    )
+    if rc == 0 and out and out != "n/a":
+        ok(f"Next refresher tick: {out}")
 
 
 @app.command()
@@ -4386,6 +4551,12 @@ def check(
             warn("Could not check running containers")
         console.print()
 
+    # --- Claude Token Refresher ---
+
+    console.print("[bold]Claude Token Refresher[/bold]")
+    _check_claude_token_refresher(repo_root, ok, warn, fail)
+    console.print()
+
     # --- Summary ---
 
     console.print("[bold]Summary[/bold]")
@@ -4811,7 +4982,11 @@ def run(
     # files that already exist (the entrypoint regenerates configs each time).
     _seed_agent_dir(GLOBAL_HOME / ".copilot", ws_state / "copilot")
     _seed_agent_dir(GLOBAL_HOME / ".gemini", ws_state / "gemini")
-    _seed_agent_dir(GLOBAL_HOME / ".claude", ws_state / "claude")
+    # Skip .credentials.json — it's handled via a shared rw mount so /login
+    # in any jail persists for all jails (not per-workspace).
+    _seed_agent_dir(
+        GLOBAL_HOME / ".claude", ws_state / "claude", skip=(".credentials.json",)
+    )
 
     # Seed claude.json onboarding state into the per-workspace overlay.
     # ~/.claude.json is a symlink → .claude/claude.json, so the actual file
@@ -4859,6 +5034,12 @@ def run(
         # base + 15 individual per-workspace writable overlays (which would use
         # 16 slots), mount ws_state as a single writable /home/agent.
         # Auth tokens are already seeded into ws_state from GLOBAL_HOME above.
+        #
+        # Note: Apple Container cannot do the cross-jail shared .credentials.json
+        # rw mount (one bind mount per file would push us over the device limit).
+        # On AC, each workspace has its own credentials file; cross-jail /login
+        # propagation requires podman or docker on macOS, or running the
+        # host-side claude-token-refresher which uses the GLOBAL_HOME source.
         docker_cmd = [
             runtime,
             "run",
@@ -4931,6 +5112,13 @@ def run(
             f"{ws_state / 'gemini'}:/home/agent/.gemini",
             "-v",
             f"{ws_state / 'claude'}:/home/agent/.claude",
+            # Shared credentials — mounted rw ON TOP of the per-workspace .claude
+            # overlay so /login in any jail persists for all jails.  The host-side
+            # claude-token-refresher writes to this file directly, keeping jails
+            # from having to refresh (and racing against Anthropic's refresh-token
+            # rotation).
+            "-v",
+            f"{GLOBAL_HOME / '.claude' / '.credentials.json'}:/home/agent/.claude/.credentials.json",
             # Other per-workspace overlays
             "-v",
             f"{ws_state / 'bash_history'}:/home/agent/.bash_history",
@@ -5038,9 +5226,24 @@ def run(
         ]
     )
 
-    # User-defined environment variables from config
-    for env_key, env_val in user_env.items():
-        docker_cmd.extend(["-e", f"{env_key}={env_val}"])
+    # User-defined environment variables from config.
+    # Written to a sourceable file instead of container -e flags so they can be
+    # overridden by editing .env or the file inside the jail without restarting.
+    user_env_file = ws_state / "yolo-user-env.sh"
+    if user_env:
+        lines = ["# Auto-generated from yolo-jail.jsonc env config.\n"]
+        lines.append("# Override by editing this file or workspace .env (mise).\n")
+        for env_key, env_val in user_env.items():
+            # Only set if not already overridden (e.g. by mise .env loading)
+            escaped = env_val.replace("'", "'\\''")
+            lines.append(
+                "export %(k)s=${%(k)s:-'%(v)s'}\n" % {"k": env_key, "v": escaped}
+            )
+        user_env_file.write_text("".join(lines))
+    else:
+        # Ensure the file exists (empty) so the mount doesn't fail
+        user_env_file.touch()
+    docker_cmd.extend(["-v", f"{user_env_file}:/home/agent/.config/yolo-user-env.sh"])
 
     docker_cmd += [
         "--workdir",
@@ -5486,7 +5689,7 @@ def run(
                 if cmd:
                     script_cmds.append(cmd)
             # Walk hooks: {"EventName": [{"hooks": [{"command": "..."}]}]}
-            for _event, matchers in (host_settings.get("hooks") or {}).items():
+            for matchers in (host_settings.get("hooks") or {}).values():
                 if not isinstance(matchers, list):
                     continue
                 for matcher in matchers:
@@ -5572,6 +5775,7 @@ def run(
     # Re-prepend yolo-shims after mise env so our wrappers (yolo, blocked tools)
     # take priority over mise-installed console_scripts in installs/python/.../bin/.
     mise_activate = (
+        '. "$HOME/.config/yolo-user-env.sh" 2>/dev/null; '
         'eval "$(mise env -s bash)" 2>/dev/null; export PATH="$HOME/.yolo-shims:$PATH"'
     )
 
@@ -5832,12 +6036,12 @@ def ps():
         w_status = max(len(c[1]) for c in containers)
         header = f"{'CONTAINER':<{w_name}}  {'STATUS':<{w_status}}  WORKSPACE"
         typer.echo(header)
-        for name, status, _running_for, workspace in containers:
+        for name, status, _, workspace in containers:
             typer.echo(f"{name:<{w_name}}  {status:<{w_status}}  {workspace}")
 
     # Warn about orphaned/stuck jails
     problems = []
-    for name, _status, _running_for, workspace in containers:
+    for name, *_, workspace in containers:
         if workspace != "unknown" and not Path(workspace).is_dir():
             problems.append((name, "workspace gone"))
         else:

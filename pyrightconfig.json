@@ -1,0 +1,12 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": ["src", "tests"],
+  "exclude": ["**/__pycache__", ".venv", "result", "dist", "build"],
+  "reportMissingImports": "error",
+  "reportUnusedVariable": "none",
+  "reportUnusedFunction": "none",
+  "reportUnusedImport": "none",
+  "reportUnusedClass": "none",
+  "reportUnusedExpression": "none"
+}

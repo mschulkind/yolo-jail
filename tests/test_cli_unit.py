@@ -157,11 +157,28 @@ class TestResolveRepoRoot:
     def test_env_var_takes_priority(self, tmp_path):
         env_root = tmp_path / "env-repo"
         env_root.mkdir()
+        # Must contain expected marker files so validation passes
+        (env_root / "flake.nix").touch()
         with patch.dict(os.environ, {"YOLO_REPO_ROOT": str(env_root)}):
             from cli import _resolve_repo_root
 
             result = _resolve_repo_root()
             assert result == env_root.resolve()
+
+    def test_env_var_falls_through_when_empty(self, tmp_path):
+        """YOLO_REPO_ROOT pointing to an empty dir falls through to source checkout."""
+        empty_root = tmp_path / "empty-repo"
+        empty_root.mkdir()
+        with patch.dict(os.environ, {"YOLO_REPO_ROOT": str(empty_root)}):
+            from cli import _resolve_repo_root
+
+            result = _resolve_repo_root()
+            # Should NOT return the empty dir — should fall through
+            assert result != empty_root.resolve()
+            # Should find the actual source checkout instead
+            assert (result / "flake.nix").exists() or (
+                result / "src" / "entrypoint.py"
+            ).exists()
 
     def test_source_checkout_detected(self, monkeypatch):
         """Running from the actual source checkout should find the repo root."""

@@ -1,3 +1,7 @@
+# Override global ignore: check pyrightconfig.json into the repo so
+# everyone gets the same type-check setup.
+!pyrightconfig.json
+
 result
 .run-result
 .last-load

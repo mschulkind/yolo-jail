@@ -56,7 +56,10 @@ def test_runtime_rejects_invalid_env():
 def test_runtime_rejects_invalid_config():
     with patch.dict(os.environ, {}, clear=False):
         os.environ.pop("YOLO_RUNTIME", None)
-        with patch("shutil.which") as mock_which:
+        with (
+            patch("shutil.which") as mock_which,
+            patch("cli._runtime_is_connectable", return_value=True),
+        ):
             mock_which.side_effect = lambda x: (
                 "/usr/bin/docker" if x == "docker" else None
             )

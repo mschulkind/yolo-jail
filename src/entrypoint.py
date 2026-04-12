@@ -326,6 +326,10 @@ export GIT_PAGER=cat
 export EDITOR=cat
 export VISUAL=nvim
 
+# Source user-defined env vars from config (defaults, overridable by .env).
+# Loaded early so mise activation can override with .env values.
+[ -f "$HOME/.config/yolo-user-env.sh" ] && . "$HOME/.config/yolo-user-env.sh"
+
 # PATH with npm-global and go binaries
 export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.npm-global}"
 export NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-$HOME/.cache/npm}"
@@ -945,8 +949,25 @@ def _install_claude_plugins(plugin_map: dict, lsp_servers: dict):
             pass  # non-fatal — plugin will be installed on next boot
 
 
+def _credentials_expiry(path: Path) -> int:
+    """Return the expiresAt timestamp (ms) from a Claude credentials file, or 0."""
+    import json as _json
+
+    try:
+        data = _json.loads(path.read_text())
+        oauth = data.get("claudeAiOauth") or {}
+        return int(oauth.get("expiresAt", 0))
+    except (ValueError, OSError, KeyError):
+        return 0
+
+
 def _sync_host_claude_files():
-    """Copy host ~/.claude/ files into the jail, except settings.json (merged separately)."""
+    """Copy host ~/.claude/ files into the jail, except settings.json (merged separately).
+
+    For .credentials.json, keeps the freshest token — if the jail already has
+    credentials with a later expiry (from a prior /login), the host copy is
+    skipped so the user doesn't have to re-login in every jail.
+    """
     import json as _json
 
     host_claude_files = _json.loads(os.environ.get("YOLO_HOST_CLAUDE_FILES", "[]"))
@@ -957,16 +978,23 @@ def _sync_host_claude_files():
             continue  # handled by configure_claude() via deep-merge
         src = host_claude_dir / fname
         dst = CLAUDE_DIR / fname
-        if src.exists():
-            try:
-                shutil.copy2(str(src), str(dst))
-            except shutil.SameFileError:
-                pass  # nested jail — src and dst are the same inode
-            except OSError as e:
-                print(
-                    f"Warning: could not copy host claude file {fname}: {e}",
-                    file=sys.stderr,
-                )
+        if not src.exists():
+            continue
+        # For credentials: keep the token with the later expiry.
+        if fname == ".credentials.json":
+            dst_expiry = _credentials_expiry(dst)
+            src_expiry = _credentials_expiry(src)
+            if dst_expiry >= src_expiry and dst_expiry > 0:
+                continue  # jail credentials are fresher — keep them
+        try:
+            shutil.copy2(str(src), str(dst))
+        except shutil.SameFileError:
+            pass  # nested jail — src and dst are the same inode
+        except OSError as e:
+            print(
+                f"Warning: could not copy host claude file {fname}: {e}",
+                file=sys.stderr,
+            )
 
 
 def _load_host_claude_settings() -> dict:
@@ -1309,10 +1337,18 @@ def exec_bash(command: str):
         sys.stderr.write(f"\033[1;36m⚡ Executing: {command}\033[0m\n")
         sys.stderr.flush()
 
-    # Prepend mise env activation so tool paths (copilot, gemini, .venv/bin,
-    # etc.) are available. Fresh containers get this from cli.py's inline
-    # eval, but exec-into-existing skips that code path.
-    activated_command = f'eval "$(mise env -s bash)" 2>/dev/null; {command}'
+    # Source user-defined env vars from config (defaults, overridable by .env).
+    # Then activate mise so tool paths (copilot, gemini, .venv/bin, etc.) are
+    # available.  Mise env runs AFTER user-env so .env can override config vars.
+    # Fresh containers get mise activation from cli.py's inline eval, but
+    # exec-into-existing skips that code path.
+    user_env_file = HOME / ".config" / "yolo-user-env.sh"
+    source_user_env = (
+        f'. "{user_env_file}" 2>/dev/null; ' if user_env_file.exists() else ""
+    )
+    activated_command = (
+        f'{source_user_env}eval "$(mise env -s bash)" 2>/dev/null; {command}'
+    )
 
     os.execvp(
         "bash",

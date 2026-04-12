@@ -1,0 +1,23 @@
+[Unit]
+Description=Refresh shared Claude Code OAuth token for yolo-jail
+Documentation=https://github.com/mschulkind-oss/yolo-jail/blob/main/scripts/README.md
+# Don't run before network is up — we need to reach platform.claude.com
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Resolve the full path to the repo-local script.  Install instructions show
+# how to edit this if you keep the repo somewhere other than ~/code/yolo-jail.
+ExecStart=%h/code/yolo-jail/scripts/claude-token-refresher.py
+# Don't retry on failure — the timer will fire again soon enough.  A
+# transient network error shouldn't tie up systemd.
+Restart=no
+# Defensive sandboxing.  We only need network + HOME for reading the
+# credentials file and writing back to it.
+ProtectSystem=strict
+ProtectHome=read-write
+PrivateTmp=yes
+NoNewPrivileges=yes
+# Timeout: generous, in case the auth endpoint is slow.
+TimeoutStartSec=60

@@ -1,0 +1,19 @@
+[Unit]
+Description=Periodic Claude Code OAuth token refresh
+Documentation=https://github.com/mschulkind-oss/yolo-jail/blob/main/scripts/README.md
+
+[Timer]
+# Fire 30 seconds after boot so the first refresh lands quickly after a
+# reboot without blocking startup.
+OnBootSec=30s
+# Then every 10 minutes.  Access tokens live ~8 hours and the refresher's
+# default threshold is 30 minutes, so in steady state this does an actual
+# refresh once every ~7.5 hours; the intervening runs are no-ops that just
+# verify state.  Cheap.
+OnUnitActiveSec=10m
+# Coalesce across jobs for efficiency — we don't need precise timing.
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

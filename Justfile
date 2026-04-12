@@ -56,9 +56,48 @@ build:
 install: build
     uv tool install --force "$(ls -1 dist/*.whl | head -1)"
 
-# Build + install (deploy the yolo CLI)
+# Installs:
+#   1. yolo CLI (via uv tool install)
+#   2. Claude OAuth token refresher (systemd --user timer, if on Linux)
+# Safe to re-run — idempotent.
+# Build and install everything needed for yolo-jail on this host
 deploy: install
-    @echo "yolo-jail deployed. Verify: which yolo"
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    # --- Claude token refresher (systemd --user timer) ---
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "⚠ systemctl not found — skipping token refresher (not a systemd host)"
+    else
+        REPO_ROOT="$(pwd)"
+        SCRIPT="$REPO_ROOT/scripts/claude-token-refresher.py"
+        if [ ! -x "$SCRIPT" ]; then
+            echo "ERROR: $SCRIPT not found or not executable" >&2
+            exit 1
+        fi
+
+        SYSTEMD_DIR="$HOME/.config/systemd/user"
+        mkdir -p "$SYSTEMD_DIR"
+
+        # Substitute the repo path into the service template so ExecStart
+        # points at the right checkout.  The template uses the literal
+        # "%h/code/yolo-jail" marker so it stays readable in-repo.
+        sed "s|%h/code/yolo-jail|$REPO_ROOT|g" \
+            scripts/claude-token-refresher.service \
+            > "$SYSTEMD_DIR/claude-token-refresher.service"
+        cp scripts/claude-token-refresher.timer "$SYSTEMD_DIR/"
+
+        systemctl --user daemon-reload
+        systemctl --user enable --now claude-token-refresher.timer
+
+        # Fire once now so the first refresh check runs without waiting for
+        # OnBootSec.  Non-fatal — the timer retries on its own cadence.
+        systemctl --user start claude-token-refresher.service || true
+
+        echo "✓ claude-token-refresher installed at $SYSTEMD_DIR"
+    fi
+
+    echo "yolo-jail deployed. Verify: yolo check"
 
 # Build the container image using Nix
 build-image:
