@@ -3930,11 +3930,6 @@ def check(
                 "Reinstall Nix or check /etc/synthetic.conf",
             )
 
-        # Cgroup limitation notice
-        warn(
-            "cgroup delegation unavailable (macOS kernel limitation)",
-            "Resource limits inside the jail are not enforced on macOS",
-        )
         console.print()
 
     console.print("[bold]Global Storage[/bold]")
