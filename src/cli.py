@@ -1271,14 +1271,28 @@ def _host_service_default_jail_socket(name: str) -> str:
     return f"{JAIL_HOST_SERVICES_DIR}/{name}.sock"
 
 
-def _host_service_sockets_dir(ws_state: Path) -> Path:
+def _host_service_sockets_dir(cname: str) -> Path:
     """Per-jail directory holding all host-service sockets on the host side.
 
-    Bind-mounted into the jail at JAIL_HOST_SERVICES_DIR.  Lives under
-    ws_state rather than /tmp so it survives host tmp cleanups and is
-    naturally scoped to the workspace.
+    Bind-mounted into the jail at JAIL_HOST_SERVICES_DIR.
+
+    Lives under /tmp (not ws_state!) because Linux's AF_UNIX path limit is
+    108 bytes and macOS's is 104 — workspace paths on CI runners or in
+    nested directories can easily blow that when we append
+    "<service-name>.sock" on top.  /tmp is always 4 bytes, leaving plenty
+    of room.
+
+    The directory name uses an 8-char hash of the container name to avoid
+    collisions while keeping the path short:
+
+        /tmp/yolo-host-services-<8hex>/cgroup-delegate.sock   (~53 bytes)
+
+    macOS resolves /tmp → /private/tmp; we use the resolved form so paths
+    we hand to Python's socket module match what the kernel sees.
     """
-    return ws_state / "host-services"
+    short_hash = hashlib.sha1(cname.encode()).hexdigest()[:8]
+    base = Path("/tmp").resolve() if IS_MACOS else Path("/tmp")
+    return base / f"yolo-host-services-{short_hash}"
 
 
 def _substitute_socket_in_cmd(args: List[str], socket_path: str) -> List[str]:
@@ -1829,7 +1843,6 @@ def _start_host_service_external(
 
 
 def start_host_services(
-    ws_state: Path,
     cname: str,
     runtime: str,
     config: Dict[str, Any],
@@ -1841,9 +1854,10 @@ def start_host_services(
     ``config["host_services"]`` as external processes.
 
     The caller is responsible for passing the returned handles to
-    ``stop_host_services`` at container exit.
+    ``stop_host_services`` at container exit, along with the same socket
+    directory (recoverable via ``_host_service_sockets_dir(cname)``).
     """
-    sockets_dir = _host_service_sockets_dir(ws_state)
+    sockets_dir = _host_service_sockets_dir(cname)
     sockets_dir.mkdir(parents=True, exist_ok=True)
 
     handles: List[HostService] = []
@@ -5982,7 +5996,11 @@ def run(
     # its Unix socket here.  Apple Container can't share Unix sockets via
     # virtiofs, so we skip the mount entirely there — start_host_services()
     # also returns no handles in that case.
-    host_services_sockets_dir = _host_service_sockets_dir(ws_state)
+    #
+    # The sockets dir lives under /tmp (not ws_state) because Linux's
+    # AF_UNIX path limit is 108 bytes and a deep workspace path blows it.
+    # See _host_service_sockets_dir() docstring.
+    host_services_sockets_dir = _host_service_sockets_dir(cname)
     if runtime != "container":
         host_services_sockets_dir.mkdir(parents=True, exist_ok=True)
         docker_cmd.extend(
@@ -6358,7 +6376,7 @@ def run(
     # exist when the entrypoint and agent code inside the jail try to
     # connect to them.  Env vars must be added BEFORE the image arg, so
     # do this before appending final_internal_cmd.
-    host_services = start_host_services(ws_state, cname, runtime, config)
+    host_services = start_host_services(cname, runtime, config)
     for svc in host_services:
         # Insert each `-e VAR=val` pair just before the image arg.  We can't
         # extend at the end — the image and command args are already in

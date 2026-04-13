@@ -93,11 +93,11 @@ class TestMacosCgroupSkip:
         # stop with empty list (what start returns on macOS for the builtin)
         stop_host_services([], tmp_path / "nonexistent")
 
-    def test_start_host_services_macos_skips_builtin(self, monkeypatch, tmp_path):
+    def test_start_host_services_macos_skips_builtin(self, monkeypatch):
         _set_macos(monkeypatch)
         # Even with podman as runtime, on macOS the builtin returns None
         # (no cgroup v2), so no handles come back.
-        handles = start_host_services(tmp_path, "test-cname", "podman", {})
+        handles = start_host_services("test-cname-macos", "podman", {})
         assert handles == []
 
 

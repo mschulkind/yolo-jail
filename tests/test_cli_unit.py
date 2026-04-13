@@ -2179,14 +2179,31 @@ class TestHostServices:
         result = _substitute_socket_in_cmd(cmd, "/tmp/foo.sock")
         assert result == ["./serve.py", "--socket", "/tmp/foo.sock", "--quiet"]
 
-    def test_sockets_dir_is_per_workspace(self, tmp_path):
-        d = _host_service_sockets_dir(tmp_path)
-        assert d == tmp_path / "host-services"
+    def test_sockets_dir_is_short_and_under_tmp(self):
+        """Sockets dir lives under /tmp with a short hash — NOT under ws_state.
 
-    def test_external_service_launch_and_stop(self, tmp_path, monkeypatch):
-        """Launch a tiny inline Python service that binds the socket and echoes one line."""
-        # Service script: bind the socket from --socket, accept one connection,
-        # echo whatever it receives, then exit.
+        Linux's AF_UNIX path limit is 108 bytes (104 on macOS).  Workspace
+        paths on CI runners can be 100+ bytes on their own, which blows the
+        limit when we append the socket filename.  /tmp + 8-char hash keeps
+        the total well under the limit for any realistic service name.
+        """
+        d = _host_service_sockets_dir("yolo-some-very-long-workspace-12345")
+        s = str(d)
+        # Path is anchored at /tmp (or /private/tmp on macOS)
+        assert s.startswith("/tmp/") or s.startswith("/private/tmp/")
+        assert d.name.startswith("yolo-host-services-")
+        # The whole thing is short enough that even with the longest realistic
+        # service name appended, we stay well under 108 bytes.
+        assert len(s) + len("/cgroup-delegate-with-some-suffix.sock") < 108
+        # Deterministic: same cname → same dir
+        assert d == _host_service_sockets_dir("yolo-some-very-long-workspace-12345")
+        # Different cname → different dir
+        assert d != _host_service_sockets_dir("yolo-other-cname")
+
+    def test_external_service_launch_and_stop(self, tmp_path):
+        """Launch a tiny inline Python service that binds the socket."""
+        # Script can live in tmp_path — long paths are fine for the script
+        # itself; only the SOCKET path is constrained by AF_UNIX.
         service_script = tmp_path / "echo-service.py"
         service_script.write_text(
             "import socket, sys, time\n"
@@ -2194,54 +2211,78 @@ class TestHostServices:
             "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
             "sock.bind(sys.argv[i])\n"
             "sock.listen(1)\n"
-            "# Sleep until killed by the parent — we only need the bind to succeed.\n"
+            "# Sleep until killed by the parent — we only need the bind.\n"
             "while True:\n"
             "    time.sleep(60)\n"
         )
-        sockets_dir = tmp_path / "host-services"
-        spec = {
-            "command": [sys.executable, str(service_script), "--socket", "{socket}"],
-        }
-        handle = _start_host_service_external("echoer", spec, sockets_dir)
-        assert handle is not None
-        assert handle.name == "echoer"
-        assert handle.host_socket_path.exists()
-        assert handle.host_socket_path == sockets_dir / "echoer.sock"
-        assert handle.env_var_name == "YOLO_SERVICE_ECHOER_SOCKET"
+        # Use the production helper to get a short /tmp dir.
+        sockets_dir = _host_service_sockets_dir("yolo-test-svc-launch")
+        try:
+            spec = {
+                "command": [
+                    sys.executable,
+                    str(service_script),
+                    "--socket",
+                    "{socket}",
+                ],
+            }
+            handle = _start_host_service_external("echoer", spec, sockets_dir)
+            assert handle is not None
+            assert handle.name == "echoer"
+            assert handle.host_socket_path.exists()
+            assert handle.host_socket_path == sockets_dir / "echoer.sock"
+            assert handle.env_var_name == "YOLO_SERVICE_ECHOER_SOCKET"
 
-        # Stop via the unified machinery
-        stop_host_services([handle], sockets_dir)
-        assert not sockets_dir.exists()
+            # Stop via the unified machinery
+            stop_host_services([handle], sockets_dir)
+            assert not sockets_dir.exists()
+        finally:
+            # Defensive cleanup if the assertions failed mid-test
+            if sockets_dir.exists():
+                import shutil as _sh
 
-    def test_external_service_command_not_found(self, tmp_path):
+                _sh.rmtree(sockets_dir, ignore_errors=True)
+
+    def test_external_service_command_not_found(self):
         """Bad command path → returns None, doesn't raise."""
-        sockets_dir = tmp_path / "host-services"
-        spec = {"command": ["/nonexistent/binary/that/does/not/exist", "{socket}"]}
-        handle = _start_host_service_external("ghost", spec, sockets_dir)
-        assert handle is None
+        sockets_dir = _host_service_sockets_dir("yolo-test-svc-notfound")
+        try:
+            spec = {"command": ["/nonexistent/binary/that/does/not/exist", "{socket}"]}
+            handle = _start_host_service_external("ghost", spec, sockets_dir)
+            assert handle is None
+        finally:
+            if sockets_dir.exists():
+                import shutil as _sh
+
+                _sh.rmtree(sockets_dir, ignore_errors=True)
 
     def test_external_service_exits_early(self, tmp_path):
         """Service that exits without binding the socket → None."""
         service_script = tmp_path / "exit-service.py"
         service_script.write_text("import sys; sys.exit(0)\n")
-        spec = {"command": [sys.executable, str(service_script), "{socket}"]}
-        handle = _start_host_service_external(
-            "quitter", spec, tmp_path / "host-services"
-        )
-        assert handle is None
+        sockets_dir = _host_service_sockets_dir("yolo-test-svc-quitter")
+        try:
+            spec = {"command": [sys.executable, str(service_script), "{socket}"]}
+            handle = _start_host_service_external("quitter", spec, sockets_dir)
+            assert handle is None
+        finally:
+            if sockets_dir.exists():
+                import shutil as _sh
 
-    def test_start_host_services_skips_apple_container(self, tmp_path):
+                _sh.rmtree(sockets_dir, ignore_errors=True)
+
+    def test_start_host_services_skips_apple_container(self):
         """Apple Container can't bind-mount Unix sockets — we skip everything."""
         handles = start_host_services(
-            tmp_path,
             "test-cname",
             "container",  # Apple Container
             {"host_services": {"foo": {"command": ["/bin/sleep", "9999"]}}},
         )
         assert handles == []
 
-    def test_start_host_services_reserves_builtin_name(self, tmp_path):
+    def test_start_host_services_reserves_builtin_name(self):
         """User can't shadow the builtin cgroup-delegate service."""
+        cname = "yolo-test-reserved-name"
         config = {
             "host_services": {
                 BUILTIN_CGROUP_SERVICE_NAME: {
@@ -2249,13 +2290,20 @@ class TestHostServices:
                 }
             }
         }
-        # Mock _resolve_container_cgroup so the builtin doesn't try to reach a real container
-        with patch("cli._resolve_container_cgroup", return_value=None):
-            handles = start_host_services(tmp_path, "test", "podman", config)
-        # The user spec is silently dropped; only the builtin (if available) appears.
-        names = [h.name for h in handles]
-        if names:
-            # On a host with cgroup v2, only the builtin should be present.
-            assert names == [BUILTIN_CGROUP_SERVICE_NAME]
-        # Clean up
-        stop_host_services(handles, _host_service_sockets_dir(tmp_path))
+        try:
+            # Mock _resolve_container_cgroup so the builtin doesn't try to reach a real container
+            with patch("cli._resolve_container_cgroup", return_value=None):
+                handles = start_host_services(cname, "podman", config)
+            # The user spec is silently dropped; only the builtin (if available) appears.
+            names = [h.name for h in handles]
+            if names:
+                # On a host with cgroup v2, only the builtin should be present.
+                assert names == [BUILTIN_CGROUP_SERVICE_NAME]
+            # Clean up
+            stop_host_services(handles, _host_service_sockets_dir(cname))
+        finally:
+            sockets_dir = _host_service_sockets_dir(cname)
+            if sockets_dir.exists():
+                import shutil as _sh
+
+                _sh.rmtree(sockets_dir, ignore_errors=True)
