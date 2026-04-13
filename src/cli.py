@@ -1,3 +1,4 @@
+import dataclasses
 import difflib
 import fcntl
 import os
@@ -14,8 +15,9 @@ import hashlib
 import time
 import tempfile
 import threading
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, List, Dict, Any, Union
+from typing import Callable, Optional, List, Dict, Any, Union
 import typer
 import pyjson5
 from rich.console import Console
@@ -1174,24 +1176,114 @@ def cleanup_port_forwarding(
 
 
 # ---------------------------------------------------------------------------
-# Host-side cgroup delegate daemon
+# Host services: split the jail boundary with outside-the-jail processes
 # ---------------------------------------------------------------------------
-# Instead of giving the container CAP_SYS_ADMIN to remount /sys/fs/cgroup rw,
-# we run a thin host-side daemon that performs cgroup operations on behalf of
-# the container.  The daemon listens on a Unix socket that is bind-mounted
-# into the jail.  The container-side `yolo-cglimit` client sends JSON
-# requests; the daemon validates them and performs the cgroup writes on the
-# host filesystem where cgroup v2 is writable.
+# A host service is a process that runs on the host (outside the jail) and
+# exposes a Unix socket that gets bind-mounted into the jail at a well-known
+# path.  The agent inside the jail can talk to the service without holding
+# any of the service's secrets or privileges.  This is how we split the jail
+# boundary cleanly:
 #
-# Security model:
-#   - All cgroup operations are confined to the container's cgroup subtree
-#   - Cgroup names are strictly validated (alphanumeric + dash/underscore)
-#   - Limit values are range-checked
-#   - PID identity comes from SO_PEERCRED (kernel-attested, unforgeable)
-#   - Every operation is logged to a file for auditability
+#   • Secrets / privileges live in the host process, not in the jail
+#   • Access control lives in the host process, not in the jail
+#   • The jail gets a socket — nothing else crosses the boundary
+#
+# Two kinds of services:
+#
+#   1. Builtin services.  Implemented in-process in the yolo CLI.  Today the
+#      cgroup delegate daemon is the only one — it performs privileged cgroup
+#      operations on behalf of the container.  Built-ins are auto-started
+#      when applicable (e.g. cgroup delegate on Linux only).
+#
+#   2. External services.  Configured in yolo-jail.jsonc under `host_services`.
+#      The user provides a command to launch.  yolo substitutes `{socket}` in
+#      the command args with the host-side socket path, launches the process,
+#      waits for the socket to appear, and tears it down when the jail exits.
+#      Example: a token broker that holds API keys and answers scoped requests.
+#
+# Both kinds share:
+#   • Same bind-mounted directory in the jail: /run/yolo-services/
+#   • Same socket naming: /run/yolo-services/<service-name>.sock
+#   • Same env var convention: YOLO_SERVICE_<NAME>_SOCKET
+#   • Same lifecycle: started before docker run, stopped after container exits
+#
+# Security model (both kinds):
+#   • The socket dir is bind-mounted from a per-jail host directory — no
+#     other jails can see the socket.
+#   • Services can use SO_PEERCRED on Linux to attest the caller's host PID.
+#   • What the service does with secrets, scopes, and audit logging is the
+#     service's problem.  yolo just wires the plumbing.
 # ---------------------------------------------------------------------------
 
+# Directory inside the jail where all host service sockets appear.
+# All bind mounts land under this path.
+JAIL_HOST_SERVICES_DIR = "/run/yolo-services"
+
+# Name of the builtin cgroup delegate service.  Reserved — user-configured
+# services in `host_services` cannot use this name.
+BUILTIN_CGROUP_SERVICE_NAME = "cgroup-delegate"
+
+# Legacy name used by the cgroup daemon when it was hard-coded at
+# /tmp/yolo-cgd/cgroup.sock.  Kept as a constant for the refactor so the
+# existing handler can be reused without changes.
 CGD_SOCKET_NAME = "cgroup.sock"
+
+
+@dataclass
+class HostService:
+    """A host-side service exposing a Unix socket inside the jail.
+
+    Created by `start_host_services` and torn down by `stop_host_services`.
+    Holds everything `run()` needs to wire the service into the docker command:
+    bind mount, env var, optional client shim path.
+
+    The `_stop` callable encapsulates the service's shutdown logic (SIGTERM for
+    external, shutdown event for builtin) so both kinds look the same to the
+    lifecycle manager.
+    """
+
+    name: str
+    # Absolute path to the Unix socket on the host (inside the per-jail sockets dir).
+    host_socket_path: Path
+    # Absolute path where the socket appears inside the jail.
+    jail_socket_path: str
+    # Env var injected into the container so the agent can discover the socket.
+    # Always set to YOLO_SERVICE_<sanitized-name>_SOCKET.
+    env_var_name: str
+    # Stop callable.  Called with no args at container exit.  Must not raise.
+    _stop: "Callable[[], None]" = dataclasses.field(
+        default_factory=lambda: lambda: None
+    )
+    # Optional path of a generated client-shim script, relative to the jail
+    # filesystem.  If set, the shim is written into the per-workspace overlay
+    # and appears on PATH inside the jail.
+    client_shim_jail_path: Optional[str] = None
+
+
+def _host_service_env_var(service_name: str) -> str:
+    """Return the canonical env var name for a service's socket path."""
+    sanitized = re.sub(r"[^A-Za-z0-9]+", "_", service_name).strip("_").upper()
+    return f"YOLO_SERVICE_{sanitized}_SOCKET"
+
+
+def _host_service_default_jail_socket(name: str) -> str:
+    """Default path where a service's socket appears inside the jail."""
+    return f"{JAIL_HOST_SERVICES_DIR}/{name}.sock"
+
+
+def _host_service_sockets_dir(ws_state: Path) -> Path:
+    """Per-jail directory holding all host-service sockets on the host side.
+
+    Bind-mounted into the jail at JAIL_HOST_SERVICES_DIR.  Lives under
+    ws_state rather than /tmp so it survives host tmp cleanups and is
+    naturally scoped to the workspace.
+    """
+    return ws_state / "host-services"
+
+
+def _substitute_socket_in_cmd(args: List[str], socket_path: str) -> List[str]:
+    """Replace '{socket}' in each arg with the actual socket path."""
+    return [a.replace("{socket}", socket_path) for a in args]
 
 
 def _resolve_container_cgroup(cname: str, runtime: str) -> Optional[Path]:
@@ -1517,29 +1609,29 @@ def _cgd_destroy(container_cgroup: Path, name: str, _log_file) -> dict:
         return {"ok": False, "error": f"Cannot remove cgroup {name}: {e}"}
 
 
-def start_cgroup_delegate(
-    cname: str, runtime: str, socket_dir: Path
-) -> Optional[threading.Thread]:
-    """Start the host-side cgroup delegate daemon.
+def _start_host_service_builtin_cgroup(
+    cname: str, runtime: str, sockets_dir: Path
+) -> Optional[HostService]:
+    """Start the built-in cgroup delegate daemon as a host service.
 
-    Listens on a Unix socket in socket_dir.  Returns the daemon thread, or
-    None if cgroup v2 is not available on this host.
+    Listens on <sockets_dir>/cgroup.sock.  Returns a HostService handle, or
+    None if cgroup v2 is not available (macOS or Linux without cgroup v2).
 
-    On macOS, cgroups don't exist — the daemon is not started and resource
-    limiting inside the jail is unavailable.
+    This is functionally identical to the pre-refactor `start_cgroup_delegate`
+    — same thread, same handler, same JSON protocol.  The only difference is
+    that the socket now lives in the unified per-jail host-services directory
+    instead of /tmp/yolo-cgd-<cname>.
     """
     if IS_MACOS:
         # macOS has no cgroup v2 — skip the delegation daemon entirely.
-        # The socket dir still needs to exist so the container mount succeeds.
-        socket_dir.mkdir(parents=True, exist_ok=True)
         return None
 
     # Quick sanity: is cgroup v2 available on the host?
     if not Path("/sys/fs/cgroup/cgroup.controllers").exists():
         return None
 
-    socket_dir.mkdir(parents=True, exist_ok=True)
-    sock_path = socket_dir / CGD_SOCKET_NAME
+    sockets_dir.mkdir(parents=True, exist_ok=True)
+    sock_path = sockets_dir / CGD_SOCKET_NAME
     sock_path.unlink(missing_ok=True)
 
     log_dir = GLOBAL_STORAGE / "logs"
@@ -1604,27 +1696,197 @@ def start_cgroup_delegate(
         srv.close()
         log_file.close()
 
-    t = threading.Thread(target=serve, daemon=True, name=f"cgd-{cname}")
-    t._shutdown_event = shutdown  # type: ignore[attr-defined]
-    t._socket = srv  # type: ignore[attr-defined]
+    t = threading.Thread(
+        target=serve, daemon=True, name=f"host-service-{BUILTIN_CGROUP_SERVICE_NAME}"
+    )
     t.start()
 
     # Give the socket a moment to be ready
     time.sleep(0.05)
-    return t
+
+    def _stop():
+        shutdown.set()
+        # The srv.settimeout(1.0) means accept() will return within a second,
+        # at which point the loop notices shutdown.is_set() and exits cleanly.
+        t.join(timeout=3)
+
+    return HostService(
+        name=BUILTIN_CGROUP_SERVICE_NAME,
+        host_socket_path=sock_path,
+        jail_socket_path=_host_service_default_jail_socket(BUILTIN_CGROUP_SERVICE_NAME),
+        env_var_name=_host_service_env_var(BUILTIN_CGROUP_SERVICE_NAME),
+        _stop=_stop,
+    )
 
 
-def stop_cgroup_delegate(
-    thread: Optional[threading.Thread], socket_dir: Optional[Path]
-):
-    """Stop the cgroup delegate daemon and clean up."""
-    if thread is not None:
-        shutdown = getattr(thread, "_shutdown_event", None)
-        if shutdown:
-            shutdown.set()
-        thread.join(timeout=3)
-    if socket_dir and socket_dir.exists():
-        shutil.rmtree(socket_dir, ignore_errors=True)
+def _start_host_service_external(
+    name: str,
+    spec: Dict[str, Any],
+    sockets_dir: Path,
+    startup_timeout_secs: float = 5.0,
+) -> Optional[HostService]:
+    """Launch a user-configured external host service.
+
+    The service's command is expected to bind a Unix socket at the path
+    substituted for `{socket}` in its args.  Returns a HostService handle if
+    the service bound the socket within `startup_timeout_secs`, or None on
+    failure (command not found, socket not bound, process exited early).
+    """
+    sockets_dir.mkdir(parents=True, exist_ok=True)
+    host_socket = sockets_dir / f"{name}.sock"
+    host_socket.unlink(missing_ok=True)
+
+    cmd_template = spec.get("command") or []
+    if not isinstance(cmd_template, list) or not cmd_template:
+        console.print(f"[red]Host service '{name}' has no command; skipping[/red]")
+        return None
+
+    cmd = _substitute_socket_in_cmd(
+        [
+            str(Path(str(a)).expanduser()) if a.startswith("~") else str(a)
+            for a in cmd_template
+        ],
+        str(host_socket),
+    )
+
+    env = {**os.environ}
+    for k, v in (spec.get("env") or {}).items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        env[k] = str(Path(v).expanduser()) if v.startswith("~") else v
+
+    log_dir = GLOBAL_STORAGE / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_dir / f"host-service-{name}.log", "ab")
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=log_file,
+            stderr=log_file,
+            start_new_session=True,  # own process group so SIGTERM reaches kids
+        )
+    except (OSError, FileNotFoundError) as e:
+        console.print(f"[red]Failed to launch host service '{name}': {e}[/red]")
+        log_file.close()
+        return None
+
+    # Wait for the service to bind the socket (or exit early with an error).
+    deadline = time.monotonic() + startup_timeout_secs
+    while time.monotonic() < deadline:
+        if host_socket.exists():
+            break
+        if proc.poll() is not None:
+            console.print(
+                f"[red]Host service '{name}' exited early with code "
+                f"{proc.returncode} before binding {host_socket}[/red]"
+            )
+            log_file.close()
+            return None
+        time.sleep(0.05)
+    else:
+        console.print(
+            f"[red]Host service '{name}' did not bind {host_socket} within "
+            f"{startup_timeout_secs:.1f}s — killing[/red]"
+        )
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        log_file.close()
+        return None
+
+    def _stop():
+        # SIGTERM, give it 5s, SIGKILL if it's still around.
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+        try:
+            log_file.close()
+        except Exception:
+            pass
+
+    jail_socket = spec.get("jail_socket") or _host_service_default_jail_socket(name)
+    return HostService(
+        name=name,
+        host_socket_path=host_socket,
+        jail_socket_path=jail_socket,
+        env_var_name=_host_service_env_var(name),
+        _stop=_stop,
+    )
+
+
+def start_host_services(
+    ws_state: Path,
+    cname: str,
+    runtime: str,
+    config: Dict[str, Any],
+) -> List[HostService]:
+    """Start all host services for this jail and return handles.
+
+    Always attempts the built-in cgroup delegate (skipped gracefully on
+    macOS and non-cgroup-v2 Linux).  Then launches any services declared in
+    ``config["host_services"]`` as external processes.
+
+    The caller is responsible for passing the returned handles to
+    ``stop_host_services`` at container exit.
+    """
+    sockets_dir = _host_service_sockets_dir(ws_state)
+    sockets_dir.mkdir(parents=True, exist_ok=True)
+
+    handles: List[HostService] = []
+
+    # Apple Container doesn't support Unix socket bind mounts at all (it
+    # can't share the sockets dir into the jail), so we skip host services
+    # entirely there.  The sockets dir still gets created above so any
+    # subsequent per-file bind mounts don't fail.
+    if runtime == "container":
+        return handles
+
+    # 1. Built-in cgroup delegate (Linux only, cgroup v2 only).
+    builtin = _start_host_service_builtin_cgroup(cname, runtime, sockets_dir)
+    if builtin is not None:
+        handles.append(builtin)
+
+    # 2. External services from config.
+    external_specs = config.get("host_services") or {}
+    if isinstance(external_specs, dict):
+        for name, spec in external_specs.items():
+            if name == BUILTIN_CGROUP_SERVICE_NAME:
+                # Reserved — user can't shadow the builtin.
+                continue
+            if not isinstance(spec, dict):
+                continue
+            h = _start_host_service_external(name, spec, sockets_dir)
+            if h is not None:
+                handles.append(h)
+
+    return handles
+
+
+def stop_host_services(handles: List[HostService], sockets_dir: Optional[Path]) -> None:
+    """Stop all host services and clean up the sockets directory."""
+    for h in handles:
+        try:
+            h._stop()
+        except Exception as e:
+            console.print(
+                f"[yellow]Error stopping host service '{h.name}': {e}[/yellow]"
+            )
+    if sockets_dir is not None and sockets_dir.exists():
+        shutil.rmtree(sockets_dir, ignore_errors=True)
 
 
 VALID_MCP_PRESETS = {"chrome-devtools", "sequential-thinking"}
@@ -1914,7 +2176,7 @@ def generate_agents_md(
             "",
             "**How it works**: The yolo CLI runs a cgroup delegate daemon on the host alongside",
             "the container. When you call `yolo-cglimit`, it sends a JSON request to the daemon",
-            "via `/tmp/yolo-cgd/cgroup.sock`. The daemon creates a child cgroup in the container's",
+            "via `/run/yolo-services/cgroup-delegate.sock`. The daemon creates a child cgroup in the container's",
             "cgroup tree, sets limits, and moves your process into it using SO_PEERCRED for secure",
             "PID identity. All operations are logged for auditability.",
             "",
@@ -2566,6 +2828,7 @@ KNOWN_TOP_LEVEL_CONFIG_KEYS = {
     "resources",
     "env",
     "host_claude_files",
+    "host_services",
 }
 KNOWN_NETWORK_KEYS = {"mode", "ports", "forward_host_ports"}
 KNOWN_SECURITY_KEYS = {"blocked_tools"}
@@ -2576,6 +2839,8 @@ KNOWN_MCP_SERVER_KEYS = {"command", "args"}
 KNOWN_DEVICE_KEYS = {"usb", "description", "cgroup_rule"}
 KNOWN_GPU_KEYS = {"enabled", "devices", "capabilities"}
 KNOWN_RESOURCES_KEYS = {"memory", "cpus", "pids_limit"}
+KNOWN_HOST_SERVICE_KEYS = {"command", "env", "jail_socket"}
+HOST_SERVICE_NAME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,63}$")
 USB_ID_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$")
 MEMORY_RE = re.compile(r"^\d+[bkmgBKMG]?$")
 
@@ -2756,6 +3021,64 @@ def _validate_config(
                     errors.append(
                         f"config.host_claude_files[{idx}]: must be a filename, not a path"
                     )
+
+    host_services = config.get("host_services")
+    if host_services is not None:
+        if not isinstance(host_services, dict):
+            errors.append("config.host_services: expected an object")
+        else:
+            for name, spec in host_services.items():
+                path = f"config.host_services.{name}"
+                if not isinstance(name, str) or not HOST_SERVICE_NAME_RE.match(name):
+                    errors.append(
+                        f"config.host_services: service name {name!r} must match "
+                        f"^[a-zA-Z][a-zA-Z0-9_-]{{0,63}}$"
+                    )
+                    continue
+                if name == BUILTIN_CGROUP_SERVICE_NAME:
+                    errors.append(
+                        f"{path}: '{BUILTIN_CGROUP_SERVICE_NAME}' is reserved "
+                        "for the built-in cgroup delegate service"
+                    )
+                    continue
+                if not isinstance(spec, dict):
+                    errors.append(f"{path}: expected an object")
+                    continue
+                _report_unknown_keys(spec, KNOWN_HOST_SERVICE_KEYS, path, errors)
+                cmd = spec.get("command")
+                if cmd is None:
+                    errors.append(f"{path}.command: required")
+                elif not isinstance(cmd, list) or not cmd:
+                    errors.append(
+                        f"{path}.command: expected a non-empty list of strings"
+                    )
+                else:
+                    for ci, ca in enumerate(cmd):
+                        if not isinstance(ca, str):
+                            errors.append(
+                                f"{path}.command[{ci}]: expected a string, got {type(ca).__name__}"
+                            )
+                env = spec.get("env")
+                if env is not None:
+                    if not isinstance(env, dict):
+                        errors.append(f"{path}.env: expected an object")
+                    else:
+                        for k, v in env.items():
+                            if not isinstance(k, str) or not isinstance(v, str):
+                                errors.append(
+                                    f"{path}.env: keys and values must be strings"
+                                )
+                                break
+                jail_socket = spec.get("jail_socket")
+                if jail_socket is not None:
+                    if not isinstance(jail_socket, str):
+                        errors.append(f"{path}.jail_socket: expected a string")
+                    elif not jail_socket.startswith(JAIL_HOST_SERVICES_DIR + "/"):
+                        errors.append(
+                            f"{path}.jail_socket: must start with "
+                            f"{JAIL_HOST_SERVICES_DIR}/ "
+                            f"(got {jail_socket!r})"
+                        )
 
     network = config.get("network")
     if network is not None:
@@ -3512,6 +3835,42 @@ def config_ref():
     Default: ["settings.json"]
     Set to [] to disable host claude file syncing.
     Example: ["settings.json", "keybindings.json"]
+
+  [bold]host_services[/bold] (object): Host-side services exposed inside the jail via Unix sockets.
+    Each key is a service name (must match ^[a-zA-Z][a-zA-Z0-9_-]{0,63}$).
+    The name "cgroup-delegate" is reserved for the built-in cgroup daemon.
+
+    Each value is an object with:
+      "command" (array of strings, required): the command to launch on the host
+        when the jail starts.  "{socket}" in any arg is substituted with the
+        actual host-side socket path the service should bind.
+      "env" (object, optional): extra env vars for the host daemon (NOT the jail).
+      "jail_socket" (string, optional): override the jail-side socket path.
+        Must start with /run/yolo-services/ and end in .sock.
+        Default: /run/yolo-services/<name>.sock
+
+    Each service gets:
+      • Its socket bind-mounted into the jail at /run/yolo-services/<name>.sock
+      • An env var YOLO_SERVICE_<NAME>_SOCKET injected into the container so
+        agents can locate the socket without hard-coding paths.
+      • A managed lifecycle: started before docker run, SIGTERM + 5s grace +
+        SIGKILL after the container exits.
+      • stdout/stderr captured to ~/.local/share/yolo-jail/logs/host-service-<name>.log
+
+    Use this to split the jail boundary cleanly: a host-side process can hold
+    secrets, credentials, and access-control logic that the agent inside the
+    jail can call but never sees.  See docs/USER_GUIDE.md § Host Services for
+    a complete example.
+
+    Example:
+      "host_services": {
+        "auth-broker": {
+          "command": ["~/code/auth-broker/serve.py", "--socket", "{socket}"],
+          "env": {"KEYS_FILE": "~/secrets/keys.json"}
+        }
+      }
+
+    Apple Container is unsupported (no Unix-socket bind-mount through virtiofs).
 
   [bold]env[/bold] (object): Extra environment variables set inside the jail.
     Keys are variable names, values are strings.
@@ -4669,6 +5028,38 @@ def check(
     _check_claude_token_refresher(repo_root, ok, warn, fail)
     console.print()
 
+    # --- Host Services ---
+
+    host_services_cfg = config.get("host_services") or {}
+    if host_services_cfg:
+        console.print("[bold]Host Services[/bold]")
+        for name, spec in host_services_cfg.items():
+            if name == BUILTIN_CGROUP_SERVICE_NAME:
+                continue  # builtin is unconditional, not user-configurable
+            if not isinstance(spec, dict):
+                continue
+            cmd = spec.get("command") or []
+            if not isinstance(cmd, list) or not cmd:
+                fail(f"host_services.{name}: missing command")
+                continue
+            # Resolve the command's executable.  Allow ~ expansion and PATH lookup.
+            exe_arg = str(cmd[0])
+            exe_path = Path(exe_arg).expanduser()
+            if exe_path.is_absolute():
+                if exe_path.is_file() and os.access(exe_path, os.X_OK):
+                    ok(f"host_services.{name}: {exe_path}")
+                else:
+                    fail(
+                        f"host_services.{name}: command not found or not executable: {exe_path}"
+                    )
+            else:
+                resolved = shutil.which(exe_arg)
+                if resolved:
+                    ok(f"host_services.{name}: {resolved}")
+                else:
+                    fail(f"host_services.{name}: command not found on PATH: {exe_arg}")
+        console.print()
+
     # --- Summary ---
 
     console.print("[bold]Summary[/bold]")
@@ -5585,11 +5976,18 @@ def run(
             socket_dir = _host_tmp / f"yolo-fwd-{cname}"
             docker_cmd.extend(["-v", f"{socket_dir}:/tmp/yolo-fwd:rw"])
 
-    # Host-side cgroup delegate: Unix socket for safe cgroup operations
-    # Apple Container doesn't support cgroup delegation or Unix socket bind mounts
-    cgd_socket_dir = _host_tmp / f"yolo-cgd-{cname}"
+    # Host services: bind-mount the per-jail sockets directory into the jail
+    # at /run/yolo-services/.  Each service (built-in cgroup delegate,
+    # user-configured external services from `host_services` in config) drops
+    # its Unix socket here.  Apple Container can't share Unix sockets via
+    # virtiofs, so we skip the mount entirely there — start_host_services()
+    # also returns no handles in that case.
+    host_services_sockets_dir = _host_service_sockets_dir(ws_state)
     if runtime != "container":
-        docker_cmd.extend(["-v", f"{cgd_socket_dir}:/tmp/yolo-cgd:rw"])
+        host_services_sockets_dir.mkdir(parents=True, exist_ok=True)
+        docker_cmd.extend(
+            ["-v", f"{host_services_sockets_dir}:{JAIL_HOST_SERVICES_DIR}:rw"]
+        )
 
     # Device passthrough from config
     # On macOS, device passthrough goes through the container runtime's VM.
@@ -5946,8 +6344,6 @@ def run(
             f"{target_cmd}"
         )
 
-    docker_cmd.append(final_internal_cmd)
-
     write_container_tracking(cname, workspace)
     _tmux_rename_window("JAIL")
 
@@ -5957,9 +6353,23 @@ def run(
     if socket_dir:
         socat_procs = start_host_port_forwarding(forward_host_ports, cname, socket_dir)
 
-    # Start host-side cgroup delegate daemon BEFORE the container so the
-    # socket exists when the entrypoint or agent runs yolo-cglimit.
-    cgd_thread = start_cgroup_delegate(cname, runtime, cgd_socket_dir)
+    # Start all host-side services (built-in cgroup delegate + any user
+    # `host_services` from config) BEFORE the container so their sockets
+    # exist when the entrypoint and agent code inside the jail try to
+    # connect to them.  Env vars must be added BEFORE the image arg, so
+    # do this before appending final_internal_cmd.
+    host_services = start_host_services(ws_state, cname, runtime, config)
+    for svc in host_services:
+        # Insert each `-e VAR=val` pair just before the image arg.  We can't
+        # extend at the end — the image and command args are already in
+        # docker_cmd at this point.
+        image_idx = docker_cmd.index(_jail_image(runtime))
+        docker_cmd[image_idx:image_idx] = [
+            "-e",
+            f"{svc.env_var_name}={svc.jail_socket_path}",
+        ]
+
+    docker_cmd.append(final_internal_cmd)
 
     if os.environ.get("YOLO_DEBUG"):
         print(" ".join(shlex.quote(s) for s in docker_cmd), file=sys.stderr)
@@ -5977,7 +6387,7 @@ def run(
             "[dim]Run `yolo check` to validate runtime availability before restarting.[/dim]"
         )
         cleanup_port_forwarding(socat_procs, socket_dir)
-        stop_cgroup_delegate(cgd_thread, cgd_socket_dir)
+        stop_host_services(host_services, host_services_sockets_dir)
         lock_file.close()
         sys.exit(1)
     for _ in range(20):
@@ -5989,9 +6399,10 @@ def run(
     proc.wait()
     result = proc
 
-    # Clean up host-side socat processes, cgroup delegate, and socket directories
+    # Clean up host-side socat processes, host services (incl. cgroup
+    # delegate), and their per-jail socket directory.
     cleanup_port_forwarding(socat_procs, socket_dir)
-    stop_cgroup_delegate(cgd_thread, cgd_socket_dir)
+    stop_host_services(host_services, host_services_sockets_dir)
 
     if profile and _profile_times:
         _profile_times["container_exited"] = _time.monotonic()

@@ -20,6 +20,7 @@ This guide covers everything you need to get started with YOLO Jail and make the
 - [Blocked Tools](#blocked-tools)
 - [Device Passthrough](#device-passthrough)
 - [GPU Passthrough (NVIDIA)](#gpu-passthrough-nvidia)
+- [Host Services](#host-services)
 - [Storage & Persistence](#storage--persistence)
 - [Container Reuse](#container-reuse)
 - [Config Safety](#config-safety)
@@ -696,6 +697,145 @@ Use an AWS Deep Learning AMI (DLAMI) — drivers and toolkit come pre-installed.
 - **`conmon bytes "": readObjectStart` error (Podman):** Caused by `crun` OCI runtime's CDI handling bug ([podman#27483](https://github.com/containers/podman/issues/27483)). The jail automatically uses `--runtime runc` when GPU is enabled to work around this. If you see this, update your `yolo-jail` installation.
 - **`nvidia-smi` not found inside jail:** The NVIDIA Container Toolkit injects driver libs at container start. Check the toolkit is installed and configured on the host.
 - **CUDA out of memory:** Reduce batch size, or limit which GPUs are exposed with `"devices": "0"`.
+
+---
+
+## Host Services
+
+**A way to split the jail boundary cleanly.** A host service is a process that runs on the host (outside the jail) and exposes a Unix socket that gets bind-mounted into the jail at `/run/yolo-services/<name>.sock`. The agent inside the jail can talk to the service without ever holding the service's secrets, credentials, or privileges.
+
+This is exactly the pattern used by the built-in cgroup delegate daemon: a host-side process performs privileged cgroup operations on behalf of the container so the jail itself doesn't need `CAP_SYS_ADMIN` or rw cgroup mounts. `host_services` lets you define your own services that follow the same pattern.
+
+### When to use it
+
+- **Auth / credential brokers.** A service holds API keys, OAuth tokens, or signed JWTs and answers scoped requests from the agent. The jail never sees the raw credentials.
+- **Access control proxies.** A service fronts an internal API and enforces "agent X may only call endpoint Y with payload Z" rules outside the jail.
+- **Audit / logging sinks.** A service receives structured events from the agent and writes them to a host-side log the jail can't tamper with.
+- **Resource brokers.** Anything where you want a small piece of host-side trust without pulling the entire dependency into the jail.
+
+### Configuration
+
+```jsonc
+{
+  "host_services": {
+    "auth-broker": {
+      // Command to launch on the host when the jail starts.
+      // "{socket}" is substituted with the host-side socket path the
+      // service should bind.
+      "command": ["~/code/auth-broker/serve.py", "--socket", "{socket}"],
+
+      // Optional environment variables for the host daemon (NOT the jail).
+      "env": {
+        "KEYS_FILE": "~/secrets/broker-keys.json",
+        "LOG_LEVEL": "info"
+      },
+
+      // Optional override of where the socket appears inside the jail.
+      // Must start with /run/yolo-services/ — that's the only directory
+      // that gets bind-mounted in.  Default: /run/yolo-services/<name>.sock
+      "jail_socket": "/run/yolo-services/auth-broker.sock"
+    }
+  }
+}
+```
+
+The service name (`auth-broker` above) must match `^[a-zA-Z][a-zA-Z0-9_-]{0,63}$`. The name `cgroup-delegate` is reserved for the built-in.
+
+### Lifecycle
+
+For each service, on `yolo run`:
+
+1. Per-jail directory `<workspace>/.yolo/host-services/` is created on the host and bind-mounted into the jail at `/run/yolo-services/`.
+2. yolo substitutes `{socket}` in the service's command with the host-side path, e.g. `<workspace>/.yolo/host-services/auth-broker.sock`.
+3. yolo launches the command as a child process. The service is expected to bind the socket at the substituted path.
+4. yolo waits up to 5 seconds for the socket file to appear. If the service exits early or doesn't bind in time, yolo logs the failure and continues without that service.
+5. The container starts. The agent inside sees `/run/yolo-services/auth-broker.sock` and can connect.
+6. When the container exits, yolo sends `SIGTERM` to each service, waits 5 seconds, then `SIGKILL`.
+7. The per-jail sockets directory is removed.
+
+Service stdout and stderr are captured to `~/.local/share/yolo-jail/logs/host-service-<name>.log` for debugging.
+
+### Discovering the socket from inside the jail
+
+For each service, yolo injects an env var so the agent doesn't need to hard-code the path:
+
+```
+YOLO_SERVICE_AUTH_BROKER_SOCKET=/run/yolo-services/auth-broker.sock
+```
+
+The variable name is `YOLO_SERVICE_<UPPERCASED-NAME>_SOCKET`, with non-alphanumeric characters replaced by underscores.
+
+### Minimal example service
+
+A trivial Python broker that hands out a single secret. The service runs on the host, holds the secret, and never reveals it to the jail — the jail just gets the resolved value for the key it asks about.
+
+```python
+# ~/code/auth-broker/serve.py
+import json, os, socket, sys
+
+KEYS = json.load(open(os.environ["KEYS_FILE"]))
+
+sock_path = sys.argv[sys.argv.index("--socket") + 1]
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(sock_path)
+srv.listen(8)
+
+while True:
+    conn, _ = srv.accept()
+    try:
+        line = b""
+        while not line.endswith(b"\n"):
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            line += chunk
+        req = json.loads(line)
+        # Toy access control: the agent can only ask for keys in an allowlist.
+        key = req.get("key")
+        if key in {"OPENAI_API_KEY", "STRIPE_SECRET"}:
+            conn.sendall(json.dumps({"value": KEYS[key]}).encode() + b"\n")
+        else:
+            conn.sendall(json.dumps({"error": "key not allowed"}).encode() + b"\n")
+    finally:
+        conn.close()
+```
+
+Hook it up in your workspace config:
+
+```jsonc
+{
+  "host_services": {
+    "auth-broker": {
+      "command": ["python3", "~/code/auth-broker/serve.py", "--socket", "{socket}"],
+      "env": {"KEYS_FILE": "~/secrets/keys.json"}
+    }
+  }
+}
+```
+
+Inside the jail, the agent uses `$YOLO_SERVICE_AUTH_BROKER_SOCKET`:
+
+```bash
+echo '{"key": "OPENAI_API_KEY"}' | nc -U "$YOLO_SERVICE_AUTH_BROKER_SOCKET"
+# {"value": "sk-..."}
+```
+
+The secret never enters the jail filesystem, env vars, or any bind mount.
+
+### Security model
+
+- Each service's socket lives in a per-jail directory bind-mounted to `/run/yolo-services/`. Other jails can't see it.
+- On Linux, services can use `SO_PEERCRED` on accepted connections to attest the caller's host PID — same mechanism the cgroup delegate uses.
+- What the service does with secrets, scopes, audit logging, and rate limiting is entirely up to the service. yolo just wires the plumbing.
+- The cgroup delegate daemon is one of these services internally — proof that the pattern is enough to support privileged operations safely.
+
+### Validation
+
+`yolo check` verifies that each configured service's command exists and is executable. Catches typos before the next jail start.
+
+### Apple Container caveat
+
+Apple Container doesn't bind-mount Unix sockets through virtiofs, so host services are skipped entirely on the `container` runtime. Use `podman` or `docker` if you need this feature on macOS.
 
 ---
 

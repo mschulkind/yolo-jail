@@ -62,8 +62,17 @@ from cli import (  # noqa: E402
     _cgd_ensure_agent_cgroup,
     _cgd_create_and_join,
     _cgd_destroy,
-    start_cgroup_delegate,
-    stop_cgroup_delegate,
+    BUILTIN_CGROUP_SERVICE_NAME,
+    HostService,
+    JAIL_HOST_SERVICES_DIR,
+    _host_service_default_jail_socket,
+    _host_service_env_var,
+    _host_service_sockets_dir,
+    _start_host_service_builtin_cgroup,
+    _start_host_service_external,
+    _substitute_socket_in_cmd,
+    start_host_services,
+    stop_host_services,
 )
 
 
@@ -939,6 +948,107 @@ class TestValidateConfig:
         errors: list[str] = []
         _validate_port_number(0, "test", errors)
         assert any("between" in e for e in errors)
+
+    def test_host_services_missing_command(self, tmp_path):
+        errors, _ = _validate_config({"host_services": {"foo": {}}}, workspace=tmp_path)
+        assert any("command: required" in e for e in errors)
+
+    def test_host_services_command_not_a_list(self, tmp_path):
+        errors, _ = _validate_config(
+            {"host_services": {"foo": {"command": "not-a-list"}}}, workspace=tmp_path
+        )
+        assert any("non-empty list" in e for e in errors)
+
+    def test_host_services_command_empty_list(self, tmp_path):
+        errors, _ = _validate_config(
+            {"host_services": {"foo": {"command": []}}}, workspace=tmp_path
+        )
+        assert any("non-empty list" in e for e in errors)
+
+    def test_host_services_command_non_string_arg(self, tmp_path):
+        errors, _ = _validate_config(
+            {"host_services": {"foo": {"command": ["serve.py", 42]}}},
+            workspace=tmp_path,
+        )
+        assert any("expected a string" in e for e in errors)
+
+    def test_host_services_reserved_name(self, tmp_path):
+        """User can't shadow the builtin cgroup-delegate service."""
+        errors, _ = _validate_config(
+            {"host_services": {"cgroup-delegate": {"command": ["/bin/sleep", "1"]}}},
+            workspace=tmp_path,
+        )
+        assert any("reserved" in e for e in errors)
+
+    def test_host_services_invalid_name(self, tmp_path):
+        errors, _ = _validate_config(
+            {"host_services": {"123 bad name!": {"command": ["/bin/true"]}}},
+            workspace=tmp_path,
+        )
+        assert any("name" in e and "match" in e for e in errors)
+
+    def test_host_services_jail_socket_must_start_under_run_yolo_services(
+        self, tmp_path
+    ):
+        errors, _ = _validate_config(
+            {
+                "host_services": {
+                    "foo": {
+                        "command": ["/bin/sleep", "1"],
+                        "jail_socket": "/tmp/elsewhere.sock",
+                    }
+                }
+            },
+            workspace=tmp_path,
+        )
+        assert any("jail_socket" in e and "yolo-services" in e for e in errors)
+
+    def test_host_services_env_must_be_string_to_string(self, tmp_path):
+        errors, _ = _validate_config(
+            {
+                "host_services": {
+                    "foo": {
+                        "command": ["/bin/sleep", "1"],
+                        "env": {"KEY": 42},
+                    }
+                }
+            },
+            workspace=tmp_path,
+        )
+        assert any("env" in e and "strings" in e for e in errors)
+
+    def test_host_services_unknown_key(self, tmp_path):
+        errors, _ = _validate_config(
+            {
+                "host_services": {
+                    "foo": {"command": ["/bin/sleep"], "made_up_field": True}
+                }
+            },
+            workspace=tmp_path,
+        )
+        assert any("unknown key" in e and "made_up_field" in e for e in errors)
+
+    def test_host_services_minimal_valid(self, tmp_path):
+        errors, _ = _validate_config(
+            {"host_services": {"auth-broker": {"command": ["/usr/bin/serve"]}}},
+            workspace=tmp_path,
+        )
+        assert errors == []
+
+    def test_host_services_with_env_and_jail_socket(self, tmp_path):
+        errors, _ = _validate_config(
+            {
+                "host_services": {
+                    "auth-broker": {
+                        "command": ["/usr/bin/serve", "--socket", "{socket}"],
+                        "env": {"KEYS_FILE": "/etc/keys.json"},
+                        "jail_socket": "/run/yolo-services/auth.sock",
+                    }
+                }
+            },
+            workspace=tmp_path,
+        )
+        assert errors == []
 
 
 class TestPresetNullConflicts:
@@ -2014,24 +2124,138 @@ class TestCgroupDaemonOps:
 
 
 class TestCgroupDaemonSocket:
-    """Test start/stop lifecycle of the cgroup delegate daemon."""
+    """Test start/stop lifecycle of the cgroup delegate built-in service."""
 
     def test_start_stop_lifecycle(self, tmp_path):
-        """Daemon starts and stops cleanly."""
-        socket_dir = tmp_path / "cgd"
+        """Builtin cgroup daemon starts and stops cleanly."""
+        sockets_dir = tmp_path / "host-services"
         # Mock _resolve_container_cgroup since no real container
         with patch("cli._resolve_container_cgroup", return_value=None):
-            thread = start_cgroup_delegate("test-cname", "podman", socket_dir)
-        if thread is None:
+            handle = _start_host_service_builtin_cgroup(
+                "test-cname", "podman", sockets_dir
+            )
+        if handle is None:
             pytest.skip("cgroup v2 not available on this host")
-        assert thread.is_alive()
-        assert (socket_dir / "cgroup.sock").exists()
-        stop_cgroup_delegate(thread, socket_dir)
-        assert not thread.is_alive()
+        assert isinstance(handle, HostService)
+        assert handle.name == BUILTIN_CGROUP_SERVICE_NAME
+        assert handle.host_socket_path.exists()
+        assert handle.host_socket_path == sockets_dir / "cgroup.sock"
+        assert handle.jail_socket_path == "/run/yolo-services/cgroup-delegate.sock"
+        # Stop via the unified machinery
+        stop_host_services([handle], sockets_dir)
+        assert not sockets_dir.exists()
 
     def test_start_returns_none_without_cgroupv2(self, tmp_path):
         """Returns None when cgroup v2 is not available."""
-        socket_dir = tmp_path / "cgd"
+        sockets_dir = tmp_path / "host-services"
         with patch("pathlib.Path.exists", return_value=False):
-            result = start_cgroup_delegate("test", "podman", socket_dir)
+            result = _start_host_service_builtin_cgroup("test", "podman", sockets_dir)
         assert result is None
+
+
+class TestHostServices:
+    """Generic host_services framework — naming, env vars, lifecycle."""
+
+    def test_env_var_naming(self):
+        assert _host_service_env_var("auth-broker") == "YOLO_SERVICE_AUTH_BROKER_SOCKET"
+        assert _host_service_env_var("Token.Vault") == "YOLO_SERVICE_TOKEN_VAULT_SOCKET"
+        assert (
+            _host_service_env_var("cgroup-delegate")
+            == "YOLO_SERVICE_CGROUP_DELEGATE_SOCKET"
+        )
+        # No leading/trailing underscores
+        assert (
+            _host_service_env_var("--my--service--") == "YOLO_SERVICE_MY_SERVICE_SOCKET"
+        )
+
+    def test_default_jail_socket(self):
+        assert (
+            _host_service_default_jail_socket("foo")
+            == f"{JAIL_HOST_SERVICES_DIR}/foo.sock"
+        )
+
+    def test_substitute_socket_in_cmd(self):
+        cmd = ["./serve.py", "--socket", "{socket}", "--quiet"]
+        result = _substitute_socket_in_cmd(cmd, "/tmp/foo.sock")
+        assert result == ["./serve.py", "--socket", "/tmp/foo.sock", "--quiet"]
+
+    def test_sockets_dir_is_per_workspace(self, tmp_path):
+        d = _host_service_sockets_dir(tmp_path)
+        assert d == tmp_path / "host-services"
+
+    def test_external_service_launch_and_stop(self, tmp_path, monkeypatch):
+        """Launch a tiny inline Python service that binds the socket and echoes one line."""
+        # Service script: bind the socket from --socket, accept one connection,
+        # echo whatever it receives, then exit.
+        service_script = tmp_path / "echo-service.py"
+        service_script.write_text(
+            "import socket, sys, time\n"
+            "i = sys.argv.index('--socket') + 1\n"
+            "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
+            "sock.bind(sys.argv[i])\n"
+            "sock.listen(1)\n"
+            "# Sleep until killed by the parent — we only need the bind to succeed.\n"
+            "while True:\n"
+            "    time.sleep(60)\n"
+        )
+        sockets_dir = tmp_path / "host-services"
+        spec = {
+            "command": [sys.executable, str(service_script), "--socket", "{socket}"],
+        }
+        handle = _start_host_service_external("echoer", spec, sockets_dir)
+        assert handle is not None
+        assert handle.name == "echoer"
+        assert handle.host_socket_path.exists()
+        assert handle.host_socket_path == sockets_dir / "echoer.sock"
+        assert handle.env_var_name == "YOLO_SERVICE_ECHOER_SOCKET"
+
+        # Stop via the unified machinery
+        stop_host_services([handle], sockets_dir)
+        assert not sockets_dir.exists()
+
+    def test_external_service_command_not_found(self, tmp_path):
+        """Bad command path → returns None, doesn't raise."""
+        sockets_dir = tmp_path / "host-services"
+        spec = {"command": ["/nonexistent/binary/that/does/not/exist", "{socket}"]}
+        handle = _start_host_service_external("ghost", spec, sockets_dir)
+        assert handle is None
+
+    def test_external_service_exits_early(self, tmp_path):
+        """Service that exits without binding the socket → None."""
+        service_script = tmp_path / "exit-service.py"
+        service_script.write_text("import sys; sys.exit(0)\n")
+        spec = {"command": [sys.executable, str(service_script), "{socket}"]}
+        handle = _start_host_service_external(
+            "quitter", spec, tmp_path / "host-services"
+        )
+        assert handle is None
+
+    def test_start_host_services_skips_apple_container(self, tmp_path):
+        """Apple Container can't bind-mount Unix sockets — we skip everything."""
+        handles = start_host_services(
+            tmp_path,
+            "test-cname",
+            "container",  # Apple Container
+            {"host_services": {"foo": {"command": ["/bin/sleep", "9999"]}}},
+        )
+        assert handles == []
+
+    def test_start_host_services_reserves_builtin_name(self, tmp_path):
+        """User can't shadow the builtin cgroup-delegate service."""
+        config = {
+            "host_services": {
+                BUILTIN_CGROUP_SERVICE_NAME: {
+                    "command": [sys.executable, "-c", "pass"],
+                }
+            }
+        }
+        # Mock _resolve_container_cgroup so the builtin doesn't try to reach a real container
+        with patch("cli._resolve_container_cgroup", return_value=None):
+            handles = start_host_services(tmp_path, "test", "podman", config)
+        # The user spec is silently dropped; only the builtin (if available) appears.
+        names = [h.name for h in handles]
+        if names:
+            # On a host with cgroup v2, only the builtin should be present.
+            assert names == [BUILTIN_CGROUP_SERVICE_NAME]
+        # Clean up
+        stop_host_services(handles, _host_service_sockets_dir(tmp_path))

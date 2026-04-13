@@ -1181,21 +1181,27 @@ def configure_claude():
 # 11. Cgroup delegation via host-side daemon (socket client)
 # ---------------------------------------------------------------------------
 # The host runs a cgroup delegate daemon that listens on a Unix socket at
-# /tmp/yolo-cgd/cgroup.sock.  The container-side yolo-cglimit sends JSON
-# requests to create child cgroups, set limits, and move processes.  This
-# avoids needing CAP_SYS_ADMIN or rw cgroup mounts inside the container.
-# All privileged cgroup operations happen on the host, with strict validation.
+# /run/yolo-services/cgroup-delegate.sock.  The container-side yolo-cglimit
+# sends JSON requests to create child cgroups, set limits, and move
+# processes.  This avoids needing CAP_SYS_ADMIN or rw cgroup mounts inside
+# the container.  All privileged cgroup operations happen on the host, with
+# strict validation.
+#
+# The cgroup delegate is one of several host-side services that yolo-jail
+# can run alongside the container.  See cli.py § "Host services" for the
+# generic mechanism — user-defined services in `host_services` config also
+# appear under /run/yolo-services/.
 
-CGD_SOCKET = Path("/tmp/yolo-cgd/cgroup.sock")
+CGD_SOCKET = Path("/run/yolo-services/cgroup-delegate.sock")
 
 
 def setup_cgroup_delegation():
     """Check if cgroup delegation is available via the host-side daemon.
 
     The host-side cgroup delegate daemon (started by cli.py) listens on a
-    Unix socket mounted at /tmp/yolo-cgd/cgroup.sock.  This function just
-    verifies the socket exists — all actual cgroup work is done by the host
-    daemon when yolo-cglimit sends requests.
+    Unix socket mounted at /run/yolo-services/cgroup-delegate.sock.  This
+    function just verifies the socket exists — all actual cgroup work is
+    done by the host daemon when yolo-cglimit sends requests.
 
     Silent on absence: falls back to nice/timeout/ulimit in non-delegated jails.
     """
@@ -1244,7 +1250,7 @@ import os
 import socket
 import sys
 
-CGD_SOCKET = "/tmp/yolo-cgd/cgroup.sock"
+CGD_SOCKET = "/run/yolo-services/cgroup-delegate.sock"
 
 
 def send_request(request: dict) -> dict:

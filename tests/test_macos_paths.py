@@ -20,8 +20,9 @@ from typer.testing import CliRunner  # noqa: E402
 import cli  # noqa: E402
 from cli import (  # noqa: E402
     _resolve_container_cgroup,
-    start_cgroup_delegate,
-    stop_cgroup_delegate,
+    _start_host_service_builtin_cgroup,
+    start_host_services,
+    stop_host_services,
     app,
 )
 
@@ -78,17 +79,26 @@ class TestMacosCgroupSkip:
         _set_macos(monkeypatch)
         assert _resolve_container_cgroup("test-container", "podman") is None
 
-    def test_start_cgroup_delegate_creates_empty_dir(self, monkeypatch, tmp_path):
+    def test_builtin_cgroup_skipped_on_macos(self, monkeypatch, tmp_path):
         _set_macos(monkeypatch)
-        sock_dir = tmp_path / "yolo-cgd"
-        result = start_cgroup_delegate("test-container", "podman", sock_dir)
+        sock_dir = tmp_path / "host-services"
+        result = _start_host_service_builtin_cgroup(
+            "test-container", "podman", sock_dir
+        )
+        # On macOS the builtin returns None — no daemon, no socket.
         assert result is None
-        assert sock_dir.is_dir()
 
-    def test_stop_cgroup_delegate_noop(self, monkeypatch, tmp_path):
+    def test_stop_host_services_handles_empty_list(self, monkeypatch, tmp_path):
         _set_macos(monkeypatch)
-        # stop with None thread (what start returns on macOS)
-        stop_cgroup_delegate(None, tmp_path / "nonexistent")
+        # stop with empty list (what start returns on macOS for the builtin)
+        stop_host_services([], tmp_path / "nonexistent")
+
+    def test_start_host_services_macos_skips_builtin(self, monkeypatch, tmp_path):
+        _set_macos(monkeypatch)
+        # Even with podman as runtime, on macOS the builtin returns None
+        # (no cgroup v2), so no handles come back.
+        handles = start_host_services(tmp_path, "test-cname", "podman", {})
+        assert handles == []
 
 
 # ---------------------------------------------------------------------------
