@@ -5791,6 +5791,15 @@ def run(
         # conmon JSON parsing errors with crun.  Disable the auto-tmpfs and let
         # our explicit mounts handle it.
         docker_flags.append("--read-only-tmpfs=false")
+    if runtime in ("podman", "docker"):
+        # Don't capture container stdout/stderr anywhere.  The default log
+        # driver on systemd hosts is journald, which means every interactive
+        # TUI redraw (Claude Code's status line, vim scrolls, progress bars)
+        # lands in the user's journal at kilobytes-per-keystroke.  We never
+        # actually read `podman logs <name>` — failure diagnosis lives in
+        # the agent-side logs under ~/.local/share/yolo-jail/logs/ and in
+        # the nix build output.  Drop it on the floor.
+        docker_flags.extend(["--log-driver", "none"])
     if sys.stdout.isatty():
         docker_flags.append("-t")
 
