@@ -1348,6 +1348,136 @@ if __name__ == "__main__":
     script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC)
 
 
+def generate_journalctl_script():
+    """Generate yolo-journalctl helper that bridges to a host-side daemon.
+
+    Usage: yolo-journalctl [journalctl args...]
+
+    The helper reads YOLO_SERVICE_JOURNAL_SOCKET and connects to the host
+    daemon over Unix socket, sends its argv as a single JSON line, and
+    decodes framed [stdout/stderr/exit] responses until the daemon closes
+    the connection.  Exits with the exit code the daemon reports (the code
+    journalctl returned on the host).
+
+    The daemon only runs if the user enabled it in config via
+    `journal: "user"` or `"full"`.  When the socket is absent the helper
+    prints a clear hint and exits 1 — that's the signal the user hasn't
+    opted in.
+    """
+    script_dir = HOME / ".local" / "bin"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    script_path = script_dir / "yolo-journalctl"
+
+    script_path.write_text(r'''#!/usr/bin/env python3
+"""yolo-journalctl — Run journalctl on the host via the yolo-jail journal bridge.
+
+Usage: yolo-journalctl [journalctl args...]
+
+Forwards all arguments to `journalctl` running on the host, streams stdout
+and stderr back to the local terminal, and exits with the host process's
+exit code.  Enabled only when the jail's config sets `journal: "user"`
+(forces --user) or `journal: "full"` (unrestricted).
+
+Examples:
+  yolo-journalctl -u nginx -n 50
+  yolo-journalctl --user -f
+  yolo-journalctl -p err --since "1 hour ago"
+"""
+import json
+import os
+import socket
+import struct
+import sys
+
+DEFAULT_SOCKET = "/run/yolo-services/journal.sock"
+SOCKET_PATH = os.environ.get("YOLO_SERVICE_JOURNAL_SOCKET", DEFAULT_SOCKET)
+
+FRAME_STDOUT = 1
+FRAME_STDERR = 2
+FRAME_EXIT = 3
+
+
+def _read_exact(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return bytes(buf)
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help") and not os.environ.get("YOLO_JOURNALCTL_PASSTHROUGH_HELP"):
+        # -h/--help without env override prints our own doc, not journalctl's.
+        # Set YOLO_JOURNALCTL_PASSTHROUGH_HELP=1 to forward it through.
+        print(__doc__)
+        print(f"Socket: {SOCKET_PATH}")
+        return 0
+
+    if not os.path.exists(SOCKET_PATH):
+        sys.stderr.write(
+            "yolo-journalctl: host journal bridge is not available.\n"
+        )
+        sys.stderr.write(
+            f"  expected socket: {SOCKET_PATH}\n"
+        )
+        sys.stderr.write(
+            "  enable it by setting `journal: \"user\"` (or \"full\") in yolo-jail.jsonc\n"
+        )
+        sys.stderr.write(
+            "  or in ~/.config/yolo-jail/config.jsonc, then restart the jail.\n"
+        )
+        return 1
+
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(SOCKET_PATH)
+    except OSError as e:
+        sys.stderr.write(f"yolo-journalctl: connect failed: {e}\n")
+        return 1
+
+    try:
+        sock.sendall((json.dumps({"args": args}) + "\n").encode())
+        exit_code = 1
+        while True:
+            header = _read_exact(sock, 5)
+            if len(header) < 5:
+                break
+            stream, length = struct.unpack(">BI", header)
+            payload = _read_exact(sock, length)
+            if len(payload) < length:
+                break
+            if stream == FRAME_STDOUT:
+                sys.stdout.buffer.write(payload)
+                sys.stdout.flush()
+            elif stream == FRAME_STDERR:
+                sys.stderr.buffer.write(payload)
+                sys.stderr.flush()
+            elif stream == FRAME_EXIT:
+                if len(payload) == 4:
+                    (exit_code,) = struct.unpack(">i", payload)
+                break
+            else:
+                # Unknown frame type — ignore, forward-compat.
+                continue
+        return exit_code
+    except KeyboardInterrupt:
+        return 130
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+''')
+    script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC)
+
+
 # ---------------------------------------------------------------------------
 # 11. Finalize PATH and exec bash
 # ---------------------------------------------------------------------------
@@ -1646,6 +1776,8 @@ def main():
     _perf("cgroup_delegation")
     generate_cglimit_script()
     _perf("cglimit_script")
+    generate_journalctl_script()
+    _perf("journalctl_script")
     generate_yolo_wrapper()
     _perf("yolo_wrapper")
 

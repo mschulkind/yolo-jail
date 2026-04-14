@@ -4,7 +4,9 @@ Covers: argv routing, repo root resolution, config validation, container naming,
 port forwarding, AGENTS.md generation, check command, and helpers.
 """
 
+import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -63,12 +65,16 @@ from cli import (  # noqa: E402
     _cgd_create_and_join,
     _cgd_destroy,
     BUILTIN_CGROUP_SERVICE_NAME,
+    BUILTIN_JOURNAL_SERVICE_NAME,
     HostService,
     JAIL_HOST_SERVICES_DIR,
+    _check_claude_token_refresher,
     _host_service_default_jail_socket,
     _host_service_env_var,
     _host_service_sockets_dir,
+    _resolve_journal_mode,
     _start_host_service_builtin_cgroup,
+    _start_host_service_builtin_journal,
     _start_host_service_external,
     _substitute_socket_in_cmd,
     start_host_services,
@@ -2151,6 +2157,201 @@ class TestCgroupDaemonSocket:
         with patch("pathlib.Path.exists", return_value=False):
             result = _start_host_service_builtin_cgroup("test", "podman", sockets_dir)
         assert result is None
+
+
+class TestJournalDaemon:
+    """Builtin journal bridge: mode resolution, lifecycle, wire protocol."""
+
+    def test_resolve_mode_defaults_to_off(self):
+        assert _resolve_journal_mode({}) == "off"
+        assert _resolve_journal_mode({"journal": None}) == "off"
+        assert _resolve_journal_mode({"journal": False}) == "off"
+
+    def test_resolve_mode_true_means_user(self):
+        # Booleans are a convenience shorthand — true picks the safe default.
+        assert _resolve_journal_mode({"journal": True}) == "user"
+
+    def test_resolve_mode_string_modes(self):
+        assert _resolve_journal_mode({"journal": "off"}) == "off"
+        assert _resolve_journal_mode({"journal": "user"}) == "user"
+        assert _resolve_journal_mode({"journal": "full"}) == "full"
+
+    def test_resolve_mode_invalid_falls_back_to_off(self):
+        # Validation catches the bad value elsewhere; runtime is defensive.
+        assert _resolve_journal_mode({"journal": "bogus"}) == "off"
+        assert _resolve_journal_mode({"journal": 42}) == "off"
+
+    def _with_fake_journalctl(self, tmp_path, stdout_text="", stderr_text="", rc=0):
+        """Put a fake `journalctl` shell script on PATH that prints fixed output."""
+        bin_dir = tmp_path / "fakebin"
+        bin_dir.mkdir()
+        fake = bin_dir / "journalctl"
+        # Echo received args on stderr so we can assert the mode forced --user.
+        fake.write_text(
+            "#!/bin/bash\n"
+            f"printf '%s' {shlex.quote(stdout_text)}\n"
+            f"printf '%s' {shlex.quote(stderr_text)} >&2\n"
+            'echo "args=$*" >&2\n'
+            f"exit {rc}\n"
+        )
+        fake.chmod(0o755)
+        return bin_dir
+
+    def _journal_client(self, sock_path, args):
+        """Tiny in-process client mirroring ~/.local/bin/yolo-journalctl."""
+        import socket as _socket
+        import struct as _struct
+
+        s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        s.connect(str(sock_path))
+        s.sendall((json.dumps({"args": args}) + "\n").encode())
+        stdout_buf = bytearray()
+        stderr_buf = bytearray()
+        exit_code = None
+        while True:
+            header = s.recv(5)
+            while header and len(header) < 5:
+                more = s.recv(5 - len(header))
+                if not more:
+                    break
+                header += more
+            if len(header) < 5:
+                break
+            stream, length = _struct.unpack(">BI", header)
+            payload = b""
+            while len(payload) < length:
+                more = s.recv(length - len(payload))
+                if not more:
+                    break
+                payload += more
+            if stream == 1:
+                stdout_buf += payload
+            elif stream == 2:
+                stderr_buf += payload
+            elif stream == 3:
+                if len(payload) == 4:
+                    (exit_code,) = _struct.unpack(">i", payload)
+                break
+        s.close()
+        return bytes(stdout_buf), bytes(stderr_buf), exit_code
+
+    def test_daemon_returns_none_when_journalctl_missing(self, tmp_path):
+        sockets_dir = tmp_path / "host-services"
+        with patch("cli.shutil.which", return_value=None):
+            result = _start_host_service_builtin_journal(
+                "test-cname", sockets_dir, "user"
+            )
+        assert result is None
+
+    def test_daemon_end_to_end_user_mode_forces_user_flag(self, tmp_path):
+        """Full wire-protocol roundtrip: client → daemon → fake journalctl → client."""
+        sockets_dir = tmp_path / "host-services"
+        bin_dir = self._with_fake_journalctl(
+            tmp_path, stdout_text="hello out", stderr_text="", rc=0
+        )
+        # Prepend fake bin to PATH so the daemon finds our script.
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{bin_dir}:{old_path}"
+        try:
+            handle = _start_host_service_builtin_journal(
+                "test-journal-cname", sockets_dir, "user"
+            )
+            assert handle is not None
+            assert handle.name == BUILTIN_JOURNAL_SERVICE_NAME
+            assert handle.host_socket_path.exists()
+
+            out, err, rc = self._journal_client(handle.host_socket_path, ["-u", "foo"])
+            assert rc == 0
+            assert out == b"hello out"
+            # Fake script echoed its received args onto stderr.
+            assert b"args=--user -u foo" in err
+        finally:
+            stop_host_services([handle] if handle else [], sockets_dir)
+            os.environ["PATH"] = old_path
+
+    def test_daemon_end_to_end_full_mode_does_not_inject_user(self, tmp_path):
+        sockets_dir = tmp_path / "host-services"
+        bin_dir = self._with_fake_journalctl(tmp_path, rc=0)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{bin_dir}:{old_path}"
+        try:
+            handle = _start_host_service_builtin_journal(
+                "test-journal-full", sockets_dir, "full"
+            )
+            assert handle is not None
+            out, err, rc = self._journal_client(
+                handle.host_socket_path, ["-u", "nginx", "-n", "10"]
+            )
+            assert rc == 0
+            assert b"args=-u nginx -n 10" in err
+            assert b"--user" not in err
+        finally:
+            stop_host_services([handle] if handle else [], sockets_dir)
+            os.environ["PATH"] = old_path
+
+    def test_daemon_propagates_exit_code(self, tmp_path):
+        sockets_dir = tmp_path / "host-services"
+        bin_dir = self._with_fake_journalctl(tmp_path, rc=7)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{bin_dir}:{old_path}"
+        try:
+            handle = _start_host_service_builtin_journal(
+                "test-journal-rc", sockets_dir, "user"
+            )
+            assert handle is not None
+            _, _, rc = self._journal_client(handle.host_socket_path, [])
+            assert rc == 7
+        finally:
+            stop_host_services([handle] if handle else [], sockets_dir)
+            os.environ["PATH"] = old_path
+
+    def test_daemon_rejects_malformed_request(self, tmp_path):
+        """A non-JSON or non-list `args` field returns exit=2 with an error."""
+        sockets_dir = tmp_path / "host-services"
+        bin_dir = self._with_fake_journalctl(tmp_path, rc=0)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{bin_dir}:{old_path}"
+        try:
+            handle = _start_host_service_builtin_journal(
+                "test-journal-bad", sockets_dir, "user"
+            )
+            assert handle is not None
+            import socket as _socket
+
+            s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+            s.connect(str(handle.host_socket_path))
+            s.sendall(b'{"args": "not-a-list"}\n')
+            # Read until close
+            chunks = b""
+            while True:
+                c = s.recv(4096)
+                if not c:
+                    break
+                chunks += c
+            s.close()
+            # Last 9 bytes should be the exit frame with code=2
+            assert chunks.endswith(b"\x03\x00\x00\x00\x04\x00\x00\x00\x02")
+        finally:
+            stop_host_services([handle] if handle else [], sockets_dir)
+            os.environ["PATH"] = old_path
+
+
+class TestClaudeRefresherOptIn:
+    """`claude_token_refresher: false` short-circuits the doctor check."""
+
+    def test_disabled_config_skips_all_checks(self):
+        messages = []
+        _check_claude_token_refresher(
+            repo_root=None,
+            ok=lambda msg, *a, **kw: messages.append(("ok", msg)),
+            warn=lambda *a, **kw: messages.append(("warn", a[0] if a else "")),
+            fail=lambda *a, **kw: messages.append(("fail", a[0] if a else "")),
+            config={"claude_token_refresher": False},
+        )
+        # Exactly one ok line, no warns or fails.
+        assert len(messages) == 1
+        assert messages[0][0] == "ok"
+        assert "disabled by config" in messages[0][1]
 
 
 class TestHostServices:

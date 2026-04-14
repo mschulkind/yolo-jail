@@ -66,7 +66,15 @@ deploy: install
     set -euo pipefail
 
     # --- Claude token refresher (systemd --user timer) ---
-    if ! command -v systemctl >/dev/null 2>&1; then
+    # Skipped when `claude` isn't on PATH — no point running a refresher for a
+    # tool the user hasn't installed.  They can run `just deploy` again later
+    # after installing Claude Code, or drop `claude_token_refresher: false`
+    # into ~/.config/yolo-jail/config.jsonc to silence `yolo check` about it.
+    if ! command -v claude >/dev/null 2>&1; then
+        echo "⚠ claude not found on PATH — skipping Claude token refresher install"
+        echo "  (install Claude Code and re-run \`just deploy\` to enable it,"
+        echo "   or set \`claude_token_refresher: false\` in your yolo config)"
+    elif ! command -v systemctl >/dev/null 2>&1; then
         echo "⚠ systemctl not found — skipping token refresher (not a systemd host)"
     else
         REPO_ROOT="$(pwd)"
