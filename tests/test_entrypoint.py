@@ -1220,6 +1220,28 @@ class TestMiseConfigUpdate:
         # node should appear exactly once
         assert content.count("node =") == 1
 
+    def test_injected_tool_matching_base_not_duplicated(self, jail_home, monkeypatch):
+        # Workspace injecting a tool that also appears in base_tools (e.g.,
+        # python = "3.13") previously produced a config with two `python =`
+        # lines, which mise refuses to parse.
+        monkeypatch.setenv("YOLO_MISE_TOOLS", json.dumps({"python": "3.13"}))
+        entrypoint.generate_mise_config()
+        config_path = jail_home / ".config" / "mise" / "config.toml"
+        content = config_path.read_text()
+        assert content.count("python =") == 1
+
+    def test_existing_duplicate_is_self_healed(self, jail_home, monkeypatch):
+        # Older writes may have left a duplicate tool line on disk. The next
+        # run should repair it rather than leave the file unparseable.
+        monkeypatch.delenv("YOLO_MISE_TOOLS", raising=False)
+        entrypoint.generate_mise_config()
+        config_path = jail_home / ".config" / "mise" / "config.toml"
+        content = config_path.read_text()
+        config_path.write_text(content.rstrip("\n") + '\npython = "3.13"\n')
+        assert config_path.read_text().count("python =") == 2
+        entrypoint.generate_mise_config()
+        assert config_path.read_text().count("python =") == 1
+
 
 class TestExecBash:
     """Cover exec_bash PATH setup (lines 951-1003 partially)."""

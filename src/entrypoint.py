@@ -510,10 +510,9 @@ def generate_mise_config():
 
     if not config_path.exists():
         MISE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        merged = {**base_tools, **injected_tools}
         lines = ["[tools]"]
-        for tool, version in base_tools.items():
-            lines.append(f'{_toml_key(tool)} = "{version}"')
-        for tool, version in injected_tools.items():
+        for tool, version in merged.items():
             lines.append(f'{_toml_key(tool)} = "{version}"')
         config_path.write_text("\n".join(lines) + "\n")
         return
@@ -526,6 +525,24 @@ def generate_mise_config():
 
     content = config_path.read_text()
     changed = False
+
+    # Self-heal: drop duplicate tool-key lines (keep the first). A prior bug
+    # could write a base tool twice when a workspace also injected it, and mise
+    # refuses to parse the resulting file.
+    seen_keys: set[str] = set()
+    deduped_lines: list[str] = []
+    key_re = re.compile(r'^\s*"?([^"\s=]+)"?\s*=')
+    for line in content.splitlines(keepends=True):
+        m = key_re.match(line)
+        if m:
+            key = m.group(1)
+            if key in seen_keys:
+                changed = True
+                continue
+            seen_keys.add(key)
+        deduped_lines.append(line)
+    if changed:
+        content = "".join(deduped_lines)
 
     # Remove retired tools (now managed by bootstrap npm install, not mise)
     for tool in retired_tools:
