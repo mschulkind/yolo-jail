@@ -172,10 +172,9 @@ class TestBashrcGeneration:
         monkeypatch.setenv("YOLO_HOST_DIR", "test")
         entrypoint.generate_bashrc()
         content = entrypoint.BASHRC_PATH.read_text()
-        assert "/mise/shims" in content or "MISE_DATA_DIR" in content
-        assert content.index("$NPM_CONFIG_PREFIX/bin") < content.index(
-            "${MISE_DATA_DIR:-/mise}/shims"
-        )
+        mise_shims = str(entrypoint.MISE_SHIMS)
+        assert mise_shims in content
+        assert content.index("$NPM_CONFIG_PREFIX/bin") < content.index(mise_shims)
 
     def test_local_bin_in_path(self, jail_home, monkeypatch):
         """~/.local/bin is on PATH for native Claude binary."""

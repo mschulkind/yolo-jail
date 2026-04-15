@@ -6019,8 +6019,14 @@ def run(
             f"{ws_state}:/home/agent",
             "-v",
             f"{GLOBAL_CACHE}:/home/agent/.cache",
+            # Host mise dir mirrored at its native host path so absolute paths
+            # baked into host-side venvs (e.g., python symlink targets) resolve
+            # inside the jail. On macOS the host tree has Mach-O binaries that
+            # can't run in Linux, so we back it with a named volume but mount
+            # it at the same host path string — keeping a single canonical
+            # mise location across runtimes.
             "-v",
-            "yolo-mise-data:/mise",
+            f"yolo-mise-data:{host_mise}",
             # Apple Container's --tmpfs only takes a plain path (no options)
             "--tmpfs",
             "/tmp",
@@ -6095,11 +6101,17 @@ def run(
             f"{ws_state / 'ssh'}:/home/agent/.ssh",
             # --- Shared mounts ---
             "-v",
-            # On macOS the host mise dir has Mach-O (darwin) binaries that cannot
-            # execute inside the Linux container.  Use a Docker named volume so the
-            # container installs its own native Linux toolchains.  The volume
-            # persists across runs so subsequent starts are fast.
-            "yolo-mise-data:/mise" if IS_MACOS else f"{host_mise}:/mise",
+            # Host mise dir mirrored at its native host path inside the jail.
+            # This keeps absolute paths baked into host-side venvs (python
+            # symlink targets, shebangs) resolvable from inside the container —
+            # no /mise alias, no divergence.
+            #
+            # On macOS the host tree has Mach-O (darwin) binaries that cannot
+            # execute inside the Linux container, so we back the mount with a
+            # Docker named volume that holds Linux toolchains. The volume is
+            # mounted at the same host path string, keeping a single canonical
+            # mise location across runtimes (and matching what nested jails see).
+            f"yolo-mise-data:{host_mise}" if IS_MACOS else f"{host_mise}:{host_mise}",
             "--tmpfs",
             # Explicit mode=1777 ensures non-root UIDs can write to tmpfs
             # (Docker on some backends defaults to 755).
@@ -6131,7 +6143,7 @@ def run(
             "-e",
             "GOPATH=/home/agent/go",
             "-e",
-            "MISE_DATA_DIR=/mise",
+            f"MISE_DATA_DIR={host_mise}",
             "-e",
             # Use a per-container cache dir so mise lockfiles don't contend with
             # the host/outer-jail's locks (shared /home/agent would otherwise share
@@ -6676,9 +6688,9 @@ def run(
         container_config = f"/home/agent/.config/yolo-jail/{USER_CONFIG_PATH.name}"
         docker_cmd.extend(["-v", f"{USER_CONFIG_PATH}:{container_config}:ro"])
 
-    # Pass container-side mise path for nested jail re-mounting.
-    # Inside the container, mise is always at /mise regardless of host path.
-    docker_cmd.extend(["-e", "YOLO_OUTER_MISE_PATH=/mise"])
+    # Pass the mise path through to any nested jail so the same host path
+    # keeps resolving one level deeper. The path is identical inside and out.
+    docker_cmd.extend(["-e", f"YOLO_OUTER_MISE_PATH={host_mise}"])
 
     # Mount merged skills directories read-only (prepared on host side).
     # Kernel-enforced :ro — agents get "Read-only file system" on write attempts.
@@ -6830,8 +6842,8 @@ def run(
             "echo '--- Node path comparison ---' >&3; "
             "_n0=$(date +%s%N); /bin/node --version >/dev/null 2>&1; _n1=$(date +%s%N); "
             "printf '  /bin/node:        %sms\\n' \"$(( (_n1 - _n0) / 1000000 ))\" >&3; "
-            "_n2=$(date +%s%N); /mise/shims/node --version >/dev/null 2>&1; _n3=$(date +%s%N); "
-            "printf '  /mise/shims/node: %sms\\n' \"$(( (_n3 - _n2) / 1000000 ))\" >&3; "
+            '_n2=$(date +%s%N); "$MISE_DATA_DIR/shims/node" --version >/dev/null 2>&1; _n3=$(date +%s%N); '
+            "printf '  mise shim node:   %sms\\n' \"$(( (_n3 - _n2) / 1000000 ))\" >&3; "
             "echo '' >&3; "
             "exit $_rc"
         )

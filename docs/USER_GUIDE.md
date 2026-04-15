@@ -859,14 +859,14 @@ If none of these resolve, the jail falls back to UTC. Override per-jail by expor
 |------|-----------------|---------|
 | Auth tokens (gh, gemini, claude) | `~/.local/share/yolo-jail/home/` | All jails |
 | Installed tools (npm, go) | `~/.local/share/yolo-jail/home/` | All jails |
-| Mise tools & runtimes | `~/.local/share/mise/` (Linux); Docker named volume `yolo-mise-data` (macOS) | All jails |
+| Mise tools & runtimes | `~/.local/share/mise/` on Linux (bind-mounted at the same path inside the jail); Docker named volume `yolo-mise-data` on macOS, also mounted at `~/.local/share/mise/` inside the jail | All jails |
 | Bash history | `<workspace>/.yolo/home/bash_history` | Per workspace |
 | Claude sessions | `<workspace>/.yolo/home/claude-projects/` | Per workspace |
 | Copilot sessions | `<workspace>/.yolo/home/copilot-sessions/` | Per workspace |
 | Gemini history | `<workspace>/.yolo/home/gemini-history/` | Per workspace |
 | SSH keys | `<workspace>/.yolo/home/ssh/` | Per workspace |
 
-**Why mise differs on macOS:** The host `~/.local/share/mise/` on macOS contains Mach-O (darwin) binaries that cannot execute inside the Linux container. Instead of bind-mounting the host directory, YOLO Jail uses a Docker named volume (`yolo-mise-data`) so the container installs its own native Linux toolchains. The volume persists across jail restarts.
+**Why mise differs on macOS:** The host `~/.local/share/mise/` on macOS contains Mach-O (darwin) binaries that cannot execute inside the Linux container. Instead of bind-mounting the host directory, YOLO Jail backs the mount with a Docker named volume (`yolo-mise-data`) that holds native Linux toolchains. The volume is mounted at the same host path string inside the container so there is one canonical mise location across runtimes — venvs with absolute shebangs keep resolving in both environments. The volume persists across jail restarts.
 
 ### What Gets Regenerated
 

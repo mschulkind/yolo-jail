@@ -145,9 +145,15 @@ class TestMacosMiseVolume:
         if mock_popen.called:
             docker_cmd = mock_popen.call_args[0][0]
             cmd_str = " ".join(str(c) for c in docker_cmd)
-            assert "yolo-mise-data:/mise" in cmd_str, (
-                f"Expected Docker named volume 'yolo-mise-data:/mise' on macOS, "
-                f"got: {cmd_str}"
+            # Named volume backs the mount (Mach-O binaries in the host mise
+            # dir can't run in Linux), but the mount point is the host mise
+            # path — same canonical location as Linux jails, so venv
+            # absolute paths resolve identically.
+            from cli import _host_mise_dir
+
+            host_mise = _host_mise_dir()
+            assert f"yolo-mise-data:{host_mise}" in cmd_str, (
+                f"Expected 'yolo-mise-data:{host_mise}' on macOS, got: {cmd_str}"
             )
 
 

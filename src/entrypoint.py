@@ -65,7 +65,7 @@ NPM_PREFIX = Path(os.environ.get("NPM_CONFIG_PREFIX", HOME / ".npm-global"))
 GOPATH = Path(os.environ.get("GOPATH", HOME / "go"))
 NPM_BIN = NPM_PREFIX / "bin"
 GO_BIN = GOPATH / "bin"
-MISE_SHIMS = Path(os.environ.get("MISE_DATA_DIR", "/mise")) / "shims"
+MISE_SHIMS = Path(os.environ["MISE_DATA_DIR"]) / "shims"
 MCP_WRAPPERS_BIN = HOME / ".local" / "bin" / "mcp-wrappers"
 BASHRC_PATH = HOME / ".bashrc"
 COPILOT_DIR = HOME / ".copilot"
@@ -294,6 +294,7 @@ fi
 def generate_bashrc():
     """Write the jail .bashrc with prompt, PATH, aliases, and mise activation."""
     host_dir = os.environ.get("YOLO_HOST_DIR", "unknown")
+    mise_shims = str(MISE_SHIMS)
 
     content = (
         r"""# YOLO Jail Prompt
@@ -335,7 +336,9 @@ export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.npm-global}"
 export NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-$HOME/.cache/npm}"
 export GOPATH="${GOPATH:-$HOME/go}"
 SHIM_DIR="${HOME}/.yolo-shims"
-export PATH="$SHIM_DIR:$HOME/.local/bin:$NPM_CONFIG_PREFIX/bin:${MISE_DATA_DIR:-/mise}/shims:$GOPATH/bin:/bin:/usr/bin"
+export PATH="$SHIM_DIR:$HOME/.local/bin:$NPM_CONFIG_PREFIX/bin:"""
+        + mise_shims
+        + r""":$GOPATH/bin:/bin:/usr/bin"
 
 # Activate mise with shell hooks (interactive shells only).
 # Non-interactive shells (bash -lc) skip activation to avoid a deadlock:
@@ -372,12 +375,13 @@ alias bat='bat --style=plain --paging=never'
 def generate_bootstrap_script():
     """Create the idempotent bootstrap script that installs MCP/LSP tools."""
     script_path = HOME / ".yolo-bootstrap.sh"
-    script_path.write_text(r"""#!/bin/bash
-export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.npm-global}"
-export NPM_CONFIG_CACHE="${NPM_CONFIG_CACHE:-$HOME/.cache/npm}"
-export GOPATH="${GOPATH:-$HOME/go}"
+    mise_shims = str(MISE_SHIMS)
+    script_path.write_text(rf"""#!/bin/bash
+export NPM_CONFIG_PREFIX="${{NPM_CONFIG_PREFIX:-$HOME/.npm-global}}"
+export NPM_CONFIG_CACHE="${{NPM_CONFIG_CACHE:-$HOME/.cache/npm}}"
+export GOPATH="${{GOPATH:-$HOME/go}}"
 export GOBIN="$GOPATH/bin"
-export PATH="$HOME/.local/bin:$NPM_CONFIG_PREFIX/bin:${MISE_DATA_DIR:-/mise}/shims:$GOBIN:$PATH"
+export PATH="$HOME/.local/bin:$NPM_CONFIG_PREFIX/bin:{mise_shims}:$GOBIN:$PATH"
 
 # Initialize font cache (once, not on every shell session)
 fc-cache -f >/dev/null 2>&1

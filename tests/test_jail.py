@@ -466,19 +466,16 @@ def test_workspace_agents_untouched_and_home_agents_present(temp_project):
     reason="Host mise has macOS binaries that cannot execute in the Linux container",
 )
 def test_venv_symlinks_resolve(temp_project):
-    """Test that host .venv python symlinks resolve inside the jail."""
-    # Inside the jail, mise is always mounted at /mise regardless of the host path.
-    # We need to find the python version on the host to know which version dir exists,
-    # then create a symlink using the in-container /mise path.
+    """Test that host .venv python symlinks resolve inside the jail.
 
-    # Locate host mise to discover available python versions
-    if Path("/mise/installs/python").exists():
-        host_mise_base = Path("/mise")
-    else:
-        host_mise_base = Path(
-            os.environ.get("MISE_DATA_DIR", str(Path.home() / ".local/share/mise"))
-        )
-
+    The host mise dir is bind-mounted at its native host path inside the jail,
+    so an absolute shebang like /home/user/.local/share/mise/installs/python/...
+    points to the same bytes whether resolved on the host or in the container.
+    This test writes a venv using the host path and asserts it works in-jail.
+    """
+    host_mise_base = Path(
+        os.environ.get("MISE_DATA_DIR", str(Path.home() / ".local/share/mise"))
+    )
     installs = host_mise_base / "installs" / "python"
     if not installs.exists():
         pytest.skip("No mise python installs found")
@@ -514,10 +511,15 @@ def test_venv_symlinks_resolve(temp_project):
     if not python_bin:
         pytest.skip("No python binary in mise install")
 
-    # Create symlink using the in-container /mise path, not the host path.
-    # The host mise dir is bind-mounted at /mise inside the jail.
+    # Symlink target is the native host path — the jail mirrors the host mise
+    # dir at the same absolute path, so this resolves identically inside.
     container_python = (
-        Path("/mise/installs/python") / version_dir.name / "bin" / python_bin.name
+        host_mise_base
+        / "installs"
+        / "python"
+        / version_dir.name
+        / "bin"
+        / python_bin.name
     )
 
     venv_dir = temp_project / ".venv" / "bin"
