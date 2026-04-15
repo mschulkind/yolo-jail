@@ -534,6 +534,11 @@ class TestClaudeConfig:
         assert "mcp__*" not in perms["allow"]
         assert perms["defaultMode"] == "acceptEdits"
         assert cfg["skipDangerousModePermissionPrompt"] is True
+        # Pre-authorize reads outside the cwd. Without this, Claude prompts
+        # for "allow reading from X" any time an agent touches /tmp, /etc,
+        # etc — breaking yolo mode inside the jail.
+        assert "/tmp" in perms["additionalDirectories"]
+        assert "/etc" in perms["additionalDirectories"]
 
     def test_mcp_per_server_rules(self, jail_home, monkeypatch):
         """One `mcp__<name>` rule per configured MCP server.
