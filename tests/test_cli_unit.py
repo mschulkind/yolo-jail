@@ -215,73 +215,6 @@ class TestResolveRepoRoot:
         pass  # Covered by env var test and integration tests
 
 
-class TestResolveSourceCheckout:
-    """_resolve_source_checkout specifically distinguishes real checkouts
-    from synthetic nix build-roots staged by _resolve_repo_root.  The
-    refresher doctor check uses this to avoid looking for scripts/ in
-    a directory that only contains flake.nix + src/.
-    """
-
-    def test_env_var_to_real_checkout_resolves(self, tmp_path, monkeypatch):
-        checkout = tmp_path / "checkout"
-        (checkout / "scripts").mkdir(parents=True)
-        (checkout / "flake.nix").touch()
-        monkeypatch.setenv("YOLO_REPO_ROOT", str(checkout))
-        from cli import _resolve_source_checkout
-
-        assert _resolve_source_checkout() == checkout.resolve()
-
-    def test_env_var_to_synthetic_build_root_rejected(self, tmp_path, monkeypatch):
-        """A build-root-shaped dir (flake.nix + src/ but no scripts/) is NOT
-        a source checkout — this is the exact bug we're preventing.
-        """
-        build_root = tmp_path / "nix-build-root"
-        (build_root / "src").mkdir(parents=True)
-        (build_root / "flake.nix").touch()
-        (build_root / "src" / "entrypoint.py").touch()
-        monkeypatch.setenv("YOLO_REPO_ROOT", str(build_root))
-        # Also make the user config absent so we don't fall through.
-        monkeypatch.setattr(cli, "USER_CONFIG_PATH", tmp_path / "no-such-config.jsonc")
-        from cli import _resolve_source_checkout
-
-        # Must NOT return the build-root — it has no scripts/.
-        result = _resolve_source_checkout()
-        assert result != build_root.resolve()
-
-    def test_user_config_repo_path_resolves(self, tmp_path, monkeypatch):
-        checkout = tmp_path / "checkout"
-        (checkout / "scripts").mkdir(parents=True)
-        (checkout / "flake.nix").touch()
-        user_cfg = tmp_path / "user-config.jsonc"
-        user_cfg.write_text(f'{{"repo_path": "{checkout}"}}')
-        monkeypatch.delenv("YOLO_REPO_ROOT", raising=False)
-        monkeypatch.setattr(cli, "USER_CONFIG_PATH", user_cfg)
-        # Also make sure source detection doesn't short-circuit us by
-        # pointing Path(__file__).parent.parent somewhere without scripts/
-        # (it actually points at /workspace which does have scripts/, so
-        # env detection would succeed before user config; that's fine —
-        # the resolver hits source checkout first).
-        from cli import _resolve_source_checkout
-
-        result = _resolve_source_checkout()
-        assert result is not None
-        # Either source detection found /workspace (which has scripts/) or
-        # user config found the tmp checkout — both are valid.
-        assert (result / "scripts").is_dir()
-
-    def test_returns_none_when_no_checkout_available(self, tmp_path, monkeypatch):
-        """Emulate a pip-installed environment with no real checkout anywhere."""
-        monkeypatch.delenv("YOLO_REPO_ROOT", raising=False)
-        monkeypatch.setattr(cli, "USER_CONFIG_PATH", tmp_path / "no-such-config.jsonc")
-        # Fake __file__ to a dir whose parent.parent has no scripts/ dir.
-        fake_module_dir = tmp_path / "site-packages" / "yolo"
-        fake_module_dir.mkdir(parents=True)
-        with patch("cli.__file__", str(fake_module_dir / "cli.py")):
-            from cli import _resolve_source_checkout
-
-            assert _resolve_source_checkout() is None
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test: Container naming & tracking
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2438,6 +2371,20 @@ class TestClaudeRefresherOptIn:
         assert len(messages) == 1
         assert messages[0][0] == "ok"
         assert "disabled by config" in messages[0][1]
+
+    def test_missing_binary_fails_with_install_hint(self, monkeypatch):
+        """When the entry-point binary isn't on PATH, fail with concrete hint."""
+        messages = []
+        monkeypatch.delenv("YOLO_VERSION", raising=False)
+        monkeypatch.setattr(cli.shutil, "which", lambda _: None)
+        _check_claude_token_refresher(
+            ok=lambda msg, *a, **kw: messages.append(("ok", msg)),
+            warn=lambda *a, **kw: messages.append(("warn", a[0] if a else "")),
+            fail=lambda msg, *a, **kw: messages.append(("fail", msg)),
+        )
+        fails = [m for m in messages if m[0] == "fail"]
+        assert len(fails) == 1
+        assert "not on PATH" in fails[0][1]
 
 
 class TestHostServices:

@@ -77,20 +77,25 @@ deploy: install
     elif ! command -v systemctl >/dev/null 2>&1; then
         echo "⚠ systemctl not found — skipping token refresher (not a systemd host)"
     else
-        REPO_ROOT="$(pwd)"
-        SCRIPT="$REPO_ROOT/scripts/claude-token-refresher.py"
-        if [ ! -x "$SCRIPT" ]; then
-            echo "ERROR: $SCRIPT not found or not executable" >&2
+        # The refresher is shipped as a console script entry point inside
+        # the yolo-jail wheel (see pyproject.toml [project.scripts]).  After
+        # `uv tool install` above, it's on PATH as `claude-token-refresher`.
+        # Resolve that absolute path and bake it into the systemd unit's
+        # ExecStart — the unit runs without needing a source checkout.
+        REFRESHER_BIN="$(command -v claude-token-refresher || true)"
+        if [ -z "$REFRESHER_BIN" ]; then
+            echo "ERROR: claude-token-refresher not on PATH after install" >&2
+            echo "  Expected entry point from the yolo-jail wheel.  Is uv tool's" >&2
+            echo "  bin dir (~/.local/bin by default) on your PATH?" >&2
             exit 1
         fi
 
         SYSTEMD_DIR="$HOME/.config/systemd/user"
         mkdir -p "$SYSTEMD_DIR"
 
-        # Substitute the repo path into the service template so ExecStart
-        # points at the right checkout.  The template uses the literal
-        # "%h/code/yolo-jail" marker so it stays readable in-repo.
-        sed "s|%h/code/yolo-jail|$REPO_ROOT|g" \
+        # Substitute the @@REFRESHER_BIN@@ placeholder in the unit template
+        # with the absolute path to the installed binary.
+        sed "s|@@REFRESHER_BIN@@|$REFRESHER_BIN|g" \
             scripts/claude-token-refresher.service \
             > "$SYSTEMD_DIR/claude-token-refresher.service"
         cp scripts/claude-token-refresher.timer "$SYSTEMD_DIR/"
@@ -103,6 +108,7 @@ deploy: install
         systemctl --user start claude-token-refresher.service || true
 
         echo "✓ claude-token-refresher installed at $SYSTEMD_DIR"
+        echo "  ExecStart → $REFRESHER_BIN"
     fi
 
     echo "yolo-jail deployed. Verify: yolo check"

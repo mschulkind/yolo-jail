@@ -7,9 +7,11 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-# Resolve the full path to the repo-local script.  Install instructions show
-# how to edit this if you keep the repo somewhere other than ~/code/yolo-jail.
-ExecStart=%h/code/yolo-jail/scripts/claude-token-refresher.py
+# ExecStart's placeholder token below is sed-replaced by `just deploy` with
+# the absolute path to the claude-token-refresher binary that uv tool
+# install / pip install shipped as part of the yolo-jail wheel.  No repo
+# checkout required on the host at runtime.
+ExecStart=@@REFRESHER_BIN@@
 # Don't retry on failure — the timer will fire again soon enough.  A
 # transient network error shouldn't tie up systemd.
 Restart=no
