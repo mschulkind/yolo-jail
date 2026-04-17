@@ -1015,6 +1015,7 @@ yolo check --no-build         # fast — skip nix build
 
 **Claude keeps logging out across jails**
 
+- Full triage walkthrough: [docs/claude-token-logouts.md](claude-token-logouts.md). It maps each `yolo doctor` symptom to a fix and escalates to the MITM broker when needed.
 - Usually means the host-side token refresher isn't running. Check with `yolo check` — it has a dedicated "Claude Token Refresher" section.
 - Linux: `systemctl --user status claude-token-refresher.timer` and `journalctl --user -u claude-token-refresher -n 30`
 - macOS: check your launchd/cron setup per [scripts/README.md](../scripts/README.md)

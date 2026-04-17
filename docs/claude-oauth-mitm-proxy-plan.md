@@ -1,6 +1,6 @@
 # Claude OAuth MITM Proxy — Deferred Plan
 
-This doc captures the MITM-proxy approach to the Claude Code logout problem. It's the **fallback** if the periodic refresher (see `scripts/claude-token-refresher.py`) doesn't eliminate the 401 races in practice.
+This doc captures the MITM-proxy approach to the Claude Code logout problem. It's the **fallback** if the periodic refresher (see `src/claude_refresher.py`, installed as the `claude-token-refresher` console script) doesn't eliminate the 401 races in practice. For the user-facing triage path, see [`claude-token-logouts.md`](claude-token-logouts.md).
 
 ## Why this exists
 
@@ -137,7 +137,8 @@ Note: multiple public sources (including earlier research during this investigat
 ## References
 
 - `HANDOFF-credentials-logout.md` — original investigation, symptoms, ruled-out hypotheses
-- `scripts/claude-token-refresher.py` — the simpler refresher we're shipping first
+- `docs/claude-token-logouts.md` — user-facing decision tree (symptoms → `yolo doctor` → fix → escalate)
+- `src/claude_refresher.py` (installed as `claude-token-refresher`) — the simpler refresher we're shipping first
 - Prior art: `dyshay/proxyclawd` (MITM Claude Code with HTTPS_PROXY + NODE_EXTRA_CA_CERTS)
 - Prior art: `griffinmartin/opencode-claude-auth` (in-process token broker pattern; same logic, no proxy)
 - Upstream bugs: anthropics/claude-code#24317, #25609, #27933, #21765, #29896

@@ -117,7 +117,17 @@ Works everywhere but has no structured logging and doesn't survive reboots clean
 
 ### Troubleshooting
 
-**"refresh HTTP error: 401"** — the refresh token the script started with has already been invalidated, probably because a jail raced and won before you deployed the refresher. Run `/login` in any Claude Code session to mint a new credential, then restart the timer.
+First line of defence: `yolo doctor` on the host. It runs `_check_claude_token_refresher` which walks binary presence → credentials file → systemd unit → timer state → last-run status and points at the fix for each. If you're triaging a logout, start there, then match the message below.
+
+For a full decision tree (symptoms → doctor → fix → escalate to MITM broker), see [`docs/claude-token-logouts.md`](../docs/claude-token-logouts.md).
+
+**"claude-token-refresher binary not on PATH" (doctor)** — the wheel isn't installed, or `~/.local/bin` isn't on PATH. Install with `uv tool install --force <wheel>` (or `pip install -e .` from the repo), then verify `which claude-token-refresher` resolves. Before the Apr 15 refactor (`00435a8`) the refresher was a loose script at `scripts/claude-token-refresher.py`; afterwards it's a console entry point inside the wheel.
+
+**"Service unit ExecStart does not point at the installed binary" (doctor)** — you have a stale systemd unit from before the wheel refactor. The old unit hardcoded `scripts/claude-token-refresher.py`; that path no longer exists. Re-run `just deploy` from the repo to re-template and reinstall.
+
+**"Refresher service last run failed" / red `● claude-token-refresher.service`** — timer is firing but the refresh itself errors. Read the last 50 lines: `journalctl --user -u claude-token-refresher -n 50 --no-pager`. Most common causes are the two HTTP errors below.
+
+**"refresh HTTP error: 401"** — the refresh token the script started with has already been invalidated, probably because a jail raced and won before you deployed the refresher (or you `/login`'d on the host after the refresher last ran and the tokens diverged). Run `/login` in any Claude Code session to mint a new credential, then restart the timer.
 
 **"refresh HTTP error: 404"** — the token endpoint moved. This script has `platform.claude.com/v1/oauth/token` hardcoded (pulled from the 2.1.101 binary). Re-verify with:
 
@@ -129,7 +139,9 @@ And update `TOKEN_URL` at the top of the script.
 
 **"another refresher is running"** — two timer instances fired concurrently (rare — systemd should serialize). Benign, next tick will retry.
 
-**Jails still getting logged out after deploying this** — the refresher is keeping the file fresh, but Claude Code inside jails may not be reloading it on its mtime check path (the `ak4()` assumption in `HANDOFF-credentials-logout.md`). In that case, the next step is the MITM proxy — see `docs/claude-oauth-mitm-proxy-plan.md`.
+**Host `~/.claude/.credentials.json` keeps expiring** — the jail-shared file is fresh but the host file lags and forces you to `/login` on the host. This is the diverged-refresh-token case: mirroring is disabled (see "Host Claude Code interaction" below). Re-converge once with `cp ~/.local/share/yolo-jail/home/.claude/.credentials.json ~/.claude/.credentials.json`, or disable mirroring entirely with `--host-creds-file /dev/null` if you want host and jail sessions to live independently.
+
+**Jails still getting logged out after deploying this** — the refresher is keeping the file fresh, but Claude Code inside jails may not be reloading it on its mtime check path (the `ak4()` assumption in `HANDOFF-credentials-logout.md`). Confirm by watching `stat` on the shared file during a jail session — if mtime advances without a corresponding refresher journal entry, jails are still refreshing. The next step in that case is the MITM proxy — see `docs/claude-oauth-mitm-proxy-plan.md`.
 
 ### Host Claude Code interaction
 
