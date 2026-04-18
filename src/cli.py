@@ -7272,7 +7272,7 @@ def _loopholes_with_config(include_disabled: bool = False):
             merged_loopholes.update(src)
     return _loopholes.discover_loopholes(
         include_disabled=include_disabled,
-        host_services=merged_loopholes,
+        loopholes_config=merged_loopholes,
     )
 
 
