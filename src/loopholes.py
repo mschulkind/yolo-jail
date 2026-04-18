@@ -587,26 +587,49 @@ def docker_args_for(loopholes: List[Loophole]) -> List[str]:
         for intercept in m.intercepts:
             args.extend(["--add-host", f"{intercept.host}:{m.broker_ip}"])
 
-        # If the loophole has a jail_daemon, mount the whole loophole dir
-        # so the daemon cmd can reference files shipped with it (e.g. a
-        # jail.py proxy).
+        # Track which container paths are already covered by a directory
+        # mount so we can point NODE_EXTRA_CA_CERTS at the CA without
+        # trying to overlay a file on top of a dir mount (podman rejects
+        # that with a cryptic "conmon bytes" container-create error).
+        state_container = f"/var/lib/yolo-jail/loopholes/{m.name}"
+        state_mounted = False
+        dir_mounted = False
+
         if m.jail_daemon is not None:
+            # Mount the bundled/user loophole dir for helper files
+            # (jail.py, etc.).
             args.extend(["-v", f"{m.path}:{container_dir}:ro"])
+            dir_mounted = True
             # State dir — writable on host, read-only in jail.  Lets
             # daemons inside the jail read generated files (leaf cert,
             # etc.) without rebaking them into the read-only bundled
             # dir.  Only mount if it exists (otherwise podman errors).
             if m.state_dir.is_dir():
-                state_container = f"/var/lib/yolo-jail/loopholes/{m.name}"
                 args.extend(["-v", f"{m.state_dir}:{state_container}:ro"])
+                state_mounted = True
 
-        # Always mount the CA file at a canonical path inside the jail
-        # so NODE_EXTRA_CA_CERTS has a known target.  Works whether the
-        # CA lives in the loophole dir OR the state dir — the file
-        # mount overlays whatever the dir mount already provided.
+        # Make the CA reachable inside the jail.  If it's already inside
+        # a dir we mounted (state or loophole), compute the container
+        # path from that existing mount — don't stack a file mount on
+        # top of a dir mount, podman refuses.  Fall back to an explicit
+        # file mount only when the CA lives somewhere unrelated.
         if m.has_ca and m.ca_cert is not None:
-            container_ca = f"{container_dir}/ca.crt"
-            args.extend(["-v", f"{m.ca_cert}:{container_ca}:ro"])
+            container_ca: Optional[str] = None
+            if state_mounted:
+                try:
+                    rel = m.ca_cert.relative_to(m.state_dir)
+                    container_ca = f"{state_container}/{rel}"
+                except ValueError:
+                    pass
+            if container_ca is None and dir_mounted:
+                try:
+                    rel = m.ca_cert.relative_to(m.path)
+                    container_ca = f"{container_dir}/{rel}"
+                except ValueError:
+                    pass
+            if container_ca is None:
+                container_ca = f"{container_dir}/ca.crt"
+                args.extend(["-v", f"{m.ca_cert}:{container_ca}:ro"])
             trusted_ca_paths.append(container_ca)
 
         if m.jail_daemon is not None:

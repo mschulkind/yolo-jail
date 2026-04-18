@@ -553,6 +553,47 @@ def test_user_overrides_bundled_by_name(tmp_path: Path):
     assert broker[0].description == "local override"
 
 
+def test_no_file_overlay_on_dir_mount(mods_dir: Path, tmp_path: Path, monkeypatch):
+    """Regression: podman rejects container specs that mount a file INTO
+    a path already covered by a dir mount ("conmon bytes '': readObjectStart").
+    When the CA lives inside a mounted dir (bundled loophole dir OR the
+    state dir), docker_args_for must reference the existing mount — not
+    stack a second file mount on top."""
+    mod = mods_dir / "has-jail"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "has-jail",
+            "description": "x",
+            "intercepts": [{"host": "example.test"}],
+            "broker_ip": "127.0.0.1",
+            "ca_cert": "{state}/ca.crt",
+            "jail_daemon": {"cmd": ["true"], "restart": "no"},
+        },
+    )
+    # Fake a state dir with a ca.crt so the state mount + CA both apply.
+    import src.loopholes as loopholes_mod
+
+    state_root = tmp_path / "state"
+    state_root.mkdir()
+    state_dir = state_root / "has-jail"
+    state_dir.mkdir()
+    (state_dir / "ca.crt").write_text("ca")
+    monkeypatch.setattr(loopholes_mod, "state_dir_for", lambda name: state_root / name)
+
+    args = loopholes.docker_args_for(
+        loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    )
+    # Exactly two -v flags for this loophole: loophole dir + state dir.
+    # No third file-mount-on-top for the CA.
+    mount_sources = [a for a in args if ":/etc/yolo-jail/loopholes/has-jail" in a]
+    assert len(mount_sources) == 1, f"expected 1 dir mount, got {mount_sources}"
+    # NODE_EXTRA_CA_CERTS should point INTO the state-dir mount.
+    node_ca = next(a for a in args if a.startswith("NODE_EXTRA_CA_CERTS="))
+    assert node_ca == "NODE_EXTRA_CA_CERTS=/var/lib/yolo-jail/loopholes/has-jail/ca.crt"
+
+
 def test_run_doctor_checks_missing_cmd(mods_dir: Path):
     mod = mods_dir / "missing"
     mod.mkdir()
