@@ -90,15 +90,14 @@ watch -n 1 'stat -c "mtime=%y inode=%i" \
 
 If the mtime advances with no corresponding refresher journal entry, a jail wrote it → jails are still refreshing.
 
-When that happens, install the **claude-oauth-broker** loophole. It's the reference `tls-intercept` loophole (see [`docs/loopholes.md`](loopholes.md) for the system) — terminates TLS for `platform.claude.com` on the host and serializes *all* refreshes through a flock. Jails never talk to Anthropic directly, so they can't race.
+When that happens, install the **claude-oauth-broker** loophole. It's a split-broker loophole (see [`docs/loopholes.md`](loopholes.md) for the system) — TLS termination lives inside each jail, and a single host-side daemon (per jail, no systemd, no port binding) holds the flock and the shared credentials file. Jails talk to the host daemon over a Unix socket instead of connecting to Anthropic directly, so they can't race.
 
 ```bash
 cd ~/code/yolo-jail && just deploy    # installs broker alongside the refresher
-systemctl --user status claude-oauth-broker
 yolo loopholes status                 # summary across every loophole
 ```
 
-Design notes: [`docs/claude-oauth-mitm-proxy-plan.md`](claude-oauth-mitm-proxy-plan.md). Loophole README: [`loopholes/claude-oauth-broker/README.md`](../loopholes/claude-oauth-broker/README.md) — covers the port-443 privilege requirement (`AmbientCapabilities` / sysctl / DNAT).
+Design notes: [`docs/claude-oauth-mitm-proxy-plan.md`](claude-oauth-mitm-proxy-plan.md). Loophole README: [`loopholes/claude-oauth-broker/README.md`](../loopholes/claude-oauth-broker/README.md).
 
 ## Manual checks cheat sheet
 

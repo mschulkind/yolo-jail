@@ -111,27 +111,27 @@ deploy: install
         echo "  ExecStart → $REFRESHER_BIN"
     fi
 
-    # --- Claude OAuth broker loophole (systemd --user) ---
-    # Reference implementation of a yolo-jail loophole. Eliminates the
-    # refresh-token rotation race that the standalone refresher can only mostly
-    # work around. Coexists with the refresher — see
-    # loopholes/claude-oauth-broker/README.md. Also cleans up the old
-    # `modules/` directory for anyone upgrading from the pre-rename install.
+    # --- Claude OAuth broker loophole ---
+    # Host daemon + jail daemon: per-jail, spawned by yolo run.  No
+    # systemd unit, no privileged host port.  We just stage the
+    # manifest into the loopholes directory and pre-generate the CA
+    # (the jail needs it at mount time, before the per-jail host
+    # daemon has a chance to run its own ensure_ca_and_leaf).
+    # Also cleans up a pre-rename ``modules/`` install + a pre-split
+    # claude-oauth-broker.service if present.
     if ! command -v claude >/dev/null 2>&1; then
         echo "⚠ claude not found — skipping claude-oauth-broker loophole install"
-    elif ! command -v systemctl >/dev/null 2>&1; then
-        echo "⚠ systemctl not found — skipping claude-oauth-broker loophole install"
     elif ! command -v openssl >/dev/null 2>&1; then
         echo "⚠ openssl not found — skipping claude-oauth-broker loophole install"
     else
-        BROKER_BIN="$(command -v yolo-claude-oauth-broker || true)"
+        BROKER_BIN="$(command -v yolo-claude-oauth-broker-host || true)"
         if [ -z "$BROKER_BIN" ]; then
-            echo "ERROR: yolo-claude-oauth-broker not on PATH after install" >&2
+            echo "ERROR: yolo-claude-oauth-broker-host not on PATH after install" >&2
             echo "  Expected entry point from the yolo-jail wheel." >&2
             exit 1
         fi
 
-        # Migrate prior (pre-rename) install location if it exists.
+        # Migrate prior install locations.
         OLD_DIR="$HOME/.local/share/yolo-jail/modules/claude-oauth-broker"
         LOOPHOLE_DIR="$HOME/.local/share/yolo-jail/loopholes/claude-oauth-broker"
         if [ -d "$OLD_DIR" ] && [ ! -d "$LOOPHOLE_DIR" ]; then
@@ -139,25 +139,26 @@ deploy: install
             mv "$OLD_DIR" "$LOOPHOLE_DIR"
             echo "  migrated $OLD_DIR → $LOOPHOLE_DIR"
         fi
+        # Retire the pre-split systemd unit if present.
+        if command -v systemctl >/dev/null 2>&1; then
+            if systemctl --user is-enabled claude-oauth-broker.service >/dev/null 2>&1; then
+                systemctl --user disable --now claude-oauth-broker.service 2>/dev/null || true
+                rm -f "$HOME/.config/systemd/user/claude-oauth-broker.service"
+                systemctl --user daemon-reload
+                echo "  retired pre-split claude-oauth-broker.service"
+            fi
+        fi
+
         mkdir -p "$LOOPHOLE_DIR"
         cp loopholes/claude-oauth-broker/manifest.jsonc "$LOOPHOLE_DIR/manifest.jsonc"
         cp loopholes/claude-oauth-broker/README.md "$LOOPHOLE_DIR/README.md"
 
-        # Generate CA + leaf on first run (idempotent — skips if present).
+        # Generate CA + leaf now so the jail can trust them at first boot.
         "$BROKER_BIN" --init-ca >/dev/null
 
-        SYSTEMD_DIR="$HOME/.config/systemd/user"
-        mkdir -p "$SYSTEMD_DIR"
-        sed "s|@@BROKER_BIN@@|$BROKER_BIN|g" \
-            loopholes/claude-oauth-broker/claude-oauth-broker.service \
-            > "$SYSTEMD_DIR/claude-oauth-broker.service"
-
-        systemctl --user daemon-reload
-        systemctl --user enable --now claude-oauth-broker.service || \
-            echo "⚠ claude-oauth-broker failed to start — journalctl --user -u claude-oauth-broker"
-
         echo "✓ claude-oauth-broker loophole installed at $LOOPHOLE_DIR"
-        echo "  ExecStart → $BROKER_BIN"
+        echo "  host daemon: $BROKER_BIN (spawned per jail)"
+        echo "  jail daemon: python -m src.oauth_broker_jail (supervised in jail)"
     fi
 
     echo "yolo-jail deployed. Verify: yolo check"

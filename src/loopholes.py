@@ -35,13 +35,34 @@ Manifest schema (v1)
       "enabled": true,                           // default true
       "transport": "tls-intercept",              // or "unix-socket" or "none"
       "lifecycle": "external",                   // or "spawned"
-      "intercepts": [                            // tls-intercept only
+      "intercepts": [                            // DNS override inside the jail
         {"host": "platform.claude.com"}
       ],
-      "broker_ip": "host-gateway",               // tls-intercept only
-      "ca_cert": "ca.crt",                       // tls-intercept only
+      "broker_ip": "127.0.0.1",                  // where the intercept points;
+                                                  // use "127.0.0.1" to route to
+                                                  // a jail-side daemon, or
+                                                  // "host-gateway" for a
+                                                  // host-side one.
+      "ca_cert": "ca.crt",                       // auto-mounted + trusted
       "jail_env": {"FOO": "bar"},                // any transport
-      "doctor_cmd": ["bin-name", "--self-check"] // optional health check
+      "doctor_cmd": ["bin-name", "--self-check"],// optional health check
+
+      // A daemon to spawn on the HOST per jail boot.  Launched by
+      // ``start_loopholes``, torn down on jail exit.  The loophole's
+      // socket is bind-mounted into the jail; the daemon's cmd
+      // receives the host-side socket path as ``{socket}``.
+      "host_daemon": {
+        "cmd": ["yolo-claude-oauth-broker-host", "--socket", "{socket}"],
+        "env": {"MY_VAR": "val"}
+      },
+
+      // A daemon to spawn INSIDE the jail at boot.  Supervised by the
+      // jail-side supervisor (src/jail_daemon_supervisor.py): restarted
+      // per ``restart`` policy until PID 1 exits.
+      "jail_daemon": {
+        "cmd": ["python3", "/etc/yolo-jail/loopholes/<name>/jail.py"],
+        "restart": "on-failure"  // "always" | "on-failure" | "no"
+      }
     }
 
 The loader is stateless — every jail boot re-reads manifests.  Disabling
@@ -68,6 +89,7 @@ DEFAULT_BROKER_IP = "host-gateway"
 
 VALID_TRANSPORTS = {"tls-intercept", "unix-socket", "none"}
 VALID_LIFECYCLES = {"external", "spawned"}
+VALID_RESTART_POLICIES = {"always", "on-failure", "no"}
 
 
 def loopholes_dir() -> Path:
@@ -78,6 +100,22 @@ def loopholes_dir() -> Path:
 @dataclass
 class Intercept:
     host: str
+
+
+@dataclass
+class JailDaemon:
+    """A daemon the jail-side supervisor starts + restarts at boot."""
+
+    cmd: List[str]
+    restart: str = "on-failure"
+
+
+@dataclass
+class HostDaemon:
+    """A host-side daemon spawned by ``start_loopholes`` per jail boot."""
+
+    cmd: List[str]
+    env: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -95,6 +133,10 @@ class Loophole:
     ca_cert: Optional[Path] = None
     jail_env: Dict[str, str] = field(default_factory=dict)
     doctor_cmd: Optional[List[str]] = None
+    # Daemons described by the manifest itself (see JailDaemon / HostDaemon
+    # dataclasses).  Either may be absent.
+    host_daemon: Optional[HostDaemon] = None
+    jail_daemon: Optional[JailDaemon] = None
     # True for loopholes synthesized from yolo-jail.jsonc's ``loopholes``
     # config block (workspace-scoped, spawned + unix-socket).  False for
     # file-backed loopholes with their own manifest.jsonc under
@@ -180,6 +222,9 @@ def _load_manifest(module_path: Path) -> Loophole:
             )
         doctor_cmd = list(doctor_cmd_raw)
 
+    host_daemon = _parse_host_daemon(manifest_path, data.get("host_daemon"))
+    jail_daemon = _parse_jail_daemon(manifest_path, data.get("jail_daemon"))
+
     return Loophole(
         name=name,
         description=description,
@@ -192,7 +237,46 @@ def _load_manifest(module_path: Path) -> Loophole:
         ca_cert=ca_cert,
         jail_env=jail_env,
         doctor_cmd=doctor_cmd,
+        host_daemon=host_daemon,
+        jail_daemon=jail_daemon,
     )
+
+
+def _parse_host_daemon(manifest_path: Path, raw: Any) -> Optional[HostDaemon]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise LoopholeError(f"{manifest_path}: 'host_daemon' must be a mapping")
+    cmd = raw.get("cmd")
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
+        raise LoopholeError(
+            f"{manifest_path}: 'host_daemon.cmd' must be a non-empty list of strings"
+        )
+    env_raw = raw.get("env") or {}
+    if not isinstance(env_raw, dict):
+        raise LoopholeError(f"{manifest_path}: 'host_daemon.env' must be a mapping")
+    return HostDaemon(
+        cmd=list(cmd),
+        env={str(k): str(v) for k, v in env_raw.items()},
+    )
+
+
+def _parse_jail_daemon(manifest_path: Path, raw: Any) -> Optional[JailDaemon]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise LoopholeError(f"{manifest_path}: 'jail_daemon' must be a mapping")
+    cmd = raw.get("cmd")
+    if not isinstance(cmd, list) or not cmd or not all(isinstance(x, str) for x in cmd):
+        raise LoopholeError(
+            f"{manifest_path}: 'jail_daemon.cmd' must be a non-empty list of strings"
+        )
+    restart = str(raw.get("restart", "on-failure"))
+    if restart not in VALID_RESTART_POLICIES:
+        raise LoopholeError(
+            f"{manifest_path}: 'jail_daemon.restart' not in {sorted(VALID_RESTART_POLICIES)}"
+        )
+    return JailDaemon(cmd=list(cmd), restart=restart)
 
 
 def _synthesize_config_loopholes(
@@ -298,29 +382,79 @@ def validate_loopholes(
 
 
 def docker_args_for(loopholes: List[Loophole]) -> List[str]:
-    """Translate file-backed tls-intercept loopholes into docker run flags.
+    """Translate file-backed loopholes into docker run flags.
+
+    Emits --add-host, CA mounts, NODE_EXTRA_CA_CERTS, jail_env, plus the
+    YOLO_JAIL_DAEMONS payload and a full loophole-dir bind mount when a
+    loophole declares a ``jail_daemon``.
 
     Config-backed loopholes are ignored here — their wiring happens in
     ``cli.start_loopholes``.  Idempotent and side-effect free.
     """
+    import json as _json
+
     args: List[str] = []
     trusted_ca_paths: List[str] = []
+    jail_daemons_payload: List[Dict[str, Any]] = []
     for m in loopholes:
         if m.from_config:
-            continue  # handled by start_loopholes pipeline
-        if m.transport != "tls-intercept":
             continue
+        container_dir = f"/etc/yolo-jail/loopholes/{m.name}"
+
         for intercept in m.intercepts:
             args.extend(["--add-host", f"{intercept.host}:{m.broker_ip}"])
-        if m.has_ca:
-            container_path = f"/etc/yolo-jail/loopholes/{m.name}/ca.crt"
+
+        # If the loophole has a jail_daemon, mount the whole loophole dir
+        # so the daemon cmd can reference files shipped with it (e.g. a
+        # jail.py proxy).  Otherwise fall back to mounting just ca.crt.
+        if m.jail_daemon is not None:
+            args.extend(["-v", f"{m.path}:{container_dir}:ro"])
+            if m.has_ca and m.ca_cert is not None:
+                trusted_ca_paths.append(f"{container_dir}/{m.ca_cert.name}")
+        elif m.has_ca:
+            container_path = f"{container_dir}/ca.crt"
             args.extend(["-v", f"{m.ca_cert}:{container_path}:ro"])
             trusted_ca_paths.append(container_path)
+
+        if m.jail_daemon is not None:
+            jail_daemons_payload.append(
+                {
+                    "name": m.name,
+                    "cmd": list(m.jail_daemon.cmd),
+                    "restart": m.jail_daemon.restart,
+                }
+            )
+
         for k, v in m.jail_env.items():
             args.extend(["-e", f"{k}={v}"])
+
     if trusted_ca_paths:
         args.extend(["-e", f"NODE_EXTRA_CA_CERTS={os.pathsep.join(trusted_ca_paths)}"])
+    if jail_daemons_payload:
+        args.extend(["-e", f"YOLO_JAIL_DAEMONS={_json.dumps(jail_daemons_payload)}"])
     return args
+
+
+def manifest_host_daemon_specs(loopholes: List[Loophole]) -> Dict[str, Dict[str, Any]]:
+    """Return ``{name: spec}`` for every file-backed loophole with a
+    ``host_daemon``, shaped like the ``loopholes:`` config block so
+    ``cli.start_loopholes`` can spawn them through the existing pipeline.
+
+    ``{socket}`` stays as a placeholder; the spawner substitutes the real
+    per-jail socket path when it creates the listener.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for m in loopholes:
+        if m.from_config or m.host_daemon is None:
+            continue
+        spec: Dict[str, Any] = {
+            "command": list(m.host_daemon.cmd),
+            "description": m.description,
+        }
+        if m.host_daemon.env:
+            spec["env"] = dict(m.host_daemon.env)
+        out[m.name] = spec
+    return out
 
 
 # ---------------------------------------------------------------------------

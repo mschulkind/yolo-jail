@@ -1613,6 +1613,32 @@ def setup_published_port_localnet():
             )
 
 
+def start_jail_daemon_supervisor():
+    """Fork ``src.jail_daemon_supervisor`` as a detached child.
+
+    The supervisor reads ``YOLO_JAIL_DAEMONS`` from the env and spawns
+    each loophole-declared jail daemon with restart-on-failure
+    semantics.  Absent or empty env means nothing to do; this function
+    exits quickly in that case.
+
+    We launch it via ``python -m`` rather than a direct import + fork to
+    keep it out of the entrypoint's GC roots and allow it to evolve
+    independently.  The child inherits PID 1's env, including the
+    daemon list.
+    """
+    if not os.environ.get("YOLO_JAIL_DAEMONS", "").strip():
+        return
+    repo_root = os.environ.get("YOLO_REPO_ROOT", "/opt/yolo-jail")
+    subprocess.Popen(
+        [sys.executable, "-m", "src.jail_daemon_supervisor"],
+        env={**os.environ, "PYTHONPATH": repo_root},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+        start_new_session=False,  # stay in the same process group as PID 1
+    )
+
+
 def generate_yolo_wrapper():
     """Generate a yolo CLI wrapper in ~/.yolo-shims/.
 
@@ -1817,6 +1843,12 @@ def main():
     _perf("published_port_localnet")
     start_container_port_forwarding()
     _perf("port_forwarding")
+
+    # Start the jail-daemon supervisor if any loopholes declared a
+    # ``jail_daemon``.  Runs as a child of PID 1; kernel kills it when
+    # PID 1 exits so no explicit teardown is needed.
+    start_jail_daemon_supervisor()
+    _perf("jail_daemon_supervisor")
 
     # Set PATH including mise shims so tools like copilot/gemini/claude are found
     os.environ["PATH"] = f"{SHIM_DIR}:{NPM_BIN}:{MISE_SHIMS}:{GO_BIN}:/bin:/usr/bin"

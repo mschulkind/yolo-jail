@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import socket
 import struct
+import sys
 import threading
 import time
 from pathlib import Path
@@ -13,6 +14,14 @@ from typing import Any, Dict
 import pytest
 
 from src import host_processes, host_service
+
+
+# macOS ps is BSD-style and doesn't understand `-C <comm>`; the daemon's
+# own logic works, but the end-to-end "does ps run" tests are Linux-only.
+_PS_C_SUPPORTED = sys.platform.startswith("linux")
+_SKIP_MACOS_PS = pytest.mark.skipif(
+    not _PS_C_SUPPORTED, reason="macOS ps doesn't support -C <comm>"
+)
 
 
 def _send_request(conn: socket.socket, payload: Dict[str, Any]) -> None:
@@ -104,6 +113,7 @@ def _client(sock: Path) -> socket.socket:
     return c
 
 
+@_SKIP_MACOS_PS
 def test_list_mode_runs_ps_for_allowlisted_comm(started_daemon):
     sock, _ = started_daemon
     # Start a sleep process we can observe.
@@ -125,6 +135,7 @@ def test_list_mode_runs_ps_for_allowlisted_comm(started_daemon):
     assert str(p.pid) in stdout or "sleep" in stdout
 
 
+@_SKIP_MACOS_PS
 def test_pid_mode_rejects_non_allowlisted_comm(started_daemon):
     sock, _ = started_daemon
     # Our own PID is python — not allowlisted in the fixture.
@@ -139,6 +150,7 @@ def test_pid_mode_rejects_non_allowlisted_comm(started_daemon):
     assert "not allowlisted" in stderr
 
 
+@_SKIP_MACOS_PS
 def test_pid_mode_rejects_nonexistent_pid(started_daemon):
     sock, _ = started_daemon
     c = _client(sock)

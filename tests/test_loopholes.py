@@ -133,22 +133,15 @@ def test_docker_args_no_ca_no_env(mods_dir: Path):
     assert args == ["--add-host", "plain.test:host-gateway"]
 
 
-def test_docker_args_skip_unix_socket_transport(mods_dir: Path):
-    mod = mods_dir / "socket-type"
-    mod.mkdir()
-    _write_manifest(
-        mod,
-        {
-            "name": "socket-type",
-            "description": "x",
-            "transport": "unix-socket",
-            "intercepts": [{"host": "shouldnt.matter"}],
-        },
+def test_docker_args_skip_config_backed_loopholes(tmp_path: Path):
+    # Config-backed (synthesized from yolo-jail.jsonc) loopholes have no
+    # file-backed mounts or intercepts — their wiring lives in
+    # cli.start_loopholes.  docker_args_for should ignore them entirely.
+    loaded = loopholes.discover_loopholes(
+        tmp_path / "empty",
+        loopholes_config={"journal": {"description": "x"}},
     )
-    # tls-intercept flags are skipped for non-tls transports — the
-    # start_loopholes pipeline handles unix-socket loopholes separately.
-    args = loopholes.docker_args_for(loopholes.discover_loopholes(mods_dir))
-    assert args == []
+    assert loopholes.docker_args_for(loaded) == []
 
 
 def test_multiple_loopholes_merge_ca_paths(mods_dir: Path):
@@ -253,6 +246,125 @@ def test_run_doctor_checks_failure(mods_dir: Path):
     )
     results = loopholes.run_doctor_checks(loopholes.discover_loopholes(mods_dir))
     assert results[0].returncode == 1
+
+
+def test_manifest_parses_jail_daemon(mods_dir: Path):
+    mod = mods_dir / "with-jd"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "with-jd",
+            "description": "x",
+            "jail_daemon": {
+                "cmd": ["python3", "-m", "src.somemod"],
+                "restart": "always",
+            },
+        },
+    )
+    loaded = loopholes.discover_loopholes(mods_dir)
+    assert len(loaded) == 1
+    jd = loaded[0].jail_daemon
+    assert jd is not None
+    assert jd.cmd == ["python3", "-m", "src.somemod"]
+    assert jd.restart == "always"
+
+
+def test_manifest_rejects_invalid_restart(mods_dir: Path):
+    mod = mods_dir / "bad-restart"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "bad-restart",
+            "description": "x",
+            "jail_daemon": {"cmd": ["true"], "restart": "whenever"},
+        },
+    )
+    _, loophole, err = loopholes.validate_loopholes(mods_dir)[0]
+    assert loophole is None
+    assert err is not None and "restart" in err
+
+
+def test_manifest_parses_host_daemon(mods_dir: Path):
+    mod = mods_dir / "with-hd"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "with-hd",
+            "description": "x",
+            "host_daemon": {
+                "cmd": ["daemon-bin", "--socket", "{socket}"],
+                "env": {"FOO": "bar"},
+            },
+        },
+    )
+    loaded = loopholes.discover_loopholes(mods_dir)
+    hd = loaded[0].host_daemon
+    assert hd is not None
+    assert hd.cmd == ["daemon-bin", "--socket", "{socket}"]
+    assert hd.env == {"FOO": "bar"}
+
+
+def test_docker_args_mounts_dir_for_jail_daemon(mods_dir: Path):
+    mod = mods_dir / "jd-mod"
+    mod.mkdir()
+    (mod / "ca.crt").write_text("ca")
+    (mod / "jail.py").write_text("# jail daemon impl")
+    _write_manifest(
+        mod,
+        {
+            "name": "jd-mod",
+            "description": "x",
+            "intercepts": [{"host": "example.test"}],
+            "broker_ip": "127.0.0.1",
+            "ca_cert": "ca.crt",
+            "jail_daemon": {
+                "cmd": ["python3", "/etc/yolo-jail/loopholes/jd-mod/jail.py"],
+                "restart": "on-failure",
+            },
+        },
+    )
+    args = loopholes.docker_args_for(loopholes.discover_loopholes(mods_dir))
+    # Dir mount covers the CA too — only one -v line per loophole.
+    mount_lines = [a for a in args if "loopholes/jd-mod" in a]
+    assert any(a.endswith(":ro") for a in mount_lines)
+    # YOLO_JAIL_DAEMONS env var carries the daemon spec.
+    jd_env = next(a for a in args if a.startswith("YOLO_JAIL_DAEMONS="))
+    import json as _json
+
+    payload = _json.loads(jd_env[len("YOLO_JAIL_DAEMONS=") :])
+    assert payload == [
+        {
+            "name": "jd-mod",
+            "cmd": ["python3", "/etc/yolo-jail/loopholes/jd-mod/jail.py"],
+            "restart": "on-failure",
+        }
+    ]
+    # CA is still trusted, just via the dir-mount path.
+    node_ca = next(a for a in args if a.startswith("NODE_EXTRA_CA_CERTS="))
+    assert "/etc/yolo-jail/loopholes/jd-mod/ca.crt" in node_ca
+
+
+def test_manifest_host_daemon_specs_shaped_like_loopholes_config(mods_dir: Path):
+    mod = mods_dir / "with-hd"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "with-hd",
+            "description": "the broker host daemon",
+            "host_daemon": {"cmd": ["daemon", "--socket", "{socket}"]},
+        },
+    )
+    specs = loopholes.manifest_host_daemon_specs(loopholes.discover_loopholes(mods_dir))
+    assert specs == {
+        "with-hd": {
+            "command": ["daemon", "--socket", "{socket}"],
+            "description": "the broker host daemon",
+        }
+    }
 
 
 def test_run_doctor_checks_missing_cmd(mods_dir: Path):

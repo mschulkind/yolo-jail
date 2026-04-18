@@ -2147,18 +2147,27 @@ def start_loopholes(
         if journal is not None:
             handles.append(journal)
 
-    # 3. External services from config.
-    external_specs = config.get("loopholes") or {}
-    if isinstance(external_specs, dict):
-        for name, spec in external_specs.items():
-            if name in (BUILTIN_CGROUP_LOOPHOLE_NAME, BUILTIN_JOURNAL_LOOPHOLE_NAME):
-                # Reserved — user can't shadow the builtins.
-                continue
-            if not isinstance(spec, dict):
-                continue
-            h = _start_host_service_external(name, spec, sockets_dir)
-            if h is not None:
-                handles.append(h)
+    # 3. External services, from two sources:
+    #    a) Workspace/user config's ``loopholes:`` block.
+    #    b) File-backed loophole manifests that declare a ``host_daemon``.
+    #    Merge with (a) winning on name conflict so a user can override a
+    #    loophole's bundled daemon from config if they really need to.
+    manifest_specs = _loopholes.manifest_host_daemon_specs(
+        _loopholes.discover_loopholes()
+    )
+    external_specs: Dict[str, Any] = dict(manifest_specs)
+    config_specs = config.get("loopholes") or {}
+    if isinstance(config_specs, dict):
+        external_specs.update(config_specs)
+    for name, spec in external_specs.items():
+        if name in (BUILTIN_CGROUP_LOOPHOLE_NAME, BUILTIN_JOURNAL_LOOPHOLE_NAME):
+            # Reserved — user can't shadow the builtins.
+            continue
+        if not isinstance(spec, dict):
+            continue
+        h = _start_host_service_external(name, spec, sockets_dir)
+        if h is not None:
+            handles.append(h)
 
     return handles
 
@@ -7285,7 +7294,7 @@ def loopholes_list():
     ]
     if not file_backed and not synthesized:
         typer.echo(f"No loopholes installed under {_loopholes.loopholes_dir()}")
-        typer.echo("(Also checked yolo-jail.jsonc host_services — empty.)")
+        typer.echo("(Also checked yolo-jail.jsonc loopholes: block — empty.)")
         return
     for path, loophole, err in file_backed:
         if err:
