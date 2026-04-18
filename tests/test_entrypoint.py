@@ -1298,7 +1298,7 @@ class TestCglimitScript:
         script = jail_home / ".local" / "bin" / "yolo-cglimit"
         content = script.read_text()
         # Python script that talks to the host-side cgroup daemon via socket.
-        # The socket path moved with the host_services refactor — it now lives
+        # The socket path moved with the loopholes refactor — it now lives
         # under the unified /run/yolo-services/ dir as cgroup-delegate.sock.
         assert "#!/usr/bin/env python3" in content
         assert "/run/yolo-services/cgroup-delegate.sock" in content

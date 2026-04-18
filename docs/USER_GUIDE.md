@@ -20,7 +20,7 @@ This guide covers everything you need to get started with YOLO Jail and make the
 - [Blocked Tools](#blocked-tools)
 - [Device Passthrough](#device-passthrough)
 - [GPU Passthrough (NVIDIA)](#gpu-passthrough-nvidia)
-- [Host Services](#host-services)
+- [Loopholes (spawned host services)](#loopholes-spawned-host-services)
 - [Storage & Persistence](#storage--persistence)
 - [Container Reuse](#container-reuse)
 - [Config Safety](#config-safety)
@@ -700,11 +700,11 @@ Use an AWS Deep Learning AMI (DLAMI) — drivers and toolkit come pre-installed.
 
 ---
 
-## Host Services
+## Loopholes (spawned host services)
 
-**A way to split the jail boundary cleanly.** A host service is a process that runs on the host (outside the jail) and exposes a Unix socket that gets bind-mounted into the jail at `/run/yolo-services/<name>.sock`. The agent inside the jail can talk to the service without ever holding the service's secrets, credentials, or privileges.
+**A way to split the jail boundary cleanly.** A *spawned* loophole is a process that runs on the host (outside the jail) and exposes a Unix socket that gets bind-mounted into the jail at `/run/yolo-services/<name>.sock`. The agent inside the jail can talk to the loophole without ever holding its secrets, credentials, or privileges. See [docs/loopholes.md](loopholes.md) for the broader loophole system (including `tls-intercept` loopholes for things like the Claude OAuth broker).
 
-This is exactly the pattern used by the built-in cgroup delegate daemon: a host-side process performs privileged cgroup operations on behalf of the container so the jail itself doesn't need `CAP_SYS_ADMIN` or rw cgroup mounts. `host_services` lets you define your own services that follow the same pattern.
+This is exactly the pattern used by the built-in cgroup delegate daemon: a host-side process performs privileged cgroup operations on behalf of the container so the jail itself doesn't need `CAP_SYS_ADMIN` or rw cgroup mounts. The `loopholes` config block lets you define your own in the same shape.
 
 ### When to use it
 
@@ -717,7 +717,7 @@ This is exactly the pattern used by the built-in cgroup delegate daemon: a host-
 
 ```jsonc
 {
-  "host_services": {
+  "loopholes": {
     "auth-broker": {
       // Command to launch on the host when the jail starts.
       // "{socket}" is substituted with the host-side socket path the
@@ -804,7 +804,7 @@ Hook it up in your workspace config:
 
 ```jsonc
 {
-  "host_services": {
+  "loopholes": {
     "auth-broker": {
       "command": ["python3", "~/code/auth-broker/serve.py", "--socket", "{socket}"],
       "env": {"KEYS_FILE": "~/secrets/keys.json"}

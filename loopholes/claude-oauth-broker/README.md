@@ -83,4 +83,4 @@ The schema lives in [`src/loopholes.py`](../../src/loopholes.py) — docstring a
 
 Drop it under `~/.local/share/yolo-jail/loopholes/<name>/`, make sure the manifest's `name` field matches the directory name, and it gets picked up at next `yolo run`. No core changes required.
 
-For `unix-socket` + `spawned` loopholes (like host-processes), the short path is adding a `host_services` entry in `yolo-jail.jsonc` and building the daemon with the `src/host_service.py` helper library. See [`docs/loopholes.md`](../../docs/loopholes.md).
+For `unix-socket` + `spawned` loopholes (like host-processes), the short path is adding a `loopholes` entry in `yolo-jail.jsonc` and building the daemon with the `src/host_service.py` helper library. See [`docs/loopholes.md`](../../docs/loopholes.md).

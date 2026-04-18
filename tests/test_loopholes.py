@@ -146,7 +146,7 @@ def test_docker_args_skip_unix_socket_transport(mods_dir: Path):
         },
     )
     # tls-intercept flags are skipped for non-tls transports — the
-    # host_services pipeline handles unix-socket loopholes separately.
+    # start_loopholes pipeline handles unix-socket loopholes separately.
     args = loopholes.docker_args_for(loopholes.discover_loopholes(mods_dir))
     assert args == []
 
@@ -201,26 +201,26 @@ def test_hidden_dirs_skipped(mods_dir: Path):
     assert loopholes.discover_loopholes(mods_dir) == []
 
 
-def test_host_services_synthesized_as_loopholes(mods_dir: Path):
-    host_services = {
+def test_loopholes_config_synthesized_as_loopholes(mods_dir: Path):
+    loopholes_config = {
         "journal": {"description": "journalctl bridge"},
         "cgroup-delegate": {"description": "cgroup v2 delegate"},
     }
-    loaded = loopholes.discover_loopholes(mods_dir, host_services=host_services)
+    loaded = loopholes.discover_loopholes(mods_dir, loopholes_config=loopholes_config)
     names = [m.name for m in loaded]
     assert "journal" in names
     assert "cgroup-delegate" in names
     for m in loaded:
         assert m.transport == "unix-socket"
         assert m.lifecycle == "spawned"
-        assert m.host_service_shorthand == m.name
+        assert m.from_config
 
 
-def test_host_services_synthesized_do_not_emit_docker_args(mods_dir: Path):
-    host_services = {"journal": {"description": "x"}}
-    loaded = loopholes.discover_loopholes(mods_dir, host_services=host_services)
+def test_loopholes_config_synthesized_do_not_emit_docker_args(mods_dir: Path):
+    loopholes_config = {"journal": {"description": "x"}}
+    loaded = loopholes.discover_loopholes(mods_dir, loopholes_config=loopholes_config)
     # synthesized entries are for display only; their docker wiring is
-    # the existing start_host_services pipeline.
+    # the existing start_loopholes pipeline.
     assert loopholes.docker_args_for(loaded) == []
 
 

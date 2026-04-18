@@ -1201,7 +1201,7 @@ def cleanup_port_forwarding(
 #      operations on behalf of the container.  Built-ins are auto-started
 #      when applicable (e.g. cgroup delegate on Linux only).
 #
-#   2. External services.  Configured in yolo-jail.jsonc under `host_services`.
+#   2. External services.  Configured in yolo-jail.jsonc under `loopholes`.
 #      The user provides a command to launch.  yolo substitutes `{socket}` in
 #      the command args with the host-side socket path, launches the process,
 #      waits for the socket to appear, and tears it down when the jail exits.
@@ -1226,13 +1226,13 @@ def cleanup_port_forwarding(
 JAIL_HOST_SERVICES_DIR = "/run/yolo-services"
 
 # Name of the builtin cgroup delegate service.  Reserved — user-configured
-# services in `host_services` cannot use this name.
-BUILTIN_CGROUP_SERVICE_NAME = "cgroup-delegate"
+# services in `loopholes` cannot use this name.
+BUILTIN_CGROUP_LOOPHOLE_NAME = "cgroup-delegate"
 
 # Name of the builtin journal bridge service.  Off by default; opt in with
 # top-level config key `journal: "user"` or `"full"`.  Reserved — user
-# `host_services` cannot shadow it.
-BUILTIN_JOURNAL_SERVICE_NAME = "journal"
+# `loopholes` cannot shadow it.
+BUILTIN_JOURNAL_LOOPHOLE_NAME = "journal"
 JOURNAL_SOCKET_NAME = "journal.sock"
 
 # Legacy name used by the cgroup daemon when it was hard-coded at
@@ -1242,10 +1242,10 @@ CGD_SOCKET_NAME = "cgroup.sock"
 
 
 @dataclass
-class HostService:
+class LoopholeDaemon:
     """A host-side service exposing a Unix socket inside the jail.
 
-    Created by `start_host_services` and torn down by `stop_host_services`.
+    Created by `start_loopholes` and torn down by `stop_loopholes`.
     Holds everything `run()` needs to wire the service into the docker command:
     bind mount, env var, optional client shim path.
 
@@ -1655,10 +1655,10 @@ def _cgd_destroy(container_cgroup: Path, name: str, _log_file) -> dict:
 
 def _start_host_service_builtin_cgroup(
     cname: str, runtime: str, sockets_dir: Path
-) -> Optional[HostService]:
+) -> Optional[LoopholeDaemon]:
     """Start the built-in cgroup delegate daemon as a host service.
 
-    Listens on <sockets_dir>/cgroup.sock.  Returns a HostService handle, or
+    Listens on <sockets_dir>/cgroup.sock.  Returns a LoopholeDaemon handle, or
     None if cgroup v2 is not available (macOS or Linux without cgroup v2).
 
     This is functionally identical to the pre-refactor `start_cgroup_delegate`
@@ -1741,7 +1741,7 @@ def _start_host_service_builtin_cgroup(
         log_file.close()
 
     t = threading.Thread(
-        target=serve, daemon=True, name=f"host-service-{BUILTIN_CGROUP_SERVICE_NAME}"
+        target=serve, daemon=True, name=f"host-service-{BUILTIN_CGROUP_LOOPHOLE_NAME}"
     )
     t.start()
 
@@ -1754,11 +1754,13 @@ def _start_host_service_builtin_cgroup(
         # at which point the loop notices shutdown.is_set() and exits cleanly.
         t.join(timeout=3)
 
-    return HostService(
-        name=BUILTIN_CGROUP_SERVICE_NAME,
+    return LoopholeDaemon(
+        name=BUILTIN_CGROUP_LOOPHOLE_NAME,
         host_socket_path=sock_path,
-        jail_socket_path=_host_service_default_jail_socket(BUILTIN_CGROUP_SERVICE_NAME),
-        env_var_name=_host_service_env_var(BUILTIN_CGROUP_SERVICE_NAME),
+        jail_socket_path=_host_service_default_jail_socket(
+            BUILTIN_CGROUP_LOOPHOLE_NAME
+        ),
+        env_var_name=_host_service_env_var(BUILTIN_CGROUP_LOOPHOLE_NAME),
         _stop=_stop,
     )
 
@@ -1929,7 +1931,7 @@ def _journal_handle_client(conn: socket.socket, mode: str, log_file) -> None:
 
 def _start_host_service_builtin_journal(
     cname: str, sockets_dir: Path, mode: str
-) -> Optional[HostService]:
+) -> Optional[LoopholeDaemon]:
     """Start the built-in journal bridge as a host service.
 
     `mode` is "user" or "full".  Returns None if journalctl isn't on the
@@ -1977,7 +1979,7 @@ def _start_host_service_builtin_journal(
         log_file.close()
 
     t = threading.Thread(
-        target=serve, daemon=True, name=f"host-service-{BUILTIN_JOURNAL_SERVICE_NAME}"
+        target=serve, daemon=True, name=f"host-service-{BUILTIN_JOURNAL_LOOPHOLE_NAME}"
     )
     t.start()
     time.sleep(0.05)
@@ -1986,13 +1988,13 @@ def _start_host_service_builtin_journal(
         shutdown.set()
         t.join(timeout=3)
 
-    return HostService(
-        name=BUILTIN_JOURNAL_SERVICE_NAME,
+    return LoopholeDaemon(
+        name=BUILTIN_JOURNAL_LOOPHOLE_NAME,
         host_socket_path=sock_path,
         jail_socket_path=_host_service_default_jail_socket(
-            BUILTIN_JOURNAL_SERVICE_NAME
+            BUILTIN_JOURNAL_LOOPHOLE_NAME
         ),
-        env_var_name=_host_service_env_var(BUILTIN_JOURNAL_SERVICE_NAME),
+        env_var_name=_host_service_env_var(BUILTIN_JOURNAL_LOOPHOLE_NAME),
         _stop=_stop,
     )
 
@@ -2002,11 +2004,11 @@ def _start_host_service_external(
     spec: Dict[str, Any],
     sockets_dir: Path,
     startup_timeout_secs: float = 5.0,
-) -> Optional[HostService]:
+) -> Optional[LoopholeDaemon]:
     """Launch a user-configured external host service.
 
     The service's command is expected to bind a Unix socket at the path
-    substituted for `{socket}` in its args.  Returns a HostService handle if
+    substituted for `{socket}` in its args.  Returns a LoopholeDaemon handle if
     the service bound the socket within `startup_timeout_secs`, or None on
     failure (command not found, socket not bound, process exited early).
     """
@@ -2097,7 +2099,7 @@ def _start_host_service_external(
             pass
 
     jail_socket = spec.get("jail_socket") or _host_service_default_jail_socket(name)
-    return HostService(
+    return LoopholeDaemon(
         name=name,
         host_socket_path=host_socket,
         jail_socket_path=jail_socket,
@@ -2106,25 +2108,25 @@ def _start_host_service_external(
     )
 
 
-def start_host_services(
+def start_loopholes(
     cname: str,
     runtime: str,
     config: Dict[str, Any],
-) -> List[HostService]:
+) -> List[LoopholeDaemon]:
     """Start all host services for this jail and return handles.
 
     Always attempts the built-in cgroup delegate (skipped gracefully on
     macOS and non-cgroup-v2 Linux).  Then launches any services declared in
-    ``config["host_services"]`` as external processes.
+    ``config["loopholes"]`` as external processes.
 
     The caller is responsible for passing the returned handles to
-    ``stop_host_services`` at container exit, along with the same socket
+    ``stop_loopholes`` at container exit, along with the same socket
     directory (recoverable via ``_host_service_sockets_dir(cname)``).
     """
     sockets_dir = _host_service_sockets_dir(cname)
     sockets_dir.mkdir(parents=True, exist_ok=True)
 
-    handles: List[HostService] = []
+    handles: List[LoopholeDaemon] = []
 
     # Apple Container doesn't support Unix socket bind mounts at all (it
     # can't share the sockets dir into the jail), so we skip host services
@@ -2146,10 +2148,10 @@ def start_host_services(
             handles.append(journal)
 
     # 3. External services from config.
-    external_specs = config.get("host_services") or {}
+    external_specs = config.get("loopholes") or {}
     if isinstance(external_specs, dict):
         for name, spec in external_specs.items():
-            if name in (BUILTIN_CGROUP_SERVICE_NAME, BUILTIN_JOURNAL_SERVICE_NAME):
+            if name in (BUILTIN_CGROUP_LOOPHOLE_NAME, BUILTIN_JOURNAL_LOOPHOLE_NAME):
                 # Reserved — user can't shadow the builtins.
                 continue
             if not isinstance(spec, dict):
@@ -2161,7 +2163,7 @@ def start_host_services(
     return handles
 
 
-def stop_host_services(handles: List[HostService], sockets_dir: Optional[Path]) -> None:
+def stop_loopholes(handles: List[LoopholeDaemon], sockets_dir: Optional[Path]) -> None:
     """Stop all host services and clean up the sockets directory."""
     for h in handles:
         try:
@@ -3124,7 +3126,7 @@ KNOWN_TOP_LEVEL_CONFIG_KEYS = {
     "resources",
     "env",
     "host_claude_files",
-    "host_services",
+    "loopholes",
     "journal",
     "claude_token_refresher",
     "kvm",
@@ -3322,22 +3324,22 @@ def _validate_config(
                         f"config.host_claude_files[{idx}]: must be a filename, not a path"
                     )
 
-    host_services = config.get("host_services")
+    host_services = config.get("loopholes")
     if host_services is not None:
         if not isinstance(host_services, dict):
-            errors.append("config.host_services: expected an object")
+            errors.append("config.loopholes: expected an object")
         else:
             for name, spec in host_services.items():
-                path = f"config.host_services.{name}"
+                path = f"config.loopholes.{name}"
                 if not isinstance(name, str) or not HOST_SERVICE_NAME_RE.match(name):
                     errors.append(
-                        f"config.host_services: service name {name!r} must match "
+                        f"config.loopholes: service name {name!r} must match "
                         f"^[a-zA-Z][a-zA-Z0-9_-]{{0,63}}$"
                     )
                     continue
-                if name == BUILTIN_CGROUP_SERVICE_NAME:
+                if name == BUILTIN_CGROUP_LOOPHOLE_NAME:
                     errors.append(
-                        f"{path}: '{BUILTIN_CGROUP_SERVICE_NAME}' is reserved "
+                        f"{path}: '{BUILTIN_CGROUP_LOOPHOLE_NAME}' is reserved "
                         "for the built-in cgroup delegate service"
                     )
                     continue
@@ -4196,7 +4198,7 @@ def config_ref():
     a complete example.
 
     Example:
-      "host_services": {
+      "loopholes": {
         "auth-broker": {
           "command": ["~/code/auth-broker/serve.py", "--socket", "{socket}"],
           "env": {"KEYS_FILE": "~/secrets/keys.json"}
@@ -5594,11 +5596,11 @@ def check(
 
     # --- Host Services ---
 
-    host_services_cfg = config.get("host_services") or {}
-    if host_services_cfg:
+    loopholes_cfg = config.get("loopholes") or {}
+    if loopholes_cfg:
         console.print("[bold]Host Services[/bold]")
-        for name, spec in host_services_cfg.items():
-            if name == BUILTIN_CGROUP_SERVICE_NAME:
+        for name, spec in loopholes_cfg.items():
+            if name == BUILTIN_CGROUP_LOOPHOLE_NAME:
                 continue  # builtin is unconditional, not user-configurable
             if not isinstance(spec, dict):
                 continue
@@ -6563,9 +6565,9 @@ def run(
 
     # Host services: bind-mount the per-jail sockets directory into the jail
     # at /run/yolo-services/.  Each service (built-in cgroup delegate,
-    # user-configured external services from `host_services` in config) drops
+    # user-configured external services from `loopholes` in config) drops
     # its Unix socket here.  Apple Container can't share Unix sockets via
-    # virtiofs, so we skip the mount entirely there — start_host_services()
+    # virtiofs, so we skip the mount entirely there — start_loopholes()
     # also returns no handles in that case.
     #
     # The sockets dir lives under /tmp (not ws_state) because Linux's
@@ -6895,12 +6897,12 @@ def run(
     # Apply host-side loopholes: --add-host entries for DNS interception,
     # CA cert bind mounts, and NODE_EXTRA_CA_CERTS for tls-intercept
     # loopholes. Spawned + unix-socket loopholes (yolo-jail.jsonc
-    # host_services entries) ride the existing start_host_services
+    # host_services entries) ride the existing start_loopholes
     # pipeline below; we only do jail-side integration here. See
     # src/loopholes.py for the full schema.
     docker_cmd.extend(
         _loopholes.docker_args_for(
-            _loopholes.discover_loopholes(host_services=config.get("host_services"))
+            _loopholes.discover_loopholes(loopholes_config=config.get("loopholes"))
         )
     )
 
@@ -6990,11 +6992,11 @@ def run(
         socat_procs = start_host_port_forwarding(forward_host_ports, cname, socket_dir)
 
     # Start all host-side services (built-in cgroup delegate + any user
-    # `host_services` from config) BEFORE the container so their sockets
+    # `loopholes` from config) BEFORE the container so their sockets
     # exist when the entrypoint and agent code inside the jail try to
     # connect to them.  Env vars must be added BEFORE the image arg, so
     # do this before appending final_internal_cmd.
-    host_services = start_host_services(cname, runtime, config)
+    host_services = start_loopholes(cname, runtime, config)
     for svc in host_services:
         # Insert each `-e VAR=val` pair just before the image arg.  We can't
         # extend at the end — the image and command args are already in
@@ -7023,7 +7025,7 @@ def run(
             "[dim]Run `yolo check` to validate runtime availability before restarting.[/dim]"
         )
         cleanup_port_forwarding(socat_procs, socket_dir)
-        stop_host_services(host_services, host_services_sockets_dir)
+        stop_loopholes(host_services, host_services_sockets_dir)
         lock_file.close()
         sys.exit(1)
     for _ in range(20):
@@ -7038,7 +7040,7 @@ def run(
     # Clean up host-side socat processes, host services (incl. cgroup
     # delegate), and their per-jail socket directory.
     cleanup_port_forwarding(socat_procs, socket_dir)
-    stop_host_services(host_services, host_services_sockets_dir)
+    stop_loopholes(host_services, host_services_sockets_dir)
 
     if profile and _profile_times:
         _profile_times["container_exited"] = _time.monotonic()
@@ -7264,13 +7266,13 @@ def _loopholes_with_config(include_disabled: bool = False):
         )
     except Exception:
         ws_cfg = {}
-    merged_host_services: Dict[str, Any] = {}
-    for src in (user_cfg.get("host_services") or {}, ws_cfg.get("host_services") or {}):
+    merged_loopholes: Dict[str, Any] = {}
+    for src in (user_cfg.get("loopholes") or {}, ws_cfg.get("loopholes") or {}):
         if isinstance(src, dict):
-            merged_host_services.update(src)
+            merged_loopholes.update(src)
     return _loopholes.discover_loopholes(
         include_disabled=include_disabled,
-        host_services=merged_host_services,
+        host_services=merged_loopholes,
     )
 
 
@@ -7279,9 +7281,7 @@ def loopholes_list():
     """List installed loopholes and their enabled state."""
     file_backed = _loopholes.validate_loopholes()
     synthesized = [
-        m
-        for m in _loopholes_with_config(include_disabled=True)
-        if m.host_service_shorthand is not None
+        m for m in _loopholes_with_config(include_disabled=True) if m.from_config
     ]
     if not file_backed and not synthesized:
         typer.echo(f"No loopholes installed under {_loopholes.loopholes_dir()}")

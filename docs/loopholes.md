@@ -6,7 +6,7 @@ Examples:
 
 - [`claude-oauth-broker`](../loopholes/claude-oauth-broker/) — MITM proxy that serializes Claude OAuth refreshes (transport: `tls-intercept`, lifecycle: `external`).
 - `host-processes` — allowlisted read-only view of host processes (transport: `unix-socket`, lifecycle: `spawned`).
-- `journal`, `cgroup-delegate` — built-in loopholes surfaced from `host_services` in `yolo-jail.jsonc`.
+- `journal`, `cgroup-delegate` — built-in loopholes surfaced from `loopholes` in `yolo-jail.jsonc`.
 - Hypothetical future: `llm-audit` (logs every inference request), `secret-gate` (scrubs outbound traffic).
 
 ## Anatomy of a file-backed loophole
@@ -46,17 +46,17 @@ What the loader does at each `yolo run`:
 1. Scans `~/.local/share/yolo-jail/loopholes/` for subdirectories with a valid `manifest.jsonc`.
 2. Skips any with `"enabled": false`.
 3. For `tls-intercept` loopholes: emits `--add-host <host>:<broker_ip>` for each intercept, bind-mounts the CA cert into the jail at `/etc/yolo-jail/loopholes/<name>/ca.crt`, and sets `NODE_EXTRA_CA_CERTS` to all loophole CAs concatenated.
-4. For `unix-socket` / `spawned` loopholes — declare them via the `host_services` shorthand in `yolo-jail.jsonc`; yolo handles spawning the daemon, creating the socket, bind-mounting it into the jail, and cleanup.
+4. For `unix-socket` / `spawned` loopholes — declare them via the `loopholes` shorthand in `yolo-jail.jsonc`; yolo handles spawning the daemon, creating the socket, bind-mounting it into the jail, and cleanup.
 5. Merges `jail_env` into the container env.
 
 Invalid manifests are skipped silently at runtime; `yolo loopholes list` surfaces the error.
 
-## `host_services` shorthand
+## `loopholes` in `yolo-jail.jsonc`
 
-`yolo-jail.jsonc` has a `host_services` block that predates the loophole registry. Entries there are treated as `unix-socket` + `spawned` loopholes — yolo spawns the daemon process at jail startup, creates a Unix socket, bind-mounts it into the jail, and tears down on exit. They appear in `yolo loopholes list` so the whole picture lives in one command.
+The `loopholes` block is the workspace-scoped entry point. Each entry is treated as a `unix-socket` + `spawned` loophole — yolo spawns the daemon process at jail startup, creates a Unix socket, bind-mounts it into the jail, and tears down on exit. They appear in `yolo loopholes list` alongside file-backed loopholes so the whole picture lives in one command.
 
 ```jsonc
-"host_services": {
+"loopholes": {
   "host-processes": {
     "description": "Allowlisted view of host processes",
     "command": ["yolo-host-processes", "--socket", "$SOCKET"],

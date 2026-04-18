@@ -16,11 +16,12 @@ at least a ``manifest.jsonc``.  The loader discovers every installed
 loophole at jail startup and applies its declared wiring — CA cert mount,
 DNS overrides, socket bind mount, jail env — to the docker run command.
 
-``host_services`` config entries in ``yolo-jail.jsonc`` are also surfaced
-through this registry as loopholes so ``yolo loopholes list`` shows the
-complete picture.  The existing ``host_services`` machinery still owns
-the lifecycle of those entries (spawn, socket, teardown); the loophole
-registry gives them a unified face for discovery and doctor checks.
+``loopholes`` config entries in ``yolo-jail.jsonc`` are the second
+source of loopholes (workspace-scoped, unix-socket + spawned).  The
+loader surfaces them alongside file-backed loopholes so
+``yolo loopholes list`` is the single pane of glass.  ``start_loopholes``
+(in ``cli.py``) owns their process lifecycle; this registry is
+discovery and doctor-integration only.
 
 Manifest schema (v1)
 --------------------
@@ -94,9 +95,14 @@ class Loophole:
     ca_cert: Optional[Path] = None
     jail_env: Dict[str, str] = field(default_factory=dict)
     doctor_cmd: Optional[List[str]] = None
-    # For host_services-synthesized loopholes, the underlying config name.
-    # None for file-backed (manifest.jsonc) loopholes.
-    host_service_shorthand: Optional[str] = None
+    # True for loopholes synthesized from yolo-jail.jsonc's ``loopholes``
+    # config block (workspace-scoped, spawned + unix-socket).  False for
+    # file-backed loopholes with their own manifest.jsonc under
+    # ``~/.local/share/yolo-jail/loopholes/``.  Used to decide which
+    # integration path applies: config-backed loopholes route through
+    # ``start_loopholes`` in cli.py; file-backed ones through
+    # ``docker_args_for`` below.
+    from_config: bool = False
 
     @property
     def has_ca(self) -> bool:
@@ -189,11 +195,11 @@ def _load_manifest(module_path: Path) -> Loophole:
     )
 
 
-def _synthesize_host_service_loopholes(
-    host_services: Optional[Dict[str, Any]],
+def _synthesize_config_loopholes(
+    loopholes_config: Optional[Dict[str, Any]],
 ) -> List[Loophole]:
-    """Surface entries from ``yolo-jail.jsonc``'s ``host_services`` block as
-    read-only loopholes.
+    """Surface entries from ``yolo-jail.jsonc``'s ``loopholes`` block as
+    read-only Loophole records.
 
     These are not file-backed (no manifest.jsonc) and can't be enabled /
     disabled through the loopholes CLI — you edit yolo-jail.jsonc.  They
@@ -201,9 +207,9 @@ def _synthesize_host_service_loopholes(
     of glass on what's crossing the jail boundary.
     """
     out: List[Loophole] = []
-    if not isinstance(host_services, dict):
+    if not isinstance(loopholes_config, dict):
         return out
-    for name, spec in host_services.items():
+    for name, spec in loopholes_config.items():
         if not isinstance(spec, dict):
             continue
         description = str(spec.get("description") or "")
@@ -218,12 +224,12 @@ def _synthesize_host_service_loopholes(
             Loophole(
                 name=str(name),
                 description=description,
-                path=Path(f"<yolo-jail.jsonc:host_services.{name}>"),
+                path=Path(f"<yolo-jail.jsonc:loopholes.{name}>"),
                 enabled=enabled,
                 transport="unix-socket",
                 lifecycle="spawned",
                 doctor_cmd=doctor_cmd,
-                host_service_shorthand=str(name),
+                from_config=True,
             )
         )
     return out
@@ -233,10 +239,10 @@ def discover_loopholes(
     root: Optional[Path] = None,
     *,
     include_disabled: bool = False,
-    host_services: Optional[Dict[str, Any]] = None,
+    loopholes_config: Optional[Dict[str, Any]] = None,
 ) -> List[Loophole]:
     """Return every validated loophole — file-backed plus any synthesized
-    from ``host_services`` config.
+    from the ``loopholes`` block in yolo-jail.jsonc.
 
     Invalid manifests are skipped silently — a broken third-party loophole
     should not prevent ``yolo run`` from starting.  Use ``validate_loopholes``
@@ -255,7 +261,7 @@ def discover_loopholes(
             if not include_disabled and not loophole.enabled:
                 continue
             out.append(loophole)
-    for synth in _synthesize_host_service_loopholes(host_services):
+    for synth in _synthesize_config_loopholes(loopholes_config):
         if not include_disabled and not synth.enabled:
             continue
         out.append(synth)
@@ -267,8 +273,8 @@ def validate_loopholes(
 ) -> List["tuple[Path, Optional[Loophole], Optional[str]]"]:
     """Return one entry per file-backed loophole directory.
 
-    Synthesized host_services loopholes are not included — they have no
-    separate manifest to validate.
+    Config-synthesized loopholes are not included — they have no manifest
+    to validate (they live in yolo-jail.jsonc).
     """
     root = root or loopholes_dir()
     if not root.is_dir():
@@ -285,22 +291,23 @@ def validate_loopholes(
 
 
 # ---------------------------------------------------------------------------
-# docker run integration — only file-backed tls-intercept loopholes.  Spawned
-# unix-socket loopholes ride the existing start_host_services pipeline.
+# docker run integration — only file-backed tls-intercept loopholes.
+# Config-backed (spawned + unix-socket) loopholes ride the ``start_loopholes``
+# pipeline in cli.py.
 # ---------------------------------------------------------------------------
 
 
 def docker_args_for(loopholes: List[Loophole]) -> List[str]:
     """Translate file-backed tls-intercept loopholes into docker run flags.
 
-    Synthesized (host_services) loopholes are ignored here — their wiring
-    happens in ``start_host_services``.  Idempotent and side-effect free.
+    Config-backed loopholes are ignored here — their wiring happens in
+    ``cli.start_loopholes``.  Idempotent and side-effect free.
     """
     args: List[str] = []
     trusted_ca_paths: List[str] = []
     for m in loopholes:
-        if m.host_service_shorthand is not None:
-            continue  # handled by host_services pipeline
+        if m.from_config:
+            continue  # handled by start_loopholes pipeline
         if m.transport != "tls-intercept":
             continue
         for intercept in m.intercepts:

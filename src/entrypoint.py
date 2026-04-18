@@ -1627,9 +1627,14 @@ def generate_yolo_wrapper():
     # Use --no-project with explicit --with deps so uv doesn't need to find
     # or build the project (which fails on read-only /opt/yolo-jail mount and
     # when CWD is outside the project tree).
+    # Use `python -m src.cli` with repo_root on PYTHONPATH so `from src
+    # import loopholes` (and any other sibling-package import) resolves
+    # the `src` package properly. Running the file as a bare script
+    # (sys.path[0] = .../src) makes `src` un-importable.
     script_path.write_text(f"""#!/bin/bash
+export PYTHONPATH="{repo_root}:${{PYTHONPATH:-}}"
 exec uv run --no-project --with typer --with rich --with "pyjson5>=2.0.0" \
-  -- python "{repo_root}/src/cli.py" "$@"
+  -- python -m src.cli "$@"
 """)
     script_path.chmod(0o755)
 

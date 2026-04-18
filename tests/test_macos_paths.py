@@ -21,8 +21,8 @@ import cli  # noqa: E402
 from cli import (  # noqa: E402
     _resolve_container_cgroup,
     _start_host_service_builtin_cgroup,
-    start_host_services,
-    stop_host_services,
+    start_loopholes,
+    stop_loopholes,
     app,
 )
 
@@ -88,16 +88,16 @@ class TestMacosCgroupSkip:
         # On macOS the builtin returns None — no daemon, no socket.
         assert result is None
 
-    def test_stop_host_services_handles_empty_list(self, monkeypatch, tmp_path):
+    def test_stop_loopholes_handles_empty_list(self, monkeypatch, tmp_path):
         _set_macos(monkeypatch)
         # stop with empty list (what start returns on macOS for the builtin)
-        stop_host_services([], tmp_path / "nonexistent")
+        stop_loopholes([], tmp_path / "nonexistent")
 
-    def test_start_host_services_macos_skips_builtin(self, monkeypatch):
+    def test_start_loopholes_macos_skips_builtin(self, monkeypatch):
         _set_macos(monkeypatch)
         # Even with podman as runtime, on macOS the builtin returns None
         # (no cgroup v2), so no handles come back.
-        handles = start_host_services("test-cname-macos", "podman", {})
+        handles = start_loopholes("test-cname-macos", "podman", {})
         assert handles == []
 
 

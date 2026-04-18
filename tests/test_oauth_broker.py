@@ -225,10 +225,16 @@ def test_ensure_ca_force_rotates(broker_dirs: Path):
 
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl")
 def test_self_check_ok(broker_dirs: Path, creds_file: Path, monkeypatch, capsys):
+    # Mask the systemd-state probe and TCP-probe — they check operational
+    # state of a running broker, not the file-level prereqs this test
+    # exercises.  No daemon is running on a CI machine, but the file
+    # checks should still come out green.
     oauth_broker.ensure_ca_and_leaf()
     from src import claude_refresher
 
     monkeypatch.setattr(claude_refresher, "DEFAULT_CREDS_PATH", creds_file)
+    monkeypatch.setattr(oauth_broker, "_systemd_check", lambda: [])
+    monkeypatch.setattr(oauth_broker, "_tcp_probe", lambda h, p, timeout=2.0: [])
     rc = oauth_broker.self_check()
     assert rc == 0
 

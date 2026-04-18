@@ -64,9 +64,9 @@ from cli import (  # noqa: E402
     _cgd_ensure_agent_cgroup,
     _cgd_create_and_join,
     _cgd_destroy,
-    BUILTIN_CGROUP_SERVICE_NAME,
-    BUILTIN_JOURNAL_SERVICE_NAME,
-    HostService,
+    BUILTIN_CGROUP_LOOPHOLE_NAME,
+    BUILTIN_JOURNAL_LOOPHOLE_NAME,
+    LoopholeDaemon,
     JAIL_HOST_SERVICES_DIR,
     _check_claude_token_refresher,
     _host_service_default_jail_socket,
@@ -77,8 +77,8 @@ from cli import (  # noqa: E402
     _start_host_service_builtin_journal,
     _start_host_service_external,
     _substitute_socket_in_cmd,
-    start_host_services,
-    stop_host_services,
+    start_loopholes,
+    stop_loopholes,
 )
 
 
@@ -955,50 +955,50 @@ class TestValidateConfig:
         _validate_port_number(0, "test", errors)
         assert any("between" in e for e in errors)
 
-    def test_host_services_missing_command(self, tmp_path):
-        errors, _ = _validate_config({"host_services": {"foo": {}}}, workspace=tmp_path)
+    def test_loopholes_config_missing_command(self, tmp_path):
+        errors, _ = _validate_config({"loopholes": {"foo": {}}}, workspace=tmp_path)
         assert any("command: required" in e for e in errors)
 
-    def test_host_services_command_not_a_list(self, tmp_path):
+    def test_loopholes_config_command_not_a_list(self, tmp_path):
         errors, _ = _validate_config(
-            {"host_services": {"foo": {"command": "not-a-list"}}}, workspace=tmp_path
+            {"loopholes": {"foo": {"command": "not-a-list"}}}, workspace=tmp_path
         )
         assert any("non-empty list" in e for e in errors)
 
-    def test_host_services_command_empty_list(self, tmp_path):
+    def test_loopholes_config_command_empty_list(self, tmp_path):
         errors, _ = _validate_config(
-            {"host_services": {"foo": {"command": []}}}, workspace=tmp_path
+            {"loopholes": {"foo": {"command": []}}}, workspace=tmp_path
         )
         assert any("non-empty list" in e for e in errors)
 
-    def test_host_services_command_non_string_arg(self, tmp_path):
+    def test_loopholes_config_command_non_string_arg(self, tmp_path):
         errors, _ = _validate_config(
-            {"host_services": {"foo": {"command": ["serve.py", 42]}}},
+            {"loopholes": {"foo": {"command": ["serve.py", 42]}}},
             workspace=tmp_path,
         )
         assert any("expected a string" in e for e in errors)
 
-    def test_host_services_reserved_name(self, tmp_path):
+    def test_loopholes_config_reserved_name(self, tmp_path):
         """User can't shadow the builtin cgroup-delegate service."""
         errors, _ = _validate_config(
-            {"host_services": {"cgroup-delegate": {"command": ["/bin/sleep", "1"]}}},
+            {"loopholes": {"cgroup-delegate": {"command": ["/bin/sleep", "1"]}}},
             workspace=tmp_path,
         )
         assert any("reserved" in e for e in errors)
 
-    def test_host_services_invalid_name(self, tmp_path):
+    def test_loopholes_config_invalid_name(self, tmp_path):
         errors, _ = _validate_config(
-            {"host_services": {"123 bad name!": {"command": ["/bin/true"]}}},
+            {"loopholes": {"123 bad name!": {"command": ["/bin/true"]}}},
             workspace=tmp_path,
         )
         assert any("name" in e and "match" in e for e in errors)
 
-    def test_host_services_jail_socket_must_start_under_run_yolo_services(
+    def test_loopholes_config_jail_socket_must_start_under_run_yolo_services(
         self, tmp_path
     ):
         errors, _ = _validate_config(
             {
-                "host_services": {
+                "loopholes": {
                     "foo": {
                         "command": ["/bin/sleep", "1"],
                         "jail_socket": "/tmp/elsewhere.sock",
@@ -1009,10 +1009,10 @@ class TestValidateConfig:
         )
         assert any("jail_socket" in e and "yolo-services" in e for e in errors)
 
-    def test_host_services_env_must_be_string_to_string(self, tmp_path):
+    def test_loopholes_config_env_must_be_string_to_string(self, tmp_path):
         errors, _ = _validate_config(
             {
-                "host_services": {
+                "loopholes": {
                     "foo": {
                         "command": ["/bin/sleep", "1"],
                         "env": {"KEY": 42},
@@ -1023,28 +1023,24 @@ class TestValidateConfig:
         )
         assert any("env" in e and "strings" in e for e in errors)
 
-    def test_host_services_unknown_key(self, tmp_path):
+    def test_loopholes_config_unknown_key(self, tmp_path):
         errors, _ = _validate_config(
-            {
-                "host_services": {
-                    "foo": {"command": ["/bin/sleep"], "made_up_field": True}
-                }
-            },
+            {"loopholes": {"foo": {"command": ["/bin/sleep"], "made_up_field": True}}},
             workspace=tmp_path,
         )
         assert any("unknown key" in e and "made_up_field" in e for e in errors)
 
-    def test_host_services_minimal_valid(self, tmp_path):
+    def test_loopholes_config_minimal_valid(self, tmp_path):
         errors, _ = _validate_config(
-            {"host_services": {"auth-broker": {"command": ["/usr/bin/serve"]}}},
+            {"loopholes": {"auth-broker": {"command": ["/usr/bin/serve"]}}},
             workspace=tmp_path,
         )
         assert errors == []
 
-    def test_host_services_with_env_and_jail_socket(self, tmp_path):
+    def test_loopholes_config_with_env_and_jail_socket(self, tmp_path):
         errors, _ = _validate_config(
             {
-                "host_services": {
+                "loopholes": {
                     "auth-broker": {
                         "command": ["/usr/bin/serve", "--socket", "{socket}"],
                         "env": {"KEYS_FILE": "/etc/keys.json"},
@@ -2162,13 +2158,13 @@ class TestCgroupDaemonSocket:
             )
         if handle is None:
             pytest.skip("cgroup v2 not available on this host")
-        assert isinstance(handle, HostService)
-        assert handle.name == BUILTIN_CGROUP_SERVICE_NAME
+        assert isinstance(handle, LoopholeDaemon)
+        assert handle.name == BUILTIN_CGROUP_LOOPHOLE_NAME
         assert handle.host_socket_path.exists()
         assert handle.host_socket_path == sockets_dir / "cgroup.sock"
         assert handle.jail_socket_path == "/run/yolo-services/cgroup-delegate.sock"
         # Stop via the unified machinery
-        stop_host_services([handle], sockets_dir)
+        stop_loopholes([handle], sockets_dir)
         assert not sockets_dir.exists()
 
     def test_start_returns_none_without_cgroupv2(self, tmp_path):
@@ -2292,7 +2288,7 @@ class TestJournalDaemon:
                 "test-journal-cname", sockets_dir, "user"
             )
             assert handle is not None
-            assert handle.name == BUILTIN_JOURNAL_SERVICE_NAME
+            assert handle.name == BUILTIN_JOURNAL_LOOPHOLE_NAME
             assert handle.host_socket_path.exists()
 
             out, err, rc = self._journal_client(handle.host_socket_path, ["-u", "foo"])
@@ -2301,7 +2297,7 @@ class TestJournalDaemon:
             # Fake script echoed its received args onto stderr.
             assert b"args=--user -u foo" in err
         finally:
-            stop_host_services([handle] if handle else [], sockets_dir)
+            stop_loopholes([handle] if handle else [], sockets_dir)
             os.environ["PATH"] = old_path
 
     def test_daemon_end_to_end_full_mode_does_not_inject_user(self, tmp_path):
@@ -2322,7 +2318,7 @@ class TestJournalDaemon:
             assert b"args=-u nginx -n 10" in err
             assert b"--user" not in err
         finally:
-            stop_host_services([handle] if handle else [], sockets_dir)
+            stop_loopholes([handle] if handle else [], sockets_dir)
             os.environ["PATH"] = old_path
 
     def test_daemon_propagates_exit_code(self, tmp_path):
@@ -2339,7 +2335,7 @@ class TestJournalDaemon:
             _, _, rc = self._journal_client(handle.host_socket_path, [])
             assert rc == 7
         finally:
-            stop_host_services([handle] if handle else [], sockets_dir)
+            stop_loopholes([handle] if handle else [], sockets_dir)
             os.environ["PATH"] = old_path
 
     def test_daemon_rejects_malformed_request(self, tmp_path):
@@ -2370,7 +2366,7 @@ class TestJournalDaemon:
             # Last 9 bytes should be the exit frame with code=2
             assert chunks.endswith(b"\x03\x00\x00\x00\x04\x00\x00\x00\x02")
         finally:
-            stop_host_services([handle] if handle else [], sockets_dir)
+            stop_loopholes([handle] if handle else [], sockets_dir)
             os.environ["PATH"] = old_path
 
 
@@ -2486,7 +2482,7 @@ class TestHostServices:
             assert handle.env_var_name == "YOLO_SERVICE_ECHOER_SOCKET"
 
             # Stop via the unified machinery
-            stop_host_services([handle], sockets_dir)
+            stop_loopholes([handle], sockets_dir)
             assert not sockets_dir.exists()
         finally:
             # Defensive cleanup if the assertions failed mid-test
@@ -2523,21 +2519,21 @@ class TestHostServices:
 
                 _sh.rmtree(sockets_dir, ignore_errors=True)
 
-    def test_start_host_services_skips_apple_container(self):
+    def test_start_loopholes_skips_apple_container(self):
         """Apple Container can't bind-mount Unix sockets — we skip everything."""
-        handles = start_host_services(
+        handles = start_loopholes(
             "test-cname",
             "container",  # Apple Container
-            {"host_services": {"foo": {"command": ["/bin/sleep", "9999"]}}},
+            {"loopholes": {"foo": {"command": ["/bin/sleep", "9999"]}}},
         )
         assert handles == []
 
-    def test_start_host_services_reserves_builtin_name(self):
+    def test_start_loopholes_reserves_builtin_name(self):
         """User can't shadow the builtin cgroup-delegate service."""
         cname = "yolo-test-reserved-name"
         config = {
-            "host_services": {
-                BUILTIN_CGROUP_SERVICE_NAME: {
+            "loopholes": {
+                BUILTIN_CGROUP_LOOPHOLE_NAME: {
                     "command": [sys.executable, "-c", "pass"],
                 }
             }
@@ -2545,14 +2541,14 @@ class TestHostServices:
         try:
             # Mock _resolve_container_cgroup so the builtin doesn't try to reach a real container
             with patch("cli._resolve_container_cgroup", return_value=None):
-                handles = start_host_services(cname, "podman", config)
+                handles = start_loopholes(cname, "podman", config)
             # The user spec is silently dropped; only the builtin (if available) appears.
             names = [h.name for h in handles]
             if names:
                 # On a host with cgroup v2, only the builtin should be present.
-                assert names == [BUILTIN_CGROUP_SERVICE_NAME]
+                assert names == [BUILTIN_CGROUP_LOOPHOLE_NAME]
             # Clean up
-            stop_host_services(handles, _host_service_sockets_dir(cname))
+            stop_loopholes(handles, _host_service_sockets_dir(cname))
         finally:
             sockets_dir = _host_service_sockets_dir(cname)
             if sockets_dir.exists():
