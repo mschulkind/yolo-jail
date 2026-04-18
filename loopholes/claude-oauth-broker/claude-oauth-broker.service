@@ -12,7 +12,7 @@ Wants=network-online.target
 # not a real host interface, so bind(2) against it fails with
 # EADDRNOTAVAIL and the daemon crash-loops. The kernel routes
 # container-origin packets for `platform.claude.com` to the host's
-# loopback via the --add-host :host-gateway line the yolo modules
+# loopback via the --add-host :host-gateway line the yolo loopholes
 # loader emits, so 0.0.0.0:443 catches them.
 ExecStart=@@BROKER_BIN@@ --host 0.0.0.0 --port 443
 Restart=on-failure
@@ -21,15 +21,15 @@ RestartSec=5s
 # Privilege: listening on :443 needs CAP_NET_BIND_SERVICE. User-level systemd
 # can grant this via AmbientCapabilities when NoNewPrivileges is off and the
 # kernel allows it. If this fails on your host, switch --port to 8443 and
-# arrange DNAT on the container bridge (see modules/claude-oauth-broker/README).
+# arrange DNAT on the container bridge (see loopholes/claude-oauth-broker/README).
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
-# Sandboxing — the daemon only needs to read/write the module dir and the
+# Sandboxing — the daemon only needs to read/write the loophole dir and the
 # shared credentials file.
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.local/share/yolo-jail/modules/claude-oauth-broker %h/.local/share/yolo-jail/home/.claude
+ReadWritePaths=%h/.local/share/yolo-jail/loopholes/claude-oauth-broker %h/.local/share/yolo-jail/home/.claude
 PrivateTmp=yes
 NoNewPrivileges=no
 

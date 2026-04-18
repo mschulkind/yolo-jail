@@ -111,17 +111,18 @@ deploy: install
         echo "  ExecStart → $REFRESHER_BIN"
     fi
 
-    # --- Claude OAuth broker module (systemd --user) ---
-    # Reference implementation of a yolo-jail host-side module. Eliminates the
+    # --- Claude OAuth broker loophole (systemd --user) ---
+    # Reference implementation of a yolo-jail loophole. Eliminates the
     # refresh-token rotation race that the standalone refresher can only mostly
     # work around. Coexists with the refresher — see
-    # modules/claude-oauth-broker/README.md.
+    # loopholes/claude-oauth-broker/README.md. Also cleans up the old
+    # `modules/` directory for anyone upgrading from the pre-rename install.
     if ! command -v claude >/dev/null 2>&1; then
-        echo "⚠ claude not found — skipping claude-oauth-broker module install"
+        echo "⚠ claude not found — skipping claude-oauth-broker loophole install"
     elif ! command -v systemctl >/dev/null 2>&1; then
-        echo "⚠ systemctl not found — skipping claude-oauth-broker module install"
+        echo "⚠ systemctl not found — skipping claude-oauth-broker loophole install"
     elif ! command -v openssl >/dev/null 2>&1; then
-        echo "⚠ openssl not found — skipping claude-oauth-broker module install"
+        echo "⚠ openssl not found — skipping claude-oauth-broker loophole install"
     else
         BROKER_BIN="$(command -v yolo-claude-oauth-broker || true)"
         if [ -z "$BROKER_BIN" ]; then
@@ -130,10 +131,17 @@ deploy: install
             exit 1
         fi
 
-        MODULES_DIR="$HOME/.local/share/yolo-jail/modules/claude-oauth-broker"
-        mkdir -p "$MODULES_DIR"
-        cp modules/claude-oauth-broker/manifest.jsonc "$MODULES_DIR/manifest.jsonc"
-        cp modules/claude-oauth-broker/README.md "$MODULES_DIR/README.md"
+        # Migrate prior (pre-rename) install location if it exists.
+        OLD_DIR="$HOME/.local/share/yolo-jail/modules/claude-oauth-broker"
+        LOOPHOLE_DIR="$HOME/.local/share/yolo-jail/loopholes/claude-oauth-broker"
+        if [ -d "$OLD_DIR" ] && [ ! -d "$LOOPHOLE_DIR" ]; then
+            mkdir -p "$(dirname "$LOOPHOLE_DIR")"
+            mv "$OLD_DIR" "$LOOPHOLE_DIR"
+            echo "  migrated $OLD_DIR → $LOOPHOLE_DIR"
+        fi
+        mkdir -p "$LOOPHOLE_DIR"
+        cp loopholes/claude-oauth-broker/manifest.jsonc "$LOOPHOLE_DIR/manifest.jsonc"
+        cp loopholes/claude-oauth-broker/README.md "$LOOPHOLE_DIR/README.md"
 
         # Generate CA + leaf on first run (idempotent — skips if present).
         "$BROKER_BIN" --init-ca >/dev/null
@@ -141,14 +149,14 @@ deploy: install
         SYSTEMD_DIR="$HOME/.config/systemd/user"
         mkdir -p "$SYSTEMD_DIR"
         sed "s|@@BROKER_BIN@@|$BROKER_BIN|g" \
-            modules/claude-oauth-broker/claude-oauth-broker.service \
+            loopholes/claude-oauth-broker/claude-oauth-broker.service \
             > "$SYSTEMD_DIR/claude-oauth-broker.service"
 
         systemctl --user daemon-reload
         systemctl --user enable --now claude-oauth-broker.service || \
             echo "⚠ claude-oauth-broker failed to start — journalctl --user -u claude-oauth-broker"
 
-        echo "✓ claude-oauth-broker module installed at $MODULES_DIR"
+        echo "✓ claude-oauth-broker loophole installed at $LOOPHOLE_DIR"
         echo "  ExecStart → $BROKER_BIN"
     fi
 

@@ -22,7 +22,7 @@ import typer
 import pyjson5
 from rich.console import Console
 
-from src import modules as _modules
+from src import loopholes as _loopholes
 
 IS_LINUX = sys.platform == "linux"
 IS_MACOS = sys.platform == "darwin"
@@ -2359,6 +2359,17 @@ def generate_agents_md(
         "Runtimes: Node.js 22, Python 3.13, Go (managed by mise)",
         f"MCP Servers: {', '.join(mcp_server_names)}",
         "",
+        "## Loopholes — controlled host access",
+        "",
+        "The jail may expose **loopholes**: sanctioned narrow passages through the jail wall for specific host-side capabilities (OAuth brokers, process views, log tailers, etc.). What's active in this jail depends on workspace/user config; list them with:",
+        "",
+        "```sh",
+        "yolo loopholes list     # every loophole + its transport",
+        "yolo loopholes status   # doctor self-check per loophole",
+        "```",
+        "",
+        "If the command you need isn't in the standard toolset, a loophole may already expose it (e.g. `yolo-ps` for host processes). Don't enumerate them from memory — run `yolo loopholes list` to see what's actually wired up.",
+        "",
     ]
 
     if blocked_tools:
@@ -4551,38 +4562,38 @@ def config_ref():
 """)
 
 
-def _check_modules(ok, warn, fail) -> None:
-    """Surface module discovery + each module's own self-check.
+def _check_loopholes(ok, warn, fail) -> None:
+    """Surface loophole discovery + each loophole's own self-check.
 
-    Bad manifests warn (one broken third-party module shouldn't fail the
-    whole check); individual module self-checks that return non-zero fail,
-    since the module's author declared this is the health signal.
+    Bad manifests warn (one broken third-party loophole shouldn't fail
+    the whole check); individual self-checks that return non-zero fail,
+    since the loophole's author declared this is the health signal.
     """
     if os.environ.get("YOLO_VERSION") is not None:
-        ok("Inside jail — module checks skipped (managed by host)")
+        ok("Inside jail — loophole checks skipped (managed by host)")
         return
-    entries = _modules.validate_modules()
+    entries = _loopholes.validate_loopholes()
     if not entries:
-        ok(f"No modules installed ({_modules.modules_dir()})")
+        ok(f"No loopholes installed ({_loopholes.loopholes_dir()})")
         return
-    for path, module, err in entries:
+    for path, loophole, err in entries:
         if err:
-            warn(f"module {path.name}: invalid manifest", err)
+            warn(f"loophole {path.name}: invalid manifest", err)
             continue
-        assert module is not None
-        if not module.enabled:
-            ok(f"module {module.name}: disabled")
+        assert loophole is not None
+        if not loophole.enabled:
+            ok(f"loophole {loophole.name}: disabled")
             continue
-        if not module.doctor_cmd:
-            ok(f"module {module.name}: no self-check declared")
+        if not loophole.doctor_cmd:
+            ok(f"loophole {loophole.name}: no self-check declared")
             continue
-        results = _modules.run_doctor_checks([module], timeout=10.0)
+        results = _loopholes.run_doctor_checks([loophole], timeout=10.0)
         r = results[0]
         if r.returncode == 0:
-            ok(f"module {module.name}: self-check ok")
+            ok(f"loophole {loophole.name}: self-check ok")
         elif r.returncode is None:
             warn(
-                f"module {module.name}: self-check could not run",
+                f"loophole {loophole.name}: self-check could not run",
                 r.output or "command missing",
             )
         else:
@@ -4593,12 +4604,12 @@ def _check_modules(ok, warn, fail) -> None:
             problems = _split_self_check_problems(r.output)
             if not problems:
                 fail(
-                    f"module {module.name}: self-check failed (rc={r.returncode})",
+                    f"loophole {loophole.name}: self-check failed (rc={r.returncode})",
                     "no output",
                 )
             else:
                 for title, detail in problems:
-                    fail(f"module {module.name}: {title}", detail)
+                    fail(f"loophole {loophole.name}: {title}", detail)
 
 
 def _split_self_check_problems(output: str) -> List["tuple[str, str]"]:
@@ -5575,10 +5586,10 @@ def check(
     _check_claude_token_refresher(ok, warn, fail, config=config)
     console.print()
 
-    # --- Host-side modules ---
+    # --- Host-side loopholes ---
 
-    console.print("[bold]Modules[/bold]")
-    _check_modules(ok, warn, fail)
+    console.print("[bold]Loopholes[/bold]")
+    _check_loopholes(ok, warn, fail)
     console.print()
 
     # --- Host Services ---
@@ -6881,11 +6892,17 @@ def run(
     if profile:
         docker_cmd.extend(["-e", "YOLO_PROFILE=1"])
 
-    # Apply host-side modules: --add-host entries for DNS interception, CA
-    # cert bind mounts, and NODE_EXTRA_CA_CERTS. Module lifecycle (their
-    # daemons) is the module's own responsibility; we just wire up the
-    # jail-side integration at run time. See src/modules.py.
-    docker_cmd.extend(_modules.docker_args_for(_modules.discover_modules()))
+    # Apply host-side loopholes: --add-host entries for DNS interception,
+    # CA cert bind mounts, and NODE_EXTRA_CA_CERTS for tls-intercept
+    # loopholes. Spawned + unix-socket loopholes (yolo-jail.jsonc
+    # host_services entries) ride the existing start_host_services
+    # pipeline below; we only do jail-side integration here. See
+    # src/loopholes.py for the full schema.
+    docker_cmd.extend(
+        _loopholes.docker_args_for(
+            _loopholes.discover_loopholes(host_services=config.get("host_services"))
+        )
+    )
 
     docker_cmd.append(_jail_image(runtime))
     docker_cmd.append("yolo-entrypoint")
@@ -7219,78 +7236,134 @@ def doctor(
 
 
 # ---------------------------------------------------------------------------
-# yolo modules — list / status / enable / disable
+# yolo loopholes — list / status / enable / disable
 # ---------------------------------------------------------------------------
 
 
-modules_app = typer.Typer(
-    help="Inspect and toggle host-side modules (e.g. the Claude OAuth broker)."
+loopholes_app = typer.Typer(
+    help=(
+        "Inspect and toggle host-side loopholes — controlled permeability "
+        "points between the jail and the host (e.g. the Claude OAuth broker, "
+        "journal bridge, host-process view)."
+    )
 )
-app.add_typer(modules_app, name="modules")
+app.add_typer(loopholes_app, name="loopholes")
 
 
-@modules_app.command("list")
-def modules_list():
-    """List installed modules and their enabled state."""
-    entries = _modules.validate_modules()
-    if not entries:
-        typer.echo(f"No modules installed under {_modules.modules_dir()}")
+def _loopholes_with_config(include_disabled: bool = False):
+    """Discover loopholes including host_services synthesized from the
+    merged user+workspace config (so `yolo loopholes list` sees them too).
+    """
+    try:
+        user_cfg = _load_jsonc_file(USER_CONFIG_PATH, "user config") or {}
+    except Exception:
+        user_cfg = {}
+    try:
+        ws_cfg = (
+            _load_jsonc_file(Path.cwd() / "yolo-jail.jsonc", "workspace config") or {}
+        )
+    except Exception:
+        ws_cfg = {}
+    merged_host_services: Dict[str, Any] = {}
+    for src in (user_cfg.get("host_services") or {}, ws_cfg.get("host_services") or {}):
+        if isinstance(src, dict):
+            merged_host_services.update(src)
+    return _loopholes.discover_loopholes(
+        include_disabled=include_disabled,
+        host_services=merged_host_services,
+    )
+
+
+@loopholes_app.command("list")
+def loopholes_list():
+    """List installed loopholes and their enabled state."""
+    file_backed = _loopholes.validate_loopholes()
+    synthesized = [
+        m
+        for m in _loopholes_with_config(include_disabled=True)
+        if m.host_service_shorthand is not None
+    ]
+    if not file_backed and not synthesized:
+        typer.echo(f"No loopholes installed under {_loopholes.loopholes_dir()}")
+        typer.echo("(Also checked yolo-jail.jsonc host_services — empty.)")
         return
-    for path, module, err in entries:
+    for path, loophole, err in file_backed:
         if err:
             typer.echo(f"  ✗ {path.name}  INVALID  {err}")
             continue
-        assert module is not None
-        state = "enabled" if module.enabled else "disabled"
-        hosts = ", ".join(i.host for i in module.intercepts) or "—"
-        typer.echo(f"  {state:<8}  {module.name}  intercepts=[{hosts}]")
-        if module.description:
-            typer.echo(f"            {module.description}")
+        assert loophole is not None
+        state = "enabled" if loophole.enabled else "disabled"
+        extra = ""
+        if loophole.transport == "tls-intercept":
+            hosts = ", ".join(i.host for i in loophole.intercepts) or "—"
+            extra = f"intercepts=[{hosts}]"
+        else:
+            extra = f"transport={loophole.transport}"
+        typer.echo(
+            f"  {state:<8}  {loophole.name}  ({loophole.transport}/{loophole.lifecycle})  {extra}"
+        )
+        if loophole.description:
+            typer.echo(f"            {loophole.description}")
+    for s in synthesized:
+        state = "enabled" if s.enabled else "disabled"
+        typer.echo(
+            f"  {state:<8}  {s.name}  (unix-socket/spawned)  [host_services shorthand]"
+        )
+        if s.description:
+            typer.echo(f"            {s.description}")
 
 
-@modules_app.command("status")
-def modules_status():
-    """Run each module's doctor_cmd and report."""
-    modules = _modules.discover_modules(include_disabled=True)
-    if not modules:
-        typer.echo(f"No modules installed under {_modules.modules_dir()}")
+@loopholes_app.command("status")
+def loopholes_status():
+    """Run each loophole's doctor_cmd and report."""
+    loopholes_list_ = _loopholes_with_config(include_disabled=True)
+    if not loopholes_list_:
+        typer.echo(f"No loopholes installed under {_loopholes.loopholes_dir()}")
         return
-    results = _modules.run_doctor_checks(modules)
+    results = _loopholes.run_doctor_checks(loopholes_list_)
     for r in results:
         prefix = (
             "disabled"
-            if not r.module.enabled
+            if not r.loophole.enabled
             else (
                 "ok"
                 if r.returncode == 0
                 else ("no-check" if r.returncode is None else "fail")
             )
         )
-        typer.echo(f"  [{prefix}] {r.module.name}  rc={r.returncode}")
+        typer.echo(f"  [{prefix}] {r.loophole.name}  rc={r.returncode}")
         if r.output:
             for line in r.output.splitlines():
                 typer.echo(f"      {line}")
 
 
-@modules_app.command("enable")
-def modules_enable(name: str):
-    """Enable a module by name."""
-    path = _modules.modules_dir() / name
+@loopholes_app.command("enable")
+def loopholes_enable(name: str):
+    """Enable a file-backed loophole by name."""
+    path = _loopholes.loopholes_dir() / name
     if not (path / "manifest.jsonc").is_file():
-        typer.echo(f"No module at {path}", err=True)
+        typer.echo(
+            f"No file-backed loophole at {path}.\n"
+            "host_services-shorthand loopholes are toggled via yolo-jail.jsonc.",
+            err=True,
+        )
         raise typer.Exit(1)
-    _modules.set_enabled(path, True)
+    _loopholes.set_enabled(path, True)
     typer.echo(f"enabled {name}")
 
 
-@modules_app.command("disable")
-def modules_disable(name: str):
-    """Disable a module by name (leaves files in place; takes effect next `yolo run`)."""
-    path = _modules.modules_dir() / name
+@loopholes_app.command("disable")
+def loopholes_disable(name: str):
+    """Disable a file-backed loophole (leaves files; next `yolo run` picks it up)."""
+    path = _loopholes.loopholes_dir() / name
     if not (path / "manifest.jsonc").is_file():
-        typer.echo(f"No module at {path}", err=True)
+        typer.echo(
+            f"No file-backed loophole at {path}.\n"
+            "host_services-shorthand loopholes are toggled via yolo-jail.jsonc.",
+            err=True,
+        )
         raise typer.Exit(1)
-    _modules.set_enabled(path, False)
+    _loopholes.set_enabled(path, False)
     typer.echo(f"disabled {name}")
 
 
@@ -7315,7 +7388,7 @@ def main():
         "run",
         "ps",
         "doctor",
-        "modules",
+        "loopholes",
     }
     args = sys.argv[1:]
     if args and "--" in args:

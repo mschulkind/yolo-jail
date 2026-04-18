@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover — running as a script
 # --- Constants ---------------------------------------------------------------
 
 BROKER_DIR = (
-    Path.home() / ".local" / "share" / "yolo-jail" / "modules" / "claude-oauth-broker"
+    Path.home() / ".local" / "share" / "yolo-jail" / "loopholes" / "claude-oauth-broker"
 )
 CA_CRT = BROKER_DIR / "ca.crt"
 CA_KEY = BROKER_DIR / "ca.key"
@@ -487,7 +487,7 @@ def _systemd_check() -> List[str]:
                     "  (2) edit the unit's ExecStart to --port 8443,",
                     "      then add an iptables DNAT from :443 → :8443 on the bridge iface",
                     "  (3) switch to a runtime that honors the unit's ambient caps",
-                    "See modules/claude-oauth-broker/README.md.",
+                    "See loopholes/claude-oauth-broker/README.md.",
                 ]
             )
         ]

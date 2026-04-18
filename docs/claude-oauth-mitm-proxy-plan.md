@@ -1,6 +1,6 @@
 # Claude OAuth MITM Proxy — Design Notes
 
-> **Status:** implemented as the [`claude-oauth-broker`](../modules/claude-oauth-broker/) module. The daemon lives in [`src/oauth_broker.py`](../src/oauth_broker.py); it's wired into the jail via the general module system described in [`docs/modules.md`](modules.md). This document is preserved for the design rationale — it's what was built.
+> **Status:** implemented as the [`claude-oauth-broker`](../loopholes/claude-oauth-broker/) loophole. The daemon lives in [`src/oauth_broker.py`](../src/oauth_broker.py); it's wired into the jail via the unified loophole system described in [`docs/loopholes.md`](loopholes.md). This document is preserved for the design rationale — it's what was built.
 
 This doc captures the MITM-proxy approach to the Claude Code logout problem. It's the **fallback** if the periodic refresher (see `src/claude_refresher.py`, installed as the `claude-token-refresher` console script) doesn't eliminate the 401 races in practice. For the user-facing triage path, see [`claude-token-logouts.md`](claude-token-logouts.md).
 
@@ -140,6 +140,7 @@ Note: multiple public sources (including earlier research during this investigat
 
 - `HANDOFF-credentials-logout.md` — original investigation, symptoms, ruled-out hypotheses
 - `docs/claude-token-logouts.md` — user-facing decision tree (symptoms → `yolo doctor` → fix → escalate)
+- `docs/loopholes.md` — the unified registry this was built into
 - `src/claude_refresher.py` (installed as `claude-token-refresher`) — the simpler refresher we're shipping first
 - Prior art: `dyshay/proxyclawd` (MITM Claude Code with HTTPS_PROXY + NODE_EXTRA_CA_CERTS)
 - Prior art: `griffinmartin/opencode-claude-auth` (in-process token broker pattern; same logic, no proxy)

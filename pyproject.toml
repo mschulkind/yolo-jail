@@ -39,6 +39,8 @@ Issues = "https://github.com/mschulkind-oss/yolo-jail/issues"
 yolo = "src.cli:main"
 claude-token-refresher = "src.claude_refresher:main"
 yolo-claude-oauth-broker = "src.oauth_broker:main"
+yolo-host-processes = "src.host_processes:main"
+yolo-ps = "src.yolo_ps:main"
 
 [build-system]
 requires = ["setuptools>=64", "setuptools-scm>=8"]

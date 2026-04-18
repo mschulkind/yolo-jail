@@ -1,0 +1,25 @@
+// yolo-jail loophole manifest. See src/loopholes.py for the schema.
+// Installed to ~/.local/share/yolo-jail/loopholes/claude-oauth-broker/ by
+// `just deploy`. ca.crt alongside is generated on first run by
+// `yolo-claude-oauth-broker --init-ca` (also triggered during deploy).
+{
+  "name": "claude-oauth-broker",
+  "description": "MITM proxy that serializes Claude OAuth refreshes across jails. Eliminates the refresh-token rotation race that causes intermittent 401 logouts.",
+  "version": 1,
+  "enabled": true,
+  "transport": "tls-intercept",
+  "lifecycle": "external",
+  // Jails route this hostname to broker_ip via --add-host, so Claude Code's
+  // OAuth calls land on our daemon instead of Anthropic.
+  "intercepts": [
+    {"host": "platform.claude.com"}
+  ],
+  // `host-gateway` is the magic value both podman and docker translate
+  // to the correct host-reachable-from-container address for the active
+  // runtime (pasta tunnel, CNI bridge, Docker Desktop VM gateway).
+  // Pinning a literal IP like 169.254.1.2 only works with pasta.
+  "broker_ip": "host-gateway",
+  // Auto-trusted in the jail via NODE_EXTRA_CA_CERTS.
+  "ca_cert": "ca.crt",
+  "doctor_cmd": ["yolo-claude-oauth-broker", "--self-check"]
+}
