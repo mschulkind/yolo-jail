@@ -1,0 +1,23 @@
+// Bundled yolo-jail loophole — allowlisted read-only view of host
+// processes.  See src/host_processes.py for the daemon and
+// src/yolo_ps.py for the jail-side CLI wrapper.
+{
+  "name": "host-processes",
+  "description": "Allowlisted view of host processes (yolo-ps). Workspace controls visibility via the top-level host_processes.visible list in yolo-jail.jsonc.",
+  "version": 1,
+  "enabled": true,
+  // ``ps`` is a POSIX staple on any host that can run yolo-jail, but
+  // gating here keeps us honest — if something pathological has it
+  // missing, the loophole goes inactive rather than crashing.
+  "requires": {
+    "command_on_path": "ps"
+  },
+  "transport": "unix-socket",
+  "lifecycle": "spawned",
+  // No TLS intercept: jails reach the daemon via the ``yolo-ps``
+  // client, which connects to YOLO_SERVICE_HOST_PROCESSES_SOCKET.
+  "host_daemon": {
+    "cmd": ["yolo-host-processes", "--socket", "{socket}"]
+  },
+  "doctor_cmd": ["yolo-host-processes", "--self-check"]
+}

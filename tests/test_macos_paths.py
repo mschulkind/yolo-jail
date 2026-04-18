@@ -96,9 +96,12 @@ class TestMacosCgroupSkip:
     def test_start_loopholes_macos_skips_builtin(self, monkeypatch):
         _set_macos(monkeypatch)
         # Even with podman as runtime, on macOS the builtin returns None
-        # (no cgroup v2), so no handles come back.
+        # (no cgroup v2).  Bundled loopholes MAY still try to spawn
+        # (depends on ``requires`` predicates), but the builtin
+        # cgroup-delegate specifically isn't among them.
         handles = start_loopholes("test-cname-macos", "podman", {})
-        assert handles == []
+        names = [h.name for h in handles]
+        assert "cgroup-delegate" not in names
 
 
 # ---------------------------------------------------------------------------

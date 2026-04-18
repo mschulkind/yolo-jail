@@ -7327,6 +7327,17 @@ def loopholes_list():
 @loopholes_app.command("status")
 def loopholes_status():
     """Run each loophole's doctor_cmd and report."""
+    # doctor_cmd entries are host-side console scripts (e.g.
+    # yolo-claude-oauth-broker-host --self-check) — they aren't
+    # installed inside the jail.  Running them from the jail just
+    # surfaces confusing ENOENT output.  Tell the operator where to
+    # run the checks instead.
+    if os.environ.get("YOLO_VERSION") is not None:
+        typer.echo(
+            "Inside jail — doctor checks are host-side.  "
+            "From the host: yolo loopholes status"
+        )
+        return
     loopholes_list_ = _loopholes_with_config(include_disabled=True)
     if not loopholes_list_:
         typer.echo("No loopholes installed.")

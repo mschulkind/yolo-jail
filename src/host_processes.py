@@ -182,21 +182,34 @@ def build_handler(config_path: Path):
 
 
 def self_check() -> int:
-    """Cheap health check for ``yolo doctor``."""
-    # Config path comes from env — set by `yolo run` when spawning.
+    """Cheap health check for ``yolo doctor``.
+
+    Invoked either from the host (no env var — just verify we can find
+    a config file if the CWD has one; a missing allowlist is a warning,
+    not a failure) OR from inside the daemon process where
+    ``YOLO_HOST_PROCESSES_CONFIG`` is set.
+    """
     cfg_env = os.environ.get("YOLO_HOST_PROCESSES_CONFIG")
-    if not cfg_env:
-        print("FAIL: YOLO_HOST_PROCESSES_CONFIG not set (daemon started without it?)")
-        return 1
-    cfg_path = Path(cfg_env)
+    cfg_path: Optional[Path] = None
+    if cfg_env:
+        cfg_path = Path(cfg_env)
+    else:
+        cwd_cfg = Path.cwd() / "yolo-jail.jsonc"
+        if cwd_cfg.is_file():
+            cfg_path = cwd_cfg
+    if cfg_path is None:
+        # Not fatal — the loophole is installed and the daemon is
+        # runnable.  It just won't have an allowlist to report against.
+        print("OK: daemon present; no host_processes config in scope")
+        return 0
     if not cfg_path.is_file():
         print(f"FAIL: config not found at {cfg_path}")
         return 1
     cfg = _load_config(cfg_path)
     if not cfg["visible"]:
-        print(f"FAIL: host_processes.visible empty in {cfg_path}")
-        return 1
-    print(f"OK: {len(cfg['visible'])} comms allowlisted")
+        print(f"OK: config at {cfg_path} has no host_processes.visible entries")
+        return 0
+    print(f"OK: {len(cfg['visible'])} comms allowlisted at {cfg_path}")
     return 0
 
 

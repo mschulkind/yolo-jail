@@ -206,12 +206,15 @@ def test_unknown_mode_rejected(started_daemon):
     assert "unknown mode" in stderr
 
 
-def test_self_check_missing_env(monkeypatch, capsys):
+def test_self_check_missing_env_falls_back_to_cwd(monkeypatch, capsys, tmp_path):
+    """No env var + no yolo-jail.jsonc in CWD → OK (loophole is installed,
+    just nothing to report)."""
     monkeypatch.delenv("YOLO_HOST_PROCESSES_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)  # empty tmp dir = no yolo-jail.jsonc
     rc = host_processes.self_check()
     out = capsys.readouterr().out
-    assert rc == 1
-    assert "YOLO_HOST_PROCESSES_CONFIG" in out
+    assert rc == 0
+    assert "no host_processes config" in out
 
 
 def test_self_check_missing_file(tmp_path: Path, monkeypatch, capsys):
@@ -222,14 +225,16 @@ def test_self_check_missing_file(tmp_path: Path, monkeypatch, capsys):
     assert "not found" in out
 
 
-def test_self_check_empty_visible(tmp_path: Path, monkeypatch, capsys):
+def test_self_check_empty_visible_is_ok(tmp_path: Path, monkeypatch, capsys):
+    """Empty allowlist isn't a failure — daemon just serves nothing.
+    Misconfiguration to look at, not a reason to fail doctor."""
     cfg = tmp_path / "c.jsonc"
     cfg.write_text(json.dumps({"host_processes": {"visible": []}}))
     monkeypatch.setenv("YOLO_HOST_PROCESSES_CONFIG", str(cfg))
     rc = host_processes.self_check()
     out = capsys.readouterr().out
-    assert rc == 1
-    assert "empty" in out
+    assert rc == 0
+    assert "no host_processes.visible" in out
 
 
 def test_self_check_ok(tmp_path: Path, monkeypatch, capsys):
