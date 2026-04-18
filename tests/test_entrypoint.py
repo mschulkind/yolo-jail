@@ -77,6 +77,35 @@ def jail_home(tmp_path, monkeypatch):
 
 
 class TestShimGeneration:
+    def test_yolo_wrapper_does_not_rely_on_pythonpath(self, jail_home, monkeypatch):
+        """Regression: ``uv run`` doesn't reliably honor PYTHONPATH across
+        Python/uv version combinations.  A shim that depends on
+        ``export PYTHONPATH=...`` to make ``src.cli`` importable fails
+        intermittently with ModuleNotFoundError.  The generator must
+        reach for ``src`` through a more robust mechanism."""
+        monkeypatch.setenv("YOLO_REPO_ROOT", "/opt/yolo-jail")
+        entrypoint.generate_yolo_wrapper()
+        shim = (entrypoint.SHIM_DIR / "yolo").read_text()
+        # The shim must still make ``src.cli`` importable — via ``cd``
+        # into the repo root, not solely via PYTHONPATH.
+        assert "cd " in shim, "shim should cd into the repo root"
+        # And should preserve the invocation CWD so cli.py's
+        # Path.cwd() logic still sees the user's directory.
+        assert "YOLO_INVOCATION_CWD" in shim
+
+    def test_cli_main_honors_invocation_cwd_env(self):
+        """cli.main() must chdir back to YOLO_INVOCATION_CWD before any
+        subcommand runs, so the shim's repo-root cd is transparent.
+        Verified by source inspection — main() is a typer dispatcher
+        and hard to unit-test end-to-end."""
+        from src import cli as cli_mod
+        import inspect
+
+        src = inspect.getsource(cli_mod.main)
+        # The env var pop + chdir pattern must be present.
+        assert "YOLO_INVOCATION_CWD" in src
+        assert "os.chdir(" in src or "chdir(" in src
+
     def test_blocked_tool_no_fallthrough(self, jail_home, monkeypatch):
         monkeypatch.setenv(
             "YOLO_BLOCK_CONFIG",

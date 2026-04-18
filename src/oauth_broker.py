@@ -310,25 +310,59 @@ def build_handler(creds_path: Path):
 
 
 def self_check() -> int:
-    problems: List[str] = []
+    """Health check.  Distinguishes three states:
+
+    - **fail** (rc=1): something is genuinely broken — e.g. the creds
+      file contains unparseable JSON, or we're missing tools we need at
+      runtime.
+    - **warn** (rc=0 + NOTE lines): not-yet-ready state that the
+      operator will fix with a deploy / login step.  Missing CA/leaf
+      before ``--init-ca`` runs, missing creds before first ``/login``.
+    - **ok** (rc=0): everything present and parseable.
+    """
+    warnings: List[str] = []
+    failures: List[str] = []
+
     if not CA_CRT.is_file():
-        problems.append(f"missing {CA_CRT}")
+        warnings.append(
+            f"{CA_CRT} not yet generated — run `--init-ca` or `just deploy`"
+        )
     if not SERVER_CRT.is_file():
-        problems.append(f"missing {SERVER_CRT}")
+        warnings.append(
+            f"{SERVER_CRT} not yet generated — run `--init-ca` or `just deploy`"
+        )
     if not shutil.which("openssl"):
-        problems.append("openssl not on PATH (required for --init-ca)")
+        # Only hard-fail if state is also missing (we'd need openssl to
+        # generate it).  If state already exists, openssl absence is
+        # benign at runtime.
+        if warnings:
+            failures.append(
+                "openssl not on PATH and no CA/leaf state yet — "
+                "install openssl so `--init-ca` can run"
+            )
+
     creds = refresher.DEFAULT_CREDS_PATH
     if creds.exists():
         try:
-            json.loads(creds.read_text())
+            raw = creds.read_text()
+            if raw.strip():
+                json.loads(raw)
         except (OSError, json.JSONDecodeError) as e:
-            problems.append(f"{creds}: {e}")
+            failures.append(f"{creds}: {e}")
     else:
-        problems.append(f"{creds} does not exist (no one has /login'd yet)")
-    if problems:
-        for p in problems:
+        warnings.append(f"{creds} does not exist — run Claude and `/login` first")
+
+    if failures:
+        for p in failures:
             print(f"FAIL: {p}")
+        for p in warnings:
+            print(f"NOTE: {p}")
         return 1
+    if warnings:
+        for p in warnings:
+            print(f"NOTE: {p}")
+        print("OK (broker present; state not yet primed)")
+        return 0
     print("OK")
     return 0
 

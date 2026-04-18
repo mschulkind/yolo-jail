@@ -4604,6 +4604,13 @@ def _check_loopholes(ok, warn, fail) -> None:
         if not loophole.enabled:
             ok(f"loophole {loophole.name}: disabled")
             continue
+        if not loophole.requirements_met:
+            # Present-but-inactive: running doctor_cmd would invoke a
+            # binary the loophole explicitly declared a precondition
+            # for, and we know that precondition isn't met.  Just
+            # report and skip.
+            ok(f"loophole {loophole.name}: inactive ({loophole.inactive_reason})")
+            continue
         if not loophole.doctor_cmd:
             ok(f"loophole {loophole.name}: no self-check declared")
             continue
