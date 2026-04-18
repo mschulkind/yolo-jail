@@ -233,6 +233,10 @@ def _default(
     to restart. The human sees the diff and approves at next startup.
     Use [bold]yolo check --no-build[/bold] inside a running jail for a quick preflight.
     See [bold]yolo config-ref[/bold] for details.
+
+    [bold cyan]Project Home[/bold cyan]
+
+    https://github.com/mschulkind-oss/yolo-jail
     """
     if ctx.invoked_subcommand is None:
         # No subcommand → default to `run` (interactive shell)
