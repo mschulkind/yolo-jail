@@ -147,16 +147,49 @@ def generate_shims():
         sug = tool_cfg.get("suggestion", "")
         real_bin = f"/bin/{name}" if name in ("grep", "find") else None
 
-        lines = ["#!/bin/sh"]
-        lines.append('if [ -z "$YOLO_BYPASS_SHIMS" ]; then')
-        lines.append(f'  echo "{msg}" >&2')
-        if sug:
-            lines.append(f'  echo "Suggestion: {sug}" >&2')
-        lines.append("  exit 127")
-        lines.append("fi")
-        if real_bin:
+        # grep gets a smarter shim: only block when argv has recursive
+        # flags (``-r``, ``-R``, ``--recursive``, or short-flag bundles
+        # like ``-rn`` / ``-Rn``).  Pipe-filter use (``cmd | grep foo``)
+        # and single-file use (``grep foo file.txt``) pass through.
+        # Long options that merely contain the letter r (``--regex``,
+        # ``--regexp``) are NOT blocked — the pattern is careful.
+        if name == "grep":
+            lines = ["#!/bin/sh"]
+            lines.append('if [ -z "$YOLO_BYPASS_SHIMS" ]; then')
+            lines.append('  for arg in "$@"; do')
+            lines.append('    case "$arg" in')
+            lines.append("      --recursive)")
+            lines.append(f'        echo "{msg}" >&2')
+            if sug:
+                lines.append(f'        echo "Suggestion: {sug}" >&2')
+            lines.append("        exit 127")
+            lines.append("        ;;")
+            # Long options (starting with --) other than --recursive: skip.
+            lines.append("      --*)")
+            lines.append("        : ;;")
+            # Any short-flag bundle containing r or R is recursive.
+            lines.append("      -*[rR]*)")
+            lines.append(f'        echo "{msg}" >&2')
+            if sug:
+                lines.append(f'        echo "Suggestion: {sug}" >&2')
+            lines.append("        exit 127")
+            lines.append("        ;;")
+            lines.append("    esac")
+            lines.append("  done")
+            lines.append("fi")
             lines.append(f'exec {real_bin} "$@"')
-        lines.append("")
+            lines.append("")
+        else:
+            lines = ["#!/bin/sh"]
+            lines.append('if [ -z "$YOLO_BYPASS_SHIMS" ]; then')
+            lines.append(f'  echo "{msg}" >&2')
+            if sug:
+                lines.append(f'  echo "Suggestion: {sug}" >&2')
+            lines.append("  exit 127")
+            lines.append("fi")
+            if real_bin:
+                lines.append(f'exec {real_bin} "$@"')
+            lines.append("")
 
         shim_path = SHIM_DIR / name
         shim_path.write_text("\n".join(lines))

@@ -3,6 +3,7 @@
 import json
 import os
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -77,6 +78,73 @@ def jail_home(tmp_path, monkeypatch):
 
 
 class TestShimGeneration:
+    def _run_shim(self, shim_path, *argv, stdin=b"") -> "subprocess.CompletedProcess":
+        import subprocess as _sp
+
+        return _sp.run(
+            [str(shim_path), *argv],
+            capture_output=True,
+            input=stdin,
+            timeout=5,
+        )
+
+    def test_grep_shim_blocks_only_recursive(self, jail_home, monkeypatch):
+        """grep is blocked *only* when invoked with recursive flags
+        (``-r``, ``-R``, ``--recursive``, short-flag bundles like
+        ``-rn``).  Plain pipe-filter usage must pass through — today's
+        "any grep is blocked" rule fired on ``cmd | grep foo``, which
+        is the wrong call."""
+        monkeypatch.setenv(
+            "YOLO_BLOCK_CONFIG",
+            json.dumps(
+                [
+                    {
+                        "name": "grep",
+                        "message": "grep -r is blocked",
+                        "suggestion": "Use rg",
+                    }
+                ]
+            ),
+        )
+        entrypoint.generate_shims()
+        shim = entrypoint.SHIM_DIR / "grep"
+        assert shim.is_file()
+
+        # Recursive — blocked (exit 127).
+        for args in (["-r", "foo", "."], ["-R", "foo", "."], ["--recursive", "foo"]):
+            r = self._run_shim(shim, *args)
+            assert r.returncode == 127, (
+                f"recursive argv {args} should be blocked, got rc={r.returncode}"
+            )
+            assert b"blocked" in r.stderr or b"rg" in r.stderr
+
+        # Short-flag bundles that include r/R — blocked.
+        for args in (["-rn", "foo", "."], ["-Rn", "foo", "."], ["-inRw", "foo"]):
+            r = self._run_shim(shim, *args)
+            assert r.returncode == 127, (
+                f"short-bundle {args} should be blocked, got rc={r.returncode}"
+            )
+
+        # Long flags that happen to contain r/R but are NOT recursive —
+        # not blocked.  The shim must not mistake ``--regex`` or
+        # ``--regexp`` for ``--recursive``.
+        r = self._run_shim(shim, "--regexp=foo", "/dev/null")
+        assert r.returncode != 127, (
+            f"--regexp must not be blocked, got rc={r.returncode} stderr={r.stderr!r}"
+        )
+
+        # Pipe-filter usage — not blocked.
+        r = self._run_shim(shim, "foo", stdin=b"bar\nfoo\nbaz\n")
+        assert r.returncode != 127, (
+            f"plain grep must not be blocked, got rc={r.returncode} stderr={r.stderr!r}"
+        )
+        # And actually return the matching line.
+        assert b"foo" in r.stdout
+
+        # Short non-recursive flag — not blocked.
+        r = self._run_shim(shim, "-n", "foo", "/dev/null")
+        assert r.returncode != 127
+
     def test_yolo_ps_script_generated(self, jail_home, monkeypatch):
         """``yolo-ps`` is the jail-side CLI for the host-processes
         loophole.  It's shipped as a wheel console script on the host,
