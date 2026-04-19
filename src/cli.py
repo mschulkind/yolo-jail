@@ -2256,12 +2256,21 @@ def _normalize_blocked_tools(
     normalized_blocked = []
     for tool in raw_blocked:
         if isinstance(tool, str):
-            tool_dict = {"name": tool}
+            merged = {"name": tool}
             if tool in default_messages:
-                tool_dict.update(default_messages[tool])
-            normalized_blocked.append(tool_dict)
+                merged.update(default_messages[tool])
+            normalized_blocked.append(merged)
         elif isinstance(tool, dict) and "name" in tool:
-            normalized_blocked.append(tool)
+            # Merge defaults with user fields — user wins on conflict
+            # but unspecified fields inherit.  Without this,
+            # ``{"name": "grep"}`` in a workspace config would
+            # silently lose the default ``block_flags`` and revert
+            # to unconditional blocking.  Explicit override: user
+            # can pass ``"block_flags": []`` to turn it off.
+            name = tool["name"]
+            merged = dict(default_messages.get(name, {}))
+            merged.update(tool)
+            normalized_blocked.append(merged)
     return normalized_blocked
 
 
@@ -3896,20 +3905,23 @@ def init(
   // ],
   // Find nixpkgs commits for specific versions at: https://lazamar.co.uk/nix-versions/
 
-  "security": {
-    // Tools to block. Can be a simple string or an object with custom messages.
-    "blocked_tools": [
-      {
-        "name": "grep",
-        "message": "Use 'rg' (ripgrep) for faster searching.",
-        "suggestion": "rg <pattern>"
-      },
-      {
-        "name": "find",
-        "message": "Use 'fd' for faster file finding."
-      }
-    ]
-  },
+  // security: tool shims injected into the jail's PATH.  Defaults (no
+  // config needed): grep is blocked only for recursive usage (``-r``,
+  // ``-R``, ``--recursive``, ``-rn`` etc. — pipe filters and
+  // single-file greps pass through); find is blocked unconditionally.
+  // Override only if you want custom rules — the defaults are sane.
+  // "security": {
+  //   "blocked_tools": [
+  //     {
+  //       "name": "grep",
+  //       // Only block when argv contains one of these shell-glob
+  //       // patterns.  Omit to block unconditionally.
+  //       "block_flags": ["--recursive", "-r", "-R", "-*[rR]*"]
+  //     },
+  //     "find",           // string form → unconditional block
+  //     "curl"            // add your own tools here
+  //   ]
+  // },
   "network": {
     // "bridge" (default) or "host"
     "mode": "bridge",

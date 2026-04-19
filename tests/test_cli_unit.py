@@ -525,6 +525,41 @@ class TestNormalizeBlockedTools:
         result = _normalize_blocked_tools({"blocked_tools": [tool]})
         assert result[0] == tool
 
+    def test_dict_grep_gets_default_block_flags(self):
+        """Regression: when the user writes the dict form for a tool
+        with baked-in defaults (grep), _normalize_blocked_tools must
+        merge the defaults — missing block_flags shouldn't silently
+        convert grep into an unconditional block.  The conditional
+        rule is part of the default contract; dict-form users get it
+        too unless they explicitly override."""
+        result = _normalize_blocked_tools({"blocked_tools": [{"name": "grep"}]})
+        assert result[0]["name"] == "grep"
+        assert result[0].get("block_flags"), (
+            "dict-form grep must inherit default block_flags"
+        )
+        # And the default message should also be present.
+        assert "rg" in result[0].get("suggestion", "")
+
+    def test_dict_grep_user_fields_win_over_defaults(self):
+        """User-supplied fields override defaults; unspecified fields
+        inherit.  So ``{"name": "grep", "message": "custom"}`` gets
+        custom message + default suggestion + default block_flags."""
+        result = _normalize_blocked_tools(
+            {"blocked_tools": [{"name": "grep", "message": "custom msg"}]}
+        )
+        assert result[0]["message"] == "custom msg"
+        assert result[0].get("block_flags"), "defaults preserved"
+        assert "rg" in result[0].get("suggestion", "")
+
+    def test_dict_grep_explicit_empty_block_flags_disables_conditional(self):
+        """User can opt out of conditional blocking by setting
+        ``block_flags: []`` — reverting grep to the unconditional
+        behavior that matches the legacy contract."""
+        result = _normalize_blocked_tools(
+            {"blocked_tools": [{"name": "grep", "block_flags": []}]}
+        )
+        assert result[0]["block_flags"] == []
+
     def test_custom_string_tool(self):
         result = _normalize_blocked_tools({"blocked_tools": ["strace"]})
         assert result[0]["name"] == "strace"
