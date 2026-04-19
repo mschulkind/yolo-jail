@@ -56,59 +56,28 @@ build:
 install: build
     uv tool install --force "$(ls -1 dist/*.whl | head -1)"
 
-# Installs:
-#   1. yolo CLI (via uv tool install)
-#   2. Claude OAuth token refresher (systemd --user timer, if on Linux)
+# Installs the yolo CLI and primes the Claude OAuth broker state.
 # Safe to re-run — idempotent.
-# Build and install everything needed for yolo-jail on this host
 deploy: install
     #!/usr/bin/env bash
     set -euo pipefail
 
-    # --- Claude token refresher (systemd --user timer) ---
-    # Skipped when `claude` isn't on PATH — no point running a refresher for a
-    # tool the user hasn't installed.  They can run `just deploy` again later
-    # after installing Claude Code, or drop `claude_token_refresher: false`
-    # into ~/.config/yolo-jail/config.jsonc to silence `yolo check` about it.
-    if ! command -v claude >/dev/null 2>&1; then
-        echo "⚠ claude not found on PATH — skipping Claude token refresher install"
-        echo "  (install Claude Code and re-run \`just deploy\` to enable it,"
-        echo "   or set \`claude_token_refresher: false\` in your yolo config)"
-    elif ! command -v systemctl >/dev/null 2>&1; then
-        echo "⚠ systemctl not found — skipping token refresher (not a systemd host)"
-    else
-        # The refresher is shipped as a console script entry point inside
-        # the yolo-jail wheel (see pyproject.toml [project.scripts]).  After
-        # `uv tool install` above, it's on PATH as `claude-token-refresher`.
-        # Resolve that absolute path and bake it into the systemd unit's
-        # ExecStart — the unit runs without needing a source checkout.
-        REFRESHER_BIN="$(command -v claude-token-refresher || true)"
-        if [ -z "$REFRESHER_BIN" ]; then
-            echo "ERROR: claude-token-refresher not on PATH after install" >&2
-            echo "  Expected entry point from the yolo-jail wheel.  Is uv tool's" >&2
-            echo "  bin dir (~/.local/bin by default) on your PATH?" >&2
-            exit 1
-        fi
-
-        SYSTEMD_DIR="$HOME/.config/systemd/user"
-        mkdir -p "$SYSTEMD_DIR"
-
-        # Substitute the @@REFRESHER_BIN@@ placeholder in the unit template
-        # with the absolute path to the installed binary.
-        sed "s|@@REFRESHER_BIN@@|$REFRESHER_BIN|g" \
-            scripts/claude-token-refresher.service \
-            > "$SYSTEMD_DIR/claude-token-refresher.service"
-        cp scripts/claude-token-refresher.timer "$SYSTEMD_DIR/"
-
-        systemctl --user daemon-reload
-        systemctl --user enable --now claude-token-refresher.timer
-
-        # Fire once now so the first refresh check runs without waiting for
-        # OnBootSec.  Non-fatal — the timer retries on its own cadence.
-        systemctl --user start claude-token-refresher.service || true
-
-        echo "✓ claude-token-refresher installed at $SYSTEMD_DIR"
-        echo "  ExecStart → $REFRESHER_BIN"
+    # --- Retire pre-broker Claude token refresher install ---
+    # The refresher daemon was removed — the broker refreshes on demand
+    # now (see docs/claude-token-logouts.md).  If an older `just deploy`
+    # installed the systemd --user timer, tear it down so it doesn't run
+    # against a binary that no longer exists.
+    if command -v systemctl >/dev/null 2>&1; then
+        for unit in claude-token-refresher.timer claude-token-refresher.service; do
+            if systemctl --user is-enabled "$unit" >/dev/null 2>&1 \
+              || systemctl --user is-active "$unit" >/dev/null 2>&1; then
+                systemctl --user disable --now "$unit" 2>/dev/null || true
+                echo "  retired legacy $unit"
+            fi
+        done
+        rm -f "$HOME/.config/systemd/user/claude-token-refresher.service"
+        rm -f "$HOME/.config/systemd/user/claude-token-refresher.timer"
+        systemctl --user daemon-reload 2>/dev/null || true
     fi
 
     # --- Claude OAuth broker loophole (bundled) ---

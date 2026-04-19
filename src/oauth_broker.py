@@ -40,11 +40,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    from . import claude_refresher as refresher
     from . import host_service
     from . import loopholes as _loopholes
 except ImportError:  # pragma: no cover — running as a script
-    from src import claude_refresher as refresher  # type: ignore[no-redef]
     from src import host_service  # type: ignore[no-redef]
     from src import loopholes as _loopholes  # type: ignore[no-redef]
 
@@ -61,10 +59,28 @@ SERVER_CRT = BROKER_DIR / "server.crt"
 SERVER_KEY = BROKER_DIR / "server.key"
 REFRESH_LOCK = BROKER_DIR / "refresh.lock"
 
+# Upstream OAuth endpoint.  Extracted from the Claude Code 2.1.x binary;
+# stable across patch releases.  If Anthropic moves it, refreshes start
+# failing with 404 and you re-verify with:
+#   rg -oab 'platform\.claude\.com|/v1/oauth/token' <claude-binary>
 UPSTREAM_HOST = "platform.claude.com"
-TOKEN_URL = refresher.TOKEN_URL
-CLIENT_ID = refresher.CLIENT_ID
-OAUTH_BETA_HEADER = refresher.OAUTH_BETA_HEADER
+TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
+CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_BETA_HEADER = "oauth-2025-04-20"
+
+# Shared credentials file — bind-mounted into every jail.  The broker
+# rewrites this file in place (preserving the inode so bind mounts stay
+# valid) whenever it refreshes upstream.
+DEFAULT_CREDS_PATH = (
+    Path.home() / ".local/share/yolo-jail/home/.claude/.credentials.json"
+)
+# Host-side Claude Code's own credentials file.  When this file exists
+# AND its refresh token matches the shared file's (meaning host and
+# jail share one identity, the default state after first-boot sync),
+# the broker mirrors each refresh here too — keeps host Claude Code
+# logged in.  If the refresh tokens differ, host has an independent
+# identity and the broker leaves this file alone.
+DEFAULT_HOST_CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
 
 
 log = logging.getLogger("oauth-broker-host")
@@ -216,6 +232,41 @@ def _write_tokens(creds_path: Path, oauth: Dict[str, Any]) -> None:
         os.close(fd)
 
 
+def _mirror_to_host_if_same_identity(
+    host_path: Path, old_refresh_token: str, new_oauth: Dict[str, Any]
+) -> None:
+    """If the host creds file shares ``old_refresh_token`` with the shared
+    file, mirror the refreshed tokens into it so host Claude Code stays
+    logged in.  Best-effort: missing/differing/unreadable host files are
+    fine — those cases mean independent identities or no host Claude."""
+    if not host_path.is_file():
+        return
+    try:
+        host_data = json.loads(host_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    host_oauth = host_data.get("claudeAiOauth") or {}
+    if host_oauth.get("refreshToken") != old_refresh_token:
+        return
+    merged = dict(host_oauth)
+    merged["accessToken"] = new_oauth["accessToken"]
+    merged["refreshToken"] = new_oauth["refreshToken"]
+    merged["expiresAt"] = new_oauth["expiresAt"]
+    host_data["claudeAiOauth"] = merged
+    try:
+        blob = json.dumps(host_data, separators=(",", ":")).encode()
+        fd = os.open(host_path, os.O_WRONLY)
+        try:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, blob)
+            os.ftruncate(fd, len(blob))
+        finally:
+            os.close(fd)
+        log.info("mirrored refresh into host creds %s", host_path)
+    except OSError as e:
+        log.warning("could not mirror into host creds %s: %s", host_path, e)
+
+
 def _normalize_oauth(
     upstream_resp: Dict[str, Any], previous: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -245,10 +296,17 @@ def _as_oauth_response(oauth: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def do_refresh(creds_path: Path) -> Dict[str, Any]:
+def do_refresh(
+    creds_path: Path, host_creds_path: Optional[Path] = DEFAULT_HOST_CREDS_PATH
+) -> Dict[str, Any]:
     """Flock-serialized refresh.  Returns a dict either
     ``{access_token, refresh_token, expires_in, token_type}`` on success
-    or ``{error, ...}`` on any failure."""
+    or ``{error, ...}`` on any failure.
+
+    If ``host_creds_path`` is provided and its refresh token matches the
+    shared file's pre-refresh refresh token, the new tokens are mirrored
+    there too — keeps a host-side Claude Code in sync.
+    """
     REFRESH_LOCK.parent.mkdir(parents=True, exist_ok=True)
     with open(REFRESH_LOCK, "w") as lockf:
         fcntl.flock(lockf, fcntl.LOCK_EX)
@@ -279,6 +337,8 @@ def do_refresh(creds_path: Path) -> Dict[str, Any]:
 
         new_oauth = _normalize_oauth(resp, previous=current)
         _write_tokens(creds_path, new_oauth)
+        if host_creds_path is not None:
+            _mirror_to_host_if_same_identity(host_creds_path, refresh_token, new_oauth)
         log.info("refreshed; new expiresAt=%s", new_oauth.get("expiresAt"))
         return _as_oauth_response(new_oauth)
 
@@ -286,12 +346,12 @@ def do_refresh(creds_path: Path) -> Dict[str, Any]:
 # --- host_service handler ---------------------------------------------------
 
 
-def build_handler(creds_path: Path):
+def build_handler(creds_path: Path, host_creds_path: Optional[Path] = None):
     def handler(session: "host_service.Session") -> None:
         req = session.request
         action = str(req.get("action") or "refresh")
         if action == "refresh":
-            session.json(do_refresh(creds_path))
+            session.json(do_refresh(creds_path, host_creds_path))
             return
         if action == "cached":
             cached = _cached_tokens(creds_path)
@@ -341,7 +401,7 @@ def self_check() -> int:
                 "install openssl so `--init-ca` can run"
             )
 
-    creds = refresher.DEFAULT_CREDS_PATH
+    creds = DEFAULT_CREDS_PATH
     if creds.exists():
         try:
             raw = creds.read_text()
@@ -381,8 +441,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument(
         "--creds-file",
         type=Path,
-        default=refresher.DEFAULT_CREDS_PATH,
+        default=DEFAULT_CREDS_PATH,
         help="Shared credentials file (default: the one jails bind-mount)",
+    )
+    parser.add_argument(
+        "--host-creds-file",
+        type=Path,
+        default=DEFAULT_HOST_CREDS_PATH,
+        help=(
+            "Host-side Claude Code creds file.  Mirrored when it shares the "
+            "same refresh token as --creds-file; left alone otherwise.  Pass "
+            "/dev/null to disable mirroring."
+        ),
     )
     parser.add_argument(
         "--init-ca",
@@ -423,7 +493,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # without them yet shouldn't crash — just generate on the fly.
     ensure_ca_and_leaf()
 
-    host_service.serve(build_handler(args.creds_file), args.socket)
+    host_creds = args.host_creds_file.expanduser()
+    host_creds_path: Optional[Path] = (
+        None if str(host_creds) in ("/dev/null", "") else host_creds
+    )
+    host_service.serve(build_handler(args.creds_file, host_creds_path), args.socket)
     return 0
 
 

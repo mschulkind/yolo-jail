@@ -5,16 +5,16 @@ Entry point when a jail (or host) prompts `Please run /login · API Error: 401 {
 This doc is user-facing and operational. Background:
 
 - [`HANDOFF-credentials-logout.md`](../HANDOFF-credentials-logout.md) — investigation notes, ruled-out hypotheses, binary offsets.
-- [`scripts/README.md`](../scripts/README.md) — refresher install + troubleshooting by message.
-- [`docs/claude-oauth-mitm-proxy-plan.md`](claude-oauth-mitm-proxy-plan.md) — fallback plan if the refresher isn't enough.
+- [`src/bundled_loopholes/claude-oauth-broker/README.md`](../src/bundled_loopholes/claude-oauth-broker/README.md) — broker architecture + operator ops.
+- [`docs/claude-oauth-mitm-proxy-plan.md`](claude-oauth-mitm-proxy-plan.md) — historical design notes for the broker split.
 
 ## TL;DR
 
 Repeated logouts almost always mean one of:
 
-1. **Refresher not running on the host** — timer never installed, or stale unit after the Apr 15 wheel refactor (`00435a8`).
-2. **Host and jail credentials diverged** — refresh tokens don't match, so mirroring is disabled by design and the host file ages out to expiry.
-3. **Two writers racing** — host `claude` and the refresher, or the refresher and a jail, refresh in the same window; refresh tokens are single-use, loser gets 401.
+1. **Broker loophole isn't installed or primed** — `just deploy` never ran, or CA/leaf state is missing.
+2. **Host and jail credentials diverged** — refresh tokens don't match, so the broker's host-file mirror is disabled by design and the host file ages out to expiry.
+3. **Broker bypassed** — jail's Claude Code is somehow reaching Anthropic directly (DNS override stripped, CA cert not trusted, loophole disabled) and races another refresher.
 
 All three are diagnosable in under a minute with `yolo doctor` on the host.
 
@@ -30,29 +30,26 @@ All three are diagnosable in under a minute with `yolo doctor` on the host.
 yolo doctor
 ```
 
-The refresher checks live in [`src/cli.py:_check_claude_token_refresher`](../src/cli.py). Scan the output for these lines:
+Scan the Loopholes section for the `claude-oauth-broker` line.
 
-| Line | What it means | Fix |
+| Symptom | What it means | Fix |
 |---|---|---|
-| `FAIL: claude-token-refresher binary not on PATH` | Wheel not installed, or PATH missing `~/.local/bin`. | `uv tool install --force <wheel>` or `pip install -e .` from the repo; verify with `which claude-token-refresher`. |
-| `WARN: Refresher systemd units not installed` | `just deploy` never ran (or ran before the systemd template was correct). | `cd ~/code/yolo-jail && just deploy`. |
-| `WARN: Service unit ExecStart does not point at the installed binary` | Stale unit file from before the Apr 15 refactor (old path: `scripts/claude-token-refresher.py`, new: wheel entry point). | `just deploy` re-templates and re-installs. |
-| `WARN: Refresher timer not enabled` / `not active` | Units installed but never started. | `systemctl --user enable --now claude-token-refresher.timer`. |
-| `FAIL: Refresher service last run failed` | Timer fires but the refresh itself errors. | `journalctl --user -u claude-token-refresher -n 50 --no-pager` — usually a 401 (burned refresh token) or a 404 (endpoint moved). See [`scripts/README.md`](../scripts/README.md#troubleshooting). |
-| `FAIL: Access token expired Nm ago` | Refresher is not running or not writing. | Combine with the lines above; start with binary/unit/timer checks. |
-
-If every line is green but logouts continue → skip to Step 3.
+| `claude-oauth-broker: inactive — requires.command_on_path 'claude' not met` | `claude` isn't on the host PATH. Broker never activates. | Install Claude Code, or set `loopholes.claude-oauth-broker.enabled: false` if intentional. |
+| `NOTE: ca.crt not yet generated` | Fresh install, state dir is empty. | `just deploy` (or `yolo-claude-oauth-broker-host --init-ca` directly). |
+| `FAIL: <creds-path>: ...` (JSON parse error) | Shared credentials file exists but is corrupt. | Re-run `claude` and `/login` inside a jail to rewrite. |
+| `NOTE: <creds-path> does not exist` | No one has logged in yet. | Start a jail, run `claude`, `/login`. |
+| `broker: OK` but jails still 401 | Skip to Step 3. | |
 
 ## Step 2 — check for host/jail divergence
 
-Even with the refresher running, the **host** `~/.claude/.credentials.json` can fall behind because the refresher only mirrors to it when the refresh tokens match.
+Even with the broker running, the **host** `~/.claude/.credentials.json` can fall behind because the broker only mirrors into it when the refresh tokens match.
 
 ```bash
 python3 - <<'EOF'
-import json, datetime
+import json, datetime, os
 for p in ('~/.claude/.credentials.json',
           '~/.local/share/yolo-jail/home/.claude/.credentials.json'):
-    import os; p = os.path.expanduser(p)
+    p = os.path.expanduser(p)
     try:
         d = json.load(open(p))['claudeAiOauth']
         exp = datetime.datetime.fromtimestamp(d['expiresAt']/1000, tz=datetime.timezone.utc)
@@ -70,14 +67,18 @@ EOF
 Fix: pick a single source of truth.
 
 - **Using jails only** — leave the host file alone; ignore its expiry. `claude` on the host will fail and you shouldn't run it anyway.
-- **Using host `claude` too** — run the refresher with `--host-creds-file /dev/null` to disable mirroring entirely, and accept that host and jail sessions drift independently.
+- **Using host `claude` too** — start the broker daemon with `--host-creds-file /dev/null` to disable mirroring entirely, and accept that host and jail sessions drift independently.
 - **Re-converge once** — copy the jail-shared file to the host path once (`cp ~/.local/share/yolo-jail/home/.claude/.credentials.json ~/.claude/.credentials.json`), then future refreshes mirror automatically until something knocks them out of sync.
 
-## Step 3 — refresher is healthy but jails still 401
+## Step 3 — broker is healthy but jails still 401
 
-At this point the failure mode is most likely that Claude Code inside jails is refreshing on its own despite the shared file being fresh — i.e. the `ak4()` mtime-reread assumption described in [`HANDOFF-credentials-logout.md`](../HANDOFF-credentials-logout.md#unexplained--what-to-investigate-next) doesn't hold.
+At this point the jail is reaching Anthropic directly instead of routing through the broker. Possible causes:
 
-Quick check: watch refresher activity while a jail is running.
+- `NODE_EXTRA_CA_CERTS` not set in the jail (so TLS to the intercepted `platform.claude.com` fails and Claude falls back — though it really shouldn't: confirm with `env | rg CA_CERTS`).
+- `--add-host platform.claude.com:127.0.0.1` missing from the podman/docker invocation.
+- The in-jail `oauth-broker-jail` daemon crashed — check `cat ~/.local/state/yolo-jail-daemons/claude-oauth-broker.log` inside a jail.
+
+Quick check: watch the shared file's mtime while a jail is running.
 
 ```bash
 # Terminal 1: inside a running jail
@@ -88,31 +89,22 @@ watch -n 1 'stat -c "mtime=%y inode=%i" \
   ~/.local/share/yolo-jail/home/.claude/.credentials.json'
 ```
 
-If the mtime advances with no corresponding refresher journal entry, a jail wrote it → jails are still refreshing.
-
-When that happens, install the **claude-oauth-broker** loophole. It's a split-broker loophole (see [`docs/loopholes.md`](loopholes.md) for the system) — TLS termination lives inside each jail, and a single host-side daemon (per jail, no systemd, no port binding) holds the flock and the shared credentials file. Jails talk to the host daemon over a Unix socket instead of connecting to Anthropic directly, so they can't race.
-
-```bash
-cd ~/code/yolo-jail && just deploy    # installs broker alongside the refresher
-yolo loopholes status                 # summary across every loophole
-```
-
-Design notes: [`docs/claude-oauth-mitm-proxy-plan.md`](claude-oauth-mitm-proxy-plan.md). Loophole README: [`loopholes/claude-oauth-broker/README.md`](../loopholes/claude-oauth-broker/README.md).
+If the mtime advances but the host broker daemon's log has nothing around that timestamp (`ls ~/.local/share/yolo-jail/logs/host-service-claude-oauth-broker-*.log`), the jail wrote it directly — broker is being bypassed.
 
 ## Manual checks cheat sheet
 
 ```bash
-# Refresher: installed, unit, timer
-which claude-token-refresher
-systemctl --user status claude-token-refresher.timer
-systemctl --user status claude-token-refresher.service
-journalctl --user -u claude-token-refresher -n 50 --no-pager
+# Broker state — CA, leaf, lock
+ls ~/.local/share/yolo-jail/state/claude-oauth-broker/
 
-# One-shot dry run — no network, no writes
-claude-token-refresher --dry-run -v
+# Broker self-check
+yolo-claude-oauth-broker-host --self-check
 
-# Force a refresh right now (burns a refresh token)
-claude-token-refresher --force
+# Per-jail host-daemon log
+ls -lt ~/.local/share/yolo-jail/logs/host-service-claude-oauth-broker-*.log | head
+
+# In-jail TLS terminator log (run inside a jail)
+cat ~/.local/state/yolo-jail-daemons/claude-oauth-broker.log
 
 # See the shared file's state
 stat ~/.local/share/yolo-jail/home/.claude/.credentials.json
@@ -120,6 +112,5 @@ stat ~/.local/share/yolo-jail/home/.claude/.credentials.json
 
 ## When to update this doc
 
-- A new Claude Code version moves the token endpoint or changes the write path → update [`scripts/README.md`](../scripts/README.md) and add a note here.
-- The MITM broker ships → add a "Step 4: broker is running but …" section.
-- A failure mode shows up that doesn't map to Step 1–3 → add it as a new table row in Step 1 or a subsection here.
+- A new Claude Code version moves the token endpoint → update `TOKEN_URL` in `src/oauth_broker.py` and note it here.
+- A failure mode shows up that doesn't map to Step 1–3 → add it as a new row in Step 1 or a subsection here.

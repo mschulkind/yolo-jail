@@ -50,6 +50,8 @@ ls ~/.local/share/yolo-jail/logs/host-service-claude-oauth-broker-*.log
 cat ~/.local/state/yolo-jail-daemons/claude-oauth-broker.log
 ```
 
-## Interaction with the refresher
+## On-demand refresh
 
-`claude-token-refresher` (systemd timer) can coexist — broker handles real-time refresh requests from jails (synchronous); refresher proactively keeps the shared file ahead of expiry (eager). If you want broker-only, set `claude_token_refresher: false` in `~/.config/yolo-jail/config.jsonc`.
+The broker refreshes on request: when a jail POSTs to `/v1/oauth/token`, the host daemon takes the flock, checks on-disk expiry, and either returns the cached tokens (still valid, ≥ 90 s headroom) or calls Anthropic once and rewrites the shared file. There is no background timer — the broker was the original rationale for the legacy `claude-token-refresher`, and once the broker became the single refresh authority the refresher had nothing left to do. It was removed.
+
+The broker also mirrors new tokens into `~/.claude/.credentials.json` iff that file currently shares the same refresh token as the jail-shared file — keeping a host-side Claude Code logged in. Override with `--host-creds-file /dev/null` on the host daemon to disable mirroring.

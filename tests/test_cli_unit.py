@@ -68,7 +68,6 @@ from cli import (  # noqa: E402
     BUILTIN_JOURNAL_LOOPHOLE_NAME,
     LoopholeDaemon,
     JAIL_HOST_SERVICES_DIR,
-    _check_claude_token_refresher,
     _host_service_default_jail_socket,
     _host_service_env_var,
     _host_service_sockets_dir,
@@ -2403,37 +2402,6 @@ class TestJournalDaemon:
         finally:
             stop_loopholes([handle] if handle else [], sockets_dir)
             os.environ["PATH"] = old_path
-
-
-class TestClaudeRefresherOptIn:
-    """`claude_token_refresher: false` short-circuits the doctor check."""
-
-    def test_disabled_config_skips_all_checks(self):
-        messages = []
-        _check_claude_token_refresher(
-            ok=lambda msg, *a, **kw: messages.append(("ok", msg)),
-            warn=lambda *a, **kw: messages.append(("warn", a[0] if a else "")),
-            fail=lambda *a, **kw: messages.append(("fail", a[0] if a else "")),
-            config={"claude_token_refresher": False},
-        )
-        # Exactly one ok line, no warns or fails.
-        assert len(messages) == 1
-        assert messages[0][0] == "ok"
-        assert "disabled by config" in messages[0][1]
-
-    def test_missing_binary_fails_with_install_hint(self, monkeypatch):
-        """When the entry-point binary isn't on PATH, fail with concrete hint."""
-        messages = []
-        monkeypatch.delenv("YOLO_VERSION", raising=False)
-        monkeypatch.setattr(cli.shutil, "which", lambda _: None)
-        _check_claude_token_refresher(
-            ok=lambda msg, *a, **kw: messages.append(("ok", msg)),
-            warn=lambda *a, **kw: messages.append(("warn", a[0] if a else "")),
-            fail=lambda msg, *a, **kw: messages.append(("fail", msg)),
-        )
-        fails = [m for m in messages if m[0] == "fail"]
-        assert len(fails) == 1
-        assert "not on PATH" in fails[0][1]
 
 
 class TestHostServices:

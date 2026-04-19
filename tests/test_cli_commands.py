@@ -362,9 +362,7 @@ class TestCheckCommand:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("YOLO_REPO_ROOT", str(REPO_ROOT))
         mock_which.side_effect = lambda x: (
-            f"/usr/bin/{x}"
-            if x in ("podman", "nix", "claude-token-refresher")
-            else None
+            f"/usr/bin/{x}" if x in ("podman", "nix") else None
         )
         mock_run.side_effect = self._mock_subprocess_run
 
@@ -400,9 +398,7 @@ class TestCheckCommand:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("YOLO_REPO_ROOT", str(REPO_ROOT))
         mock_which.side_effect = lambda x: (
-            f"/usr/bin/{x}"
-            if x in ("podman", "nix", "claude-token-refresher")
-            else None
+            f"/usr/bin/{x}" if x in ("podman", "nix") else None
         )
         mock_run.side_effect = self._mock_subprocess_run
 
@@ -419,9 +415,7 @@ class TestCheckCommand:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("YOLO_REPO_ROOT", str(REPO_ROOT))
         mock_which.side_effect = lambda x: (
-            f"/usr/bin/{x}"
-            if x in ("podman", "nix", "claude-token-refresher")
-            else None
+            f"/usr/bin/{x}" if x in ("podman", "nix") else None
         )
         mock_run.side_effect = self._mock_subprocess_run
 
@@ -442,9 +436,7 @@ class TestDoctorAlias:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("YOLO_REPO_ROOT", str(REPO_ROOT))
         mock_which.side_effect = lambda x: (
-            f"/usr/bin/{x}"
-            if x in ("podman", "nix", "claude-token-refresher")
-            else None
+            f"/usr/bin/{x}" if x in ("podman", "nix") else None
         )
         mock_run.return_value = MagicMock(returncode=0, stdout="podman version 4.9.0\n")
 
@@ -1141,9 +1133,7 @@ class TestCheckCommandDetailed:
             (tmp_path / d).mkdir()
 
         mock_which.side_effect = lambda x: (
-            f"/usr/bin/{x}"
-            if x in ("podman", "nix", "claude-token-refresher")
-            else None
+            f"/usr/bin/{x}" if x in ("podman", "nix") else None
         )
 
         def smart_run(cmd, **kwargs):
@@ -1188,9 +1178,7 @@ class TestCheckCommandDetailed:
         monkeypatch.setattr("cli.USER_CONFIG_PATH", tmp_path / "user-config.jsonc")
 
         mock_which.side_effect = lambda x: (
-            f"/usr/bin/{x}"
-            if x in ("podman", "nix", "claude-token-refresher")
-            else None
+            f"/usr/bin/{x}" if x in ("podman", "nix") else None
         )
 
         def smart_run(cmd, **kwargs):
@@ -1234,9 +1222,7 @@ class TestCheckCommandDetailed:
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("YOLO_REPO_ROOT", str(REPO_ROOT))
         mock_which.side_effect = lambda x: (
-            f"/usr/bin/{x}"
-            if x in ("podman", "nix", "claude-token-refresher")
-            else None
+            f"/usr/bin/{x}" if x in ("podman", "nix") else None
         )
 
         def run_with_exception(cmd, **kwargs):

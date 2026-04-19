@@ -53,6 +53,11 @@ def broker_dirs(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(oauth_broker, "SERVER_CRT", broker_root / "server.crt")
     monkeypatch.setattr(oauth_broker, "SERVER_KEY", broker_root / "server.key")
     monkeypatch.setattr(oauth_broker, "REFRESH_LOCK", broker_root / "refresh.lock")
+    # Point the host-creds default at a nonexistent tmp path so
+    # do_refresh's host-mirror path never touches the real ~/.claude.
+    monkeypatch.setattr(
+        oauth_broker, "DEFAULT_HOST_CREDS_PATH", broker_root / "nohost.json"
+    )
     return broker_root
 
 
@@ -144,6 +149,98 @@ def test_do_refresh_cache_miss_calls_upstream_and_writes(
     assert new["subscriptionType"] == "max"
     assert new["scopes"] == ["user:inference"]
     assert new["expiresAt"] > int(time.time() * 1000)
+
+
+def test_do_refresh_mirrors_into_host_file_when_identity_matches(
+    tmp_path: Path, broker_dirs: Path
+):
+    """When host Claude and the shared file share one refresh token, a
+    successful refresh must also write the new tokens to the host file
+    — otherwise host Claude Code keeps an invalidated token and the next
+    /login dialog pops up unexpectedly."""
+    shared = tmp_path / "shared.json"
+    shared.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "a-expired",
+                    "refreshToken": "r-shared",
+                    "expiresAt": int(time.time() * 1000) - 10_000,
+                    "subscriptionType": "max",
+                }
+            }
+        )
+    )
+    host = tmp_path / "host.json"
+    host.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "a-expired",
+                    "refreshToken": "r-shared",  # same identity
+                    "expiresAt": int(time.time() * 1000) - 10_000,
+                    "subscriptionType": "max",
+                    "hostOnlyField": "preserve-me",
+                }
+            }
+        )
+    )
+
+    with patch.object(oauth_broker, "_refresh_upstream") as m:
+        m.return_value = {
+            "access_token": "a-new",
+            "refresh_token": "r-new",
+            "expires_in": 7200,
+            "token_type": "Bearer",
+        }
+        oauth_broker.do_refresh(shared, host_creds_path=host)
+
+    host_oauth = json.loads(host.read_text())["claudeAiOauth"]
+    assert host_oauth["accessToken"] == "a-new"
+    assert host_oauth["refreshToken"] == "r-new"
+    assert host_oauth["hostOnlyField"] == "preserve-me"
+
+
+def test_do_refresh_does_not_mirror_when_host_identity_differs(
+    tmp_path: Path, broker_dirs: Path
+):
+    """Host Claude with an independent refresh token must be left alone —
+    otherwise we'd log out a separate session the user had set up
+    deliberately."""
+    shared = tmp_path / "shared.json"
+    shared.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "a-expired",
+                    "refreshToken": "r-shared",
+                    "expiresAt": int(time.time() * 1000) - 10_000,
+                }
+            }
+        )
+    )
+    host = tmp_path / "host.json"
+    host_blob_before = json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": "host-access",
+                "refreshToken": "r-different",
+                "expiresAt": int(time.time() * 1000) + 3_600_000,
+            }
+        }
+    )
+    host.write_text(host_blob_before)
+
+    with patch.object(oauth_broker, "_refresh_upstream") as m:
+        m.return_value = {
+            "access_token": "a-new",
+            "refresh_token": "r-new",
+            "expires_in": 7200,
+        }
+        oauth_broker.do_refresh(shared, host_creds_path=host)
+
+    # Host file untouched.
+    assert host.read_text() == host_blob_before
 
 
 def test_do_refresh_returns_error_dict_when_no_refresh_token(
@@ -243,9 +340,7 @@ def test_ensure_ca_force_rotates(broker_dirs: Path):
 @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs openssl")
 def test_self_check_ok(broker_dirs: Path, creds_file: Path, monkeypatch, capsys):
     oauth_broker.ensure_ca_and_leaf()
-    from src import claude_refresher
-
-    monkeypatch.setattr(claude_refresher, "DEFAULT_CREDS_PATH", creds_file)
+    monkeypatch.setattr(oauth_broker, "DEFAULT_CREDS_PATH", creds_file)
     rc = oauth_broker.self_check()
     assert rc == 0
 

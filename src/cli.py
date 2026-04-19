@@ -3180,7 +3180,6 @@ KNOWN_TOP_LEVEL_CONFIG_KEYS = {
     "loopholes",
     "host_processes",
     "journal",
-    "claude_token_refresher",
     "kvm",
 }
 JOURNAL_MODES = ("off", "user", "full")
@@ -3442,12 +3441,6 @@ def _validate_config(
                 f"config.journal: expected one of {list(JOURNAL_MODES)} "
                 f"or a boolean (got {journal!r})"
             )
-
-    refresher = config.get("claude_token_refresher")
-    if refresher is not None and not isinstance(refresher, bool):
-        errors.append(
-            f"config.claude_token_refresher: expected a boolean (got {refresher!r})"
-        )
 
     kvm = config.get("kvm")
     if kvm is not None and not isinstance(kvm, bool):
@@ -4187,11 +4180,6 @@ def init_user_config():
   // "full" — passes args through unchanged (needs host journal read access)
   // "journal": "user",
 
-  // Disable the host-side Claude OAuth token refresher.  Set to false if
-  // you don't use Claude Code on the host or don't want `yolo check` /
-  // `just deploy` to touch the systemd --user timer.
-  // "claude_token_refresher": false,
-
   // Expose /dev/kvm inside the jail for nested hardware-accelerated VMs.
   // Requires your host user to be in the kvm group.  Linux only.
   // "kvm": true
@@ -4306,14 +4294,6 @@ def config_ref():
     Socket: /run/yolo-services/journal.sock
     Env var: YOLO_SERVICE_JOURNAL_SOCKET
     "journal" is reserved as a host_services name — you cannot shadow it.
-
-  [bold]claude_token_refresher[/bold] (boolean, default true): Enable the host-side
-    Claude OAuth token refresher integration.  When false, [cyan]yolo check[/cyan]
-    skips all refresher checks and [cyan]just deploy[/cyan] (via Justfile) won't install
-    the systemd --user timer.  Set to false if you don't use Claude Code on
-    the host, or if you manage the refresher through another mechanism.
-    This has no effect inside the jail — the check already auto-skips when
-    it detects it's running in-jail.
 
   [bold]env[/bold] (object): Extra environment variables set inside the jail.
     Keys are variable names, values are strings.
@@ -4764,192 +4744,6 @@ def _finalize_problem(lines: List[str]) -> "tuple[str, str]":
     title = lines[0]
     detail_lines = [line for line in lines[1:] if line.strip()]
     return title, "\n".join(detail_lines)
-
-
-def _check_claude_token_refresher(
-    ok,
-    warn,
-    fail,
-    config: Optional[Dict[str, Any]] = None,
-) -> None:
-    """Verify the host-side Claude OAuth token refresher is healthy.
-
-    Checks (in order, each independent):
-      1. refresher script is present and executable in the repo
-      2. shared credentials file parses and its access token is still valid
-      3. systemd user unit files are installed (if systemctl is available)
-      4. timer is enabled and active
-      5. last service run did not fail
-
-    On a non-systemd host (e.g. macOS), reports only the non-systemd pieces.
-    When run inside a jail, skips entirely — the refresher lives on the host
-    and a jail has no visibility into host systemd, the real GLOBAL_HOME, or
-    the bind-mount source of the credentials file.
-
-    The entire check is skipped when `claude_token_refresher: false` is set
-    in user or workspace config — users who don't want the host-side timer
-    can opt out without doctor failing.
-    """
-    if config is not None and config.get("claude_token_refresher") is False:
-        ok("Claude token refresher: disabled by config")
-        return
-
-    if os.environ.get("YOLO_VERSION") is not None:
-        ok("Inside jail — refresher checks skipped (managed by host)")
-        return
-
-    # --- Binary presence ---
-    # The refresher ships as a console_script entry point inside the
-    # yolo-jail wheel (see pyproject.toml [project.scripts]), so after
-    # `uv tool install` / `pip install` it's on PATH as
-    # `claude-token-refresher`.  No source checkout required.
-    refresher_bin = shutil.which("claude-token-refresher")
-    if refresher_bin is None:
-        fail(
-            "claude-token-refresher binary not on PATH",
-            "Re-run `just deploy` (or `uv tool install --force <wheel>`) to "
-            "install the entry point, or set `claude_token_refresher: false` "
-            "in ~/.config/yolo-jail/config.jsonc to silence this check",
-        )
-        return
-    ok(f"Refresher binary: {refresher_bin}")
-
-    # --- Credentials file ---
-    creds_path = GLOBAL_HOME / ".claude" / ".credentials.json"
-    # ensure_global_storage() creates this path as an empty file so the jail's
-    # bind mount can target it on first boot.  An empty file here means "no
-    # credentials yet", not a corrupted credentials file — treat it the same
-    # as missing and emit a warn rather than failing the whole check.
-    if not creds_path.exists() or creds_path.stat().st_size == 0:
-        warn(
-            f"No credentials at {creds_path}",
-            "Run `claude` and /login to create — refresher has nothing to refresh yet",
-        )
-    else:
-        try:
-            oauth = json.loads(creds_path.read_text()).get("claudeAiOauth") or {}
-            expires_at_ms = int(oauth.get("expiresAt", 0))
-            if expires_at_ms == 0:
-                warn(f"{creds_path} has no expiresAt", "Re-run /login")
-            else:
-                headroom_secs = expires_at_ms / 1000 - time.time()
-                sub = oauth.get("subscriptionType", "?")
-                if headroom_secs <= 0:
-                    fail(
-                        f"Access token expired {-headroom_secs / 60:.0f}m ago (sub={sub})",
-                        f"Run `claude` /login or force: {refresher_bin} --force",
-                    )
-                elif headroom_secs < 300:
-                    warn(
-                        f"Access token expires in {headroom_secs / 60:.1f}m (sub={sub})",
-                        "Refresher may be lagging — check journalctl --user -u claude-token-refresher",
-                    )
-                else:
-                    ok(
-                        f"Credentials: sub={sub}, expires in {headroom_secs / 3600:.1f}h"
-                    )
-        except (json.JSONDecodeError, OSError, ValueError, TypeError) as e:
-            fail(f"Could not parse {creds_path}", str(e))
-
-    # --- systemd integration (Linux only) ---
-    if not shutil.which("systemctl"):
-        warn(
-            "systemctl not found — refresher cannot run as a timer on this host",
-            "Run it from cron, launchd, or manually instead",
-        )
-        return
-
-    systemd_dir = Path.home() / ".config" / "systemd" / "user"
-    service_unit = systemd_dir / "claude-token-refresher.service"
-    timer_unit = systemd_dir / "claude-token-refresher.timer"
-    if not service_unit.is_file() or not timer_unit.is_file():
-        # Not installed is a warn, not a fail: on a fresh system or CI runner
-        # the user simply hasn't run `just deploy` yet.  `yolo check` validates
-        # the jail environment; it shouldn't hard-fail on optional host-side
-        # setup the user can opt into.
-        warn(
-            "Refresher systemd units not installed",
-            "Run `just deploy` from the yolo-jail repo to install them",
-        )
-        return
-    ok(f"systemd units installed: {systemd_dir}")
-
-    # Check that the service unit's ExecStart actually points at the
-    # currently-installed refresher binary.  A stale unit file from a
-    # previous install at a different path (e.g. a venv that no longer
-    # exists, or an old repo-relative path from before the entry-point
-    # refactor) is easy to miss and produces silent breakage.
-    try:
-        unit_text = service_unit.read_text()
-        if refresher_bin not in unit_text:
-            warn(
-                "Service unit ExecStart does not point at the installed binary",
-                f"Re-run `just deploy` to refresh the unit (should point at {refresher_bin})",
-            )
-    except OSError:
-        pass
-
-    def _systemctl(args: List[str]) -> "tuple[int, str]":
-        try:
-            result = subprocess.run(
-                ["systemctl", "--user", *args],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            return result.returncode, (result.stdout or result.stderr).strip()
-        except (subprocess.TimeoutExpired, OSError) as e:
-            return -1, str(e)
-
-    # --- Timer enabled ---
-    # Not-enabled / not-active are warns rather than fails: user may have
-    # disabled the timer intentionally, or just needs to enable it.
-    rc, out = _systemctl(["is-enabled", "claude-token-refresher.timer"])
-    if rc == 0 and out == "enabled":
-        ok("Refresher timer enabled")
-    else:
-        warn(
-            f"Refresher timer not enabled (state: {out or 'unknown'})",
-            "systemctl --user enable --now claude-token-refresher.timer",
-        )
-        return
-
-    # --- Timer active ---
-    rc, out = _systemctl(["is-active", "claude-token-refresher.timer"])
-    if rc == 0 and out == "active":
-        ok("Refresher timer active")
-    else:
-        warn(
-            f"Refresher timer not active (state: {out or 'unknown'})",
-            "systemctl --user start claude-token-refresher.timer",
-        )
-        return
-
-    # --- Last service run status ---
-    # is-failed IS a hard fail: the unit is installed and running, but the
-    # actual refresh attempt errored — something is genuinely broken (expired
-    # refresh token, network down, etc.) and the user needs to investigate.
-    rc, out = _systemctl(["is-failed", "claude-token-refresher.service"])
-    if rc == 0 and out == "failed":
-        fail(
-            "Refresher service last run failed",
-            "journalctl --user -u claude-token-refresher -n 30 --no-pager",
-        )
-        return
-    ok("Refresher service has not failed")
-
-    # --- Next scheduled run (informational) ---
-    rc, out = _systemctl(
-        [
-            "show",
-            "claude-token-refresher.timer",
-            "-p",
-            "NextElapseUSecRealtime",
-            "--value",
-        ]
-    )
-    if rc == 0 and out and out != "n/a":
-        ok(f"Next refresher tick: {out}")
 
 
 @app.command()
@@ -5705,12 +5499,6 @@ def check(
             warn("Could not check running containers")
         console.print()
 
-    # --- Claude Token Refresher ---
-
-    console.print("[bold]Claude Token Refresher[/bold]")
-    _check_claude_token_refresher(ok, warn, fail, config=config)
-    console.print()
-
     # --- Host-side loopholes ---
 
     console.print("[bold]Loopholes[/bold]")
@@ -6247,7 +6035,8 @@ def run(
         # rw mount (one bind mount per file would push us over the device limit).
         # On AC, each workspace has its own credentials file; cross-jail /login
         # propagation requires podman or docker on macOS, or running the
-        # host-side claude-token-refresher which uses the GLOBAL_HOME source.
+        # host-side claude-oauth-broker which refreshes against the
+        # GLOBAL_HOME source.
         docker_cmd = [
             runtime,
             "run",
@@ -6327,10 +6116,9 @@ def run(
             "-v",
             f"{ws_state / 'claude'}:/home/agent/.claude",
             # Shared credentials — mounted rw ON TOP of the per-workspace .claude
-            # overlay so /login in any jail persists for all jails.  The host-side
-            # claude-token-refresher writes to this file directly, keeping jails
-            # from having to refresh (and racing against Anthropic's refresh-token
-            # rotation).
+            # overlay so /login in any jail persists for all jails.  Refreshes
+            # go through the host-side claude-oauth-broker, which rewrites this
+            # file in place (preserving the inode jails hold).
             "-v",
             f"{GLOBAL_HOME / '.claude' / '.credentials.json'}:/home/agent/.claude/.credentials.json",
             # Other per-workspace overlays
