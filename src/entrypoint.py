@@ -146,40 +146,49 @@ def generate_shims():
         msg = tool_cfg.get("message", f"Error: tool {name} is blocked in this project.")
         sug = tool_cfg.get("suggestion", "")
         real_bin = f"/bin/{name}" if name in ("grep", "find") else None
+        # ``block_flags`` is a list of shell ``case`` glob patterns.
+        # When present, the shim only blocks when argv contains one
+        # of the patterns; otherwise argv passes through to the real
+        # binary.  Absent means "always block" (default for ``find``).
+        block_flags = tool_cfg.get("block_flags") or []
 
-        # grep gets a smarter shim: only block when argv has recursive
-        # flags (``-r``, ``-R``, ``--recursive``, or short-flag bundles
-        # like ``-rn`` / ``-Rn``).  Pipe-filter use (``cmd | grep foo``)
-        # and single-file use (``grep foo file.txt``) pass through.
-        # Long options that merely contain the letter r (``--regex``,
-        # ``--regexp``) are NOT blocked — the pattern is careful.
-        if name == "grep":
+        if block_flags and real_bin:
+            # Split patterns into explicit long-option exact matches
+            # (``--foo``) and everything else.  The shim emits the
+            # long matches first, then a wildcard ``--*`` skip so
+            # unrelated long options (``--regex`` when the user
+            # configured short pattern ``-*[rR]*``) don't get caught,
+            # then the short patterns.
+            long_exact = [p for p in block_flags if p.startswith("--")]
+            short_patterns = [p for p in block_flags if not p.startswith("--")]
+
             lines = ["#!/bin/sh"]
             lines.append('if [ -z "$YOLO_BYPASS_SHIMS" ]; then')
             lines.append('  for arg in "$@"; do')
             lines.append('    case "$arg" in')
-            lines.append("      --recursive)")
-            lines.append(f'        echo "{msg}" >&2')
-            if sug:
-                lines.append(f'        echo "Suggestion: {sug}" >&2')
-            lines.append("        exit 127")
-            lines.append("        ;;")
-            # Long options (starting with --) other than --recursive: skip.
+            if long_exact:
+                lines.append("      " + "|".join(long_exact) + ")")
+                lines.append(f'        echo "{msg}" >&2')
+                if sug:
+                    lines.append(f'        echo "Suggestion: {sug}" >&2')
+                lines.append("        exit 127")
+                lines.append("        ;;")
             lines.append("      --*)")
             lines.append("        : ;;")
-            # Any short-flag bundle containing r or R is recursive.
-            lines.append("      -*[rR]*)")
-            lines.append(f'        echo "{msg}" >&2')
-            if sug:
-                lines.append(f'        echo "Suggestion: {sug}" >&2')
-            lines.append("        exit 127")
-            lines.append("        ;;")
+            if short_patterns:
+                lines.append("      " + "|".join(short_patterns) + ")")
+                lines.append(f'        echo "{msg}" >&2')
+                if sug:
+                    lines.append(f'        echo "Suggestion: {sug}" >&2')
+                lines.append("        exit 127")
+                lines.append("        ;;")
             lines.append("    esac")
             lines.append("  done")
             lines.append("fi")
             lines.append(f'exec {real_bin} "$@"')
             lines.append("")
         else:
+            # Unconditional block.
             lines = ["#!/bin/sh"]
             lines.append('if [ -z "$YOLO_BYPASS_SHIMS" ]; then')
             lines.append(f'  echo "{msg}" >&2')

@@ -88,6 +88,44 @@ class TestShimGeneration:
             timeout=5,
         )
 
+    def test_block_flags_is_config_driven(self, jail_home, monkeypatch):
+        """The smart-block behavior lives in config, not code.  Prove it
+        by supplying custom ``block_flags`` (different from the default
+        grep recursion rule) and confirming:
+
+          - the OLD default patterns (``-r``, ``-R``) pass through (they're
+            not in the user's config)
+          - the user's custom patterns DO block
+        """
+        monkeypatch.setenv(
+            "YOLO_BLOCK_CONFIG",
+            json.dumps(
+                [
+                    {
+                        "name": "grep",
+                        "message": "custom block",
+                        "block_flags": ["--dangerous", "-*[xX]*"],
+                    }
+                ]
+            ),
+        )
+        entrypoint.generate_shims()
+        shim = entrypoint.SHIM_DIR / "grep"
+
+        # ``-r`` is not in the user's custom block_flags — passes through.
+        r = self._run_shim(shim, "-r", "foo", "/dev/null")
+        assert r.returncode != 127, (
+            f"custom block_flags should let -r through, got rc={r.returncode} "
+            f"stderr={r.stderr!r}"
+        )
+        # The user's custom long pattern DOES block.
+        r = self._run_shim(shim, "--dangerous", "foo")
+        assert r.returncode == 127
+        assert b"custom block" in r.stderr
+        # The user's custom short-bundle pattern DOES block.
+        r = self._run_shim(shim, "-xn", "foo", "/dev/null")
+        assert r.returncode == 127
+
     def test_grep_shim_blocks_only_recursive(self, jail_home, monkeypatch):
         """grep is blocked *only* when invoked with recursive flags
         (``-r``, ``-R``, ``--recursive``, short-flag bundles like
@@ -102,6 +140,12 @@ class TestShimGeneration:
                         "name": "grep",
                         "message": "grep -r is blocked",
                         "suggestion": "Use rg",
+                        "block_flags": [
+                            "--recursive",
+                            "-r",
+                            "-R",
+                            "-*[rR]*",
+                        ],
                     }
                 ]
             ),

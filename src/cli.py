@@ -2237,8 +2237,15 @@ def _normalize_blocked_tools(
 
     default_messages = {
         "grep": {
-            "message": "grep is blocked to prevent unintended recursive searches. Use ripgrep (rg) or other targeted tools.",
-            "suggestion": "Try: rg <pattern> [file]",
+            "message": "grep's recursive mode is blocked. Use ripgrep (rg) for recursive searches; pipe filters and single-file greps pass through.",
+            "suggestion": "Try: rg <pattern> [path]",
+            # Only block when argv contains a recursive flag.  Patterns
+            # are shell ``case`` globs.  The entrypoint's shim generator
+            # splits ``--*`` patterns into exact long-match arm (first),
+            # then skips any other ``--*`` argv (so ``--regex`` /
+            # ``--regexp`` aren't false-positive'd by the short-bundle
+            # pattern below), then matches the remaining short patterns.
+            "block_flags": ["--recursive", "-r", "-R", "-*[rR]*"],
         },
         "find": {
             "message": "find is blocked to prevent unintended recursive searches. Use fd for a faster, more intuitive alternative.",
@@ -3152,7 +3159,7 @@ KNOWN_TOP_LEVEL_CONFIG_KEYS = {
 JOURNAL_MODES = ("off", "user", "full")
 KNOWN_NETWORK_KEYS = {"mode", "ports", "forward_host_ports"}
 KNOWN_SECURITY_KEYS = {"blocked_tools"}
-KNOWN_BLOCKED_TOOL_KEYS = {"name", "message", "suggestion"}
+KNOWN_BLOCKED_TOOL_KEYS = {"name", "message", "suggestion", "block_flags"}
 KNOWN_PACKAGE_KEYS = {"name", "nixpkgs", "version", "url", "hash"}
 KNOWN_LSP_SERVER_KEYS = {"command", "args", "fileExtensions"}
 KNOWN_MCP_SERVER_KEYS = {"command", "args"}
@@ -3485,6 +3492,14 @@ def _validate_config(
                         for key in ("message", "suggestion"):
                             if key in tool and not isinstance(tool.get(key), str):
                                 errors.append(f"{path}.{key}: expected a string")
+                        if "block_flags" in tool:
+                            bf = tool.get("block_flags")
+                            if not isinstance(bf, list) or not all(
+                                isinstance(x, str) for x in bf
+                            ):
+                                errors.append(
+                                    f"{path}.block_flags: expected a list of strings"
+                                )
 
     mise_tools = config.get("mise_tools")
     if mise_tools is not None:
@@ -4281,6 +4296,28 @@ def config_ref():
     Simple: ["curl", "wget"]
     Detailed: [{"name": "grep", "message": "Use rg", "suggestion": "rg <pattern>"}]
     Default: grep and find are blocked (rg/fd suggested instead).
+      • grep is conditionally blocked — only recursive invocations
+        (``-r``, ``-R``, ``--recursive``, or short-flag bundles like
+        ``-rn``).  Pipe filters and single-file greps pass through.
+      • find is unconditionally blocked.
+    Conditional: add ``block_flags`` (array of shell case-glob patterns)
+    to block only when argv contains a matching flag.  Absence means
+    "always block" (find's default behavior).  Long options in
+    block_flags match exactly; short patterns (starting with ``-``)
+    match after any non-matching ``--*`` arg is skipped, so patterns
+    like ``-*[rR]*`` catch ``-rn`` / ``-Rn`` without false-positive-ing
+    ``--regex``.
+    Example:
+      "security": {
+        "blocked_tools": [
+          {
+            "name": "grep",
+            "message": "grep -r blocked; use rg",
+            "suggestion": "rg <pattern>",
+            "block_flags": ["-r", "-R", "--recursive", "-*[rR]*"]
+          }
+        ]
+      }
     Bypass: Set YOLO_BYPASS_SHIMS=1 in scripts that need blocked tools.
 
   [bold]mise_tools[/bold] (object): Extra tools installed via mise in the jail.
