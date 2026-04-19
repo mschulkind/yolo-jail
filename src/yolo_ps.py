@@ -5,7 +5,7 @@ Runs inside the jail, talks over the Unix socket the host-side daemon
 exposes.  Output is JSON by default (agents parse JSON); ``--table``
 pretty-prints for humans.
 
-The socket path is passed via ``YOLO_HOST_PROCESSES_SOCKET`` — set by
+The socket path is passed via ``YOLO_SERVICE_HOST_PROCESSES_SOCKET`` — set by
 ``yolo run`` when the loophole is active.  If that env var is missing,
 the loophole isn't wired up for this jail (likely not enabled in
 ``yolo-jail.jsonc``).
@@ -88,7 +88,7 @@ def _call(socket_path: str, request: Dict[str, Any]) -> int:
 
 
 def _resolve_socket() -> Optional[str]:
-    return os.environ.get("YOLO_HOST_PROCESSES_SOCKET")
+    return os.environ.get("YOLO_SERVICE_HOST_PROCESSES_SOCKET")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -112,7 +112,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument(
         "--socket",
-        help="Override socket path (default: $YOLO_HOST_PROCESSES_SOCKET)",
+        help="Override socket path (default: $YOLO_SERVICE_HOST_PROCESSES_SOCKET)",
     )
     args = parser.parse_args(argv)
 

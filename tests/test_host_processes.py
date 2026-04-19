@@ -237,6 +237,20 @@ def test_self_check_empty_visible_is_ok(tmp_path: Path, monkeypatch, capsys):
     assert "no host_processes.visible" in out
 
 
+def test_yolo_ps_reads_service_socket_env_convention(monkeypatch):
+    """Regression: every loophole's jail-side env var follows the
+    ``YOLO_SERVICE_<NAME>_SOCKET`` convention set by
+    ``_host_service_env_var`` in cli.py.  yolo-ps must read that
+    convention, not a bespoke ``YOLO_HOST_PROCESSES_SOCKET``."""
+    from src import yolo_ps
+
+    monkeypatch.delenv("YOLO_HOST_PROCESSES_SOCKET", raising=False)
+    monkeypatch.setenv(
+        "YOLO_SERVICE_HOST_PROCESSES_SOCKET", "/run/yolo-services/h.sock"
+    )
+    assert yolo_ps._resolve_socket() == "/run/yolo-services/h.sock"
+
+
 def test_self_check_ok(tmp_path: Path, monkeypatch, capsys):
     cfg = tmp_path / "c.jsonc"
     cfg.write_text(
