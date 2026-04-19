@@ -185,6 +185,26 @@
           cat > $out/etc/containers/registries.conf <<REGISTRIES
           unqualified-search-registries = ["docker.io"]
           REGISTRIES
+        '' + ''
+
+          # /etc/ld.so.cache so non-nix binaries that don't read
+          # LD_LIBRARY_PATH (setuid helpers, some dlopen callers) can
+          # still find libstdc++, glibc, etc.  The symlinks created
+          # above under /lib and /usr/lib are the scan roots.
+          #
+          # ``-r $out`` tells ldconfig to treat $out as root while it
+          # scans, so the paths it records in the cache are absolute
+          # paths that will resolve at runtime inside the container.
+          # Failure shouldn't abort the image build — if ldconfig
+          # can't index something we fall back to LD_LIBRARY_PATH
+          # which is already wired for every standard path.
+          {
+            echo "/lib"
+            echo "/usr/lib"
+            echo "/usr/lib/${linuxMultilib}"
+          } > $out/etc/ld.so.conf
+          ${imagePkgs.glibc.bin}/bin/ldconfig \
+            -r $out -C /etc/ld.so.cache -f /etc/ld.so.conf || true
         '');
 
         binPathLinks = mkBinPathLinks { };
