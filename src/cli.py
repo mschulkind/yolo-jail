@@ -3161,6 +3161,7 @@ KNOWN_TOP_LEVEL_CONFIG_KEYS = {
     "env",
     "host_claude_files",
     "loopholes",
+    "host_processes",
     "journal",
     "claude_token_refresher",
     "kvm",
@@ -3169,6 +3170,7 @@ JOURNAL_MODES = ("off", "user", "full")
 KNOWN_NETWORK_KEYS = {"mode", "ports", "forward_host_ports"}
 KNOWN_SECURITY_KEYS = {"blocked_tools"}
 KNOWN_BLOCKED_TOOL_KEYS = {"name", "message", "suggestion", "block_flags"}
+KNOWN_HOST_PROCESSES_KEYS = {"visible", "fields"}
 KNOWN_PACKAGE_KEYS = {"name", "nixpkgs", "version", "url", "hash"}
 KNOWN_LSP_SERVER_KEYS = {"command", "args", "fileExtensions"}
 KNOWN_MCP_SERVER_KEYS = {"command", "args"}
@@ -3509,6 +3511,28 @@ def _validate_config(
                                 errors.append(
                                     f"{path}.block_flags: expected a list of strings"
                                 )
+
+    host_processes = config.get("host_processes")
+    if host_processes is not None:
+        if not isinstance(host_processes, dict):
+            errors.append("config.host_processes: expected an object")
+        else:
+            _report_unknown_keys(
+                host_processes,
+                KNOWN_HOST_PROCESSES_KEYS,
+                "config.host_processes",
+                errors,
+            )
+            for list_key in ("visible", "fields"):
+                if list_key in host_processes:
+                    val = host_processes.get(list_key)
+                    if not isinstance(val, list) or not all(
+                        isinstance(x, str) for x in val
+                    ):
+                        errors.append(
+                            f"config.host_processes.{list_key}: "
+                            "expected a list of strings"
+                        )
 
     mise_tools = config.get("mise_tools")
     if mise_tools is not None:
@@ -4631,6 +4655,14 @@ def config_ref():
 """)
 
 
+def _loophole_exec_checks_skipped_in_jail() -> bool:
+    """True when running inside a jail, where host paths referenced in
+    ``loopholes:`` config entries legitimately don't exist.  The
+    exec-presence check should short-circuit with an informational
+    message instead of false-failing."""
+    return os.environ.get("YOLO_VERSION") is not None
+
+
 def _check_loopholes(ok, warn, fail) -> None:
     """Surface loophole discovery + each loophole's own self-check.
 
@@ -5668,36 +5700,39 @@ def check(
     _check_loopholes(ok, warn, fail)
     console.print()
 
-    # --- Host Services ---
+    # --- Loopholes (config-inline daemons) ---
 
     loopholes_cfg = config.get("loopholes") or {}
     if loopholes_cfg:
-        console.print("[bold]Host Services[/bold]")
-        for name, spec in loopholes_cfg.items():
-            if name == BUILTIN_CGROUP_LOOPHOLE_NAME:
-                continue  # builtin is unconditional, not user-configurable
-            if not isinstance(spec, dict):
-                continue
-            cmd = spec.get("command") or []
-            if not isinstance(cmd, list) or not cmd:
-                fail(f"host_services.{name}: missing command")
-                continue
-            # Resolve the command's executable.  Allow ~ expansion and PATH lookup.
-            exe_arg = str(cmd[0])
-            exe_path = Path(exe_arg).expanduser()
-            if exe_path.is_absolute():
-                if exe_path.is_file() and os.access(exe_path, os.X_OK):
-                    ok(f"host_services.{name}: {exe_path}")
+        console.print("[bold]Loopholes — inline daemons[/bold]")
+        if _loophole_exec_checks_skipped_in_jail():
+            ok("Inside jail — exec checks skipped (host paths aren't reachable here)")
+        else:
+            for name, spec in loopholes_cfg.items():
+                if name == BUILTIN_CGROUP_LOOPHOLE_NAME:
+                    continue  # builtin is unconditional, not user-configurable
+                if not isinstance(spec, dict):
+                    continue
+                cmd = spec.get("command") or []
+                if not isinstance(cmd, list) or not cmd:
+                    fail(f"loopholes.{name}: missing command")
+                    continue
+                # Resolve the command's executable.  Allow ~ expansion and PATH lookup.
+                exe_arg = str(cmd[0])
+                exe_path = Path(exe_arg).expanduser()
+                if exe_path.is_absolute():
+                    if exe_path.is_file() and os.access(exe_path, os.X_OK):
+                        ok(f"loopholes.{name}: {exe_path}")
+                    else:
+                        fail(
+                            f"loopholes.{name}: command not found or not executable: {exe_path}"
+                        )
                 else:
-                    fail(
-                        f"host_services.{name}: command not found or not executable: {exe_path}"
-                    )
-            else:
-                resolved = shutil.which(exe_arg)
-                if resolved:
-                    ok(f"host_services.{name}: {resolved}")
-                else:
-                    fail(f"host_services.{name}: command not found on PATH: {exe_arg}")
+                    resolved = shutil.which(exe_arg)
+                    if resolved:
+                        ok(f"loopholes.{name}: {resolved}")
+                    else:
+                        fail(f"loopholes.{name}: command not found on PATH: {exe_arg}")
         console.print()
 
     # --- Summary ---

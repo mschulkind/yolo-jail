@@ -174,8 +174,13 @@ def test_blocked_tool_curl(temp_project):
 
 
 def test_blocked_tool_grep(temp_project):
-    """Test that grep is blocked."""
-    result = run_yolo(temp_project, "grep 'foo' bar")
+    """Test that grep's recursive mode is blocked (the default).
+
+    Plain / pipe-filter usage passes through to /bin/grep — see
+    ``test_entrypoint.py::test_grep_shim_blocks_only_recursive`` for
+    the full matrix.  Here we just confirm the integration wiring
+    fires the block on a recursive invocation."""
+    result = run_yolo(temp_project, "grep -r 'foo' .")
     assert result.returncode == 127
     assert "NO GREP ALLOWED" in result.stderr
 
