@@ -77,6 +77,23 @@ def jail_home(tmp_path, monkeypatch):
 
 
 class TestShimGeneration:
+    def test_yolo_ps_script_generated(self, jail_home, monkeypatch):
+        """``yolo-ps`` is the jail-side CLI for the host-processes
+        loophole.  It's shipped as a wheel console script on the host,
+        but the wheel isn't installed inside the jail — the entrypoint
+        has to drop an equivalent into ``~/.local/bin/`` at boot, same
+        pattern as ``yolo-journalctl`` / ``yolo-cglimit``."""
+        monkeypatch.setenv("YOLO_REPO_ROOT", "/opt/yolo-jail")
+        entrypoint.generate_yolo_ps_script()
+        path = entrypoint.HOME / ".local" / "bin" / "yolo-ps"
+        assert path.is_file()
+        assert path.stat().st_mode & 0o111, "should be executable"
+        content = path.read_text()
+        # Reaches the shipped src.yolo_ps implementation — no logic
+        # duplication from the generator.
+        assert "src.yolo_ps" in content
+        assert "/opt/yolo-jail" in content
+
     def test_yolo_wrapper_does_not_rely_on_pythonpath_or_cd(
         self, jail_home, monkeypatch
     ):

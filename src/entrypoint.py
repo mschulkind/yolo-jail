@@ -1374,6 +1374,37 @@ if __name__ == "__main__":
     script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC)
 
 
+def generate_yolo_ps_script():
+    """Drop a ``yolo-ps`` wrapper into ``~/.local/bin/`` inside the jail.
+
+    The host-processes loophole ships its jail-side CLI as the
+    ``yolo-ps`` wheel console script.  Wheels aren't installed inside
+    the jail, so we generate a tiny wrapper that invokes
+    ``src.yolo_ps:main`` from the bind-mounted repo root instead.
+
+    Same pattern as ``generate_journalctl_script`` / ``generate_yolo_wrapper``:
+    no dependency on PYTHONPATH and no cd dance — just a
+    ``sys.path.insert`` before the import.
+    """
+    repo_root = os.environ.get("YOLO_REPO_ROOT", "/opt/yolo-jail")
+    script_dir = HOME / ".local" / "bin"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    script_path = script_dir / "yolo-ps"
+    script_path.write_text(
+        f"""#!/usr/bin/env python3
+\"\"\"yolo-ps — jail-side client for the host-processes loophole.
+Thin wrapper that invokes src.yolo_ps:main from the bind-mounted
+yolo-jail repo root.
+\"\"\"
+import sys
+sys.path.insert(0, {repo_root!r})
+from src.yolo_ps import main
+sys.exit(main())
+"""
+    )
+    script_path.chmod(script_path.stat().st_mode | stat.S_IEXEC)
+
+
 def generate_journalctl_script():
     """Generate yolo-journalctl helper that bridges to a host-side daemon.
 
@@ -1858,6 +1889,8 @@ def main():
     _perf("cglimit_script")
     generate_journalctl_script()
     _perf("journalctl_script")
+    generate_yolo_ps_script()
+    _perf("yolo_ps_script")
     generate_yolo_wrapper()
     _perf("yolo_wrapper")
 
