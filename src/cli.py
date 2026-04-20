@@ -3250,6 +3250,7 @@ KNOWN_TOP_LEVEL_CONFIG_KEYS = {
     "host_processes",
     "journal",
     "kvm",
+    "prune",
 }
 JOURNAL_MODES = ("off", "user", "full")
 KNOWN_NETWORK_KEYS = {"mode", "ports", "forward_host_ports"}
@@ -4729,6 +4730,55 @@ def _loophole_exec_checks_skipped_in_jail() -> bool:
     return os.environ.get("YOLO_VERSION") is not None
 
 
+def _check_disk_usage(
+    ok,
+    warn,
+    fail,
+    *,
+    threshold_gb: float = 15.0,
+    config: "Optional[Dict[str, Any]]" = None,
+) -> None:
+    """Surface yolo-jail's total on-disk footprint and nudge toward
+    `yolo prune` when it crosses a threshold.
+
+    Threshold defaults to 15 GiB and can be overridden via the
+    ``prune.warn_threshold_gb`` config key.  Below threshold: ok.
+    Over: warn (never fail — disk use isn't a health bug, just a
+    courtesy reminder).
+    """
+    if os.environ.get("YOLO_VERSION") is not None:
+        ok("Inside jail — disk-usage check skipped (runs host-side)")
+        return
+
+    # Allow config to override the default threshold without breaking
+    # a user who hasn't set one.
+    if config:
+        prune_cfg = config.get("prune") or {}
+        raw = prune_cfg.get("warn_threshold_gb")
+        if isinstance(raw, (int, float)) and raw > 0:
+            threshold_gb = float(raw)
+
+    from src import prune as _prune
+
+    runtime = _detect_runtime()
+    try:
+        workspaces = _prune._find_yolo_workspaces(runtime)
+    except Exception:  # never block doctor on a prune detection issue
+        workspaces = []
+    report = _prune._disk_usage_report(
+        workspaces=workspaces, global_storage=GLOBAL_STORAGE
+    )
+    total_gb = report["total"] / (1024**3)
+    human = _fmt_bytes(report["total"])
+    if total_gb >= threshold_gb:
+        warn(
+            f"yolo-jail disk usage: {human} (over {threshold_gb:.0f} GiB threshold)",
+            "Run `yolo prune` to see reclaim candidates, `yolo prune --apply` to execute",
+        )
+    else:
+        ok(f"yolo-jail disk usage: {human} (threshold {threshold_gb:.0f} GiB)")
+
+
 def _check_loopholes(ok, warn, fail) -> None:
     """Surface loophole discovery + each loophole's own self-check.
 
@@ -5572,6 +5622,12 @@ def check(
 
     console.print("[bold]Loopholes[/bold]")
     _check_loopholes(ok, warn, fail)
+    console.print()
+
+    # --- Disk usage (nudges toward `yolo prune` when large) ---
+
+    console.print("[bold]Disk usage[/bold]")
+    _check_disk_usage(ok, warn, fail, config=config)
     console.print()
 
     # --- Loopholes (config-inline daemons) ---
@@ -7230,6 +7286,146 @@ def doctor(
 ):
     """Alias for 'check'. Validate environment, config, and build."""
     check(build=build)
+
+
+@app.command("prune")
+def prune_cmd(
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Actually reclaim space.  Without this flag, prune prints what "
+        "it WOULD do and exits (safe default).",
+    ),
+    no_hardlink: bool = typer.Option(
+        False,
+        "--no-hardlink",
+        help="Skip the cross-workspace hardlink dedup pass.",
+    ),
+    no_containers: bool = typer.Option(
+        False,
+        "--no-containers",
+        help="Skip the stopped-container cleanup.",
+    ),
+    no_images: bool = typer.Option(
+        False,
+        "--no-images",
+        help="Skip the old-image cleanup.",
+    ),
+    keep_images: int = typer.Option(
+        2,
+        "--keep-images",
+        help="Number of most-recent yolo-jail images to retain (default: 2).",
+    ),
+):
+    """Reclaim disk space: hardlink-dedup, drop stale containers + old images.
+
+    Defaults to dry-run — nothing on disk changes unless you pass --apply.
+    Only touches yolo-* containers, yolo-jail images, and files under
+    ``<workspace>/.yolo/home/{npm-global,local,go}``.
+    """
+    from src import prune as _prune
+
+    runtime = _detect_runtime()
+    workspaces = _prune._find_yolo_workspaces(runtime)
+
+    mode = "APPLY" if apply else "DRY-RUN"
+    console.print(f"[bold]yolo prune ({mode})[/bold]")
+    console.print(f"Runtime: {runtime}  Workspaces tracked: {len(workspaces)}")
+    for ws in workspaces:
+        console.print(f"  • {ws}")
+    if not workspaces:
+        console.print(
+            "[dim]No yolo-* containers found — nothing to dedupe across.[/dim]"
+        )
+
+    # --- Pre-report ---
+    before = _prune._disk_usage_report(
+        workspaces=workspaces, global_storage=GLOBAL_STORAGE
+    )
+    console.print(
+        f"\n[bold]Current usage[/bold]  total={_fmt_bytes(before['total'])}  "
+        f"(workspaces={_fmt_bytes(before['workspaces'])}, "
+        f"global={_fmt_bytes(before['global_storage'])})"
+    )
+
+    total_saved = 0
+    total_links = 0
+    removed_containers: list[str] = []
+    removed_images: list[str] = []
+
+    if not no_hardlink and workspaces:
+        console.print("\n[bold]Hardlink dedup[/bold]")
+        entries = list(_prune._walk_dedupable_files(workspaces))
+        console.print(f"  candidate files: {len(entries):,}")
+        saved, links = _prune._hardlink_duplicate_files(entries, apply=apply)
+        verb = "would save" if not apply else "saved"
+        console.print(f"  {verb}: {_fmt_bytes(saved)} across {links:,} hardlinks")
+        total_saved += saved
+        total_links += links
+
+    if not no_containers:
+        console.print("\n[bold]Stopped yolo-* containers[/bold]")
+        removed_containers = _prune._prune_stopped_containers(runtime, apply=apply)
+        verb = "would remove" if not apply else "removed"
+        if removed_containers:
+            console.print(f"  {verb}: {len(removed_containers)}")
+            for name in removed_containers:
+                console.print(f"    • {name}")
+        else:
+            console.print("  [dim]none[/dim]")
+
+    if not no_images:
+        console.print(f"\n[bold]Old yolo-jail images[/bold]  (keep={keep_images})")
+        removed_images = _prune._prune_old_images(
+            runtime, keep=keep_images, apply=apply
+        )
+        verb = "would remove" if not apply else "removed"
+        if removed_images:
+            console.print(f"  {verb}: {len(removed_images)}")
+            for img in removed_images:
+                console.print(f"    • {img}")
+        else:
+            console.print("  [dim]none[/dim]")
+
+    console.print()
+    if apply:
+        console.print(
+            f"[bold green]Reclaimed {_fmt_bytes(total_saved)}[/bold green] via "
+            f"{total_links:,} hardlinks, {len(removed_containers)} container(s), "
+            f"{len(removed_images)} image(s)."
+        )
+    else:
+        console.print(
+            f"[bold yellow]DRY-RUN:[/bold yellow] would reclaim "
+            f"{_fmt_bytes(total_saved)} via {total_links:,} hardlinks, remove "
+            f"{len(removed_containers)} container(s), "
+            f"{len(removed_images)} image(s).  Re-run with [cyan]--apply[/cyan] "
+            "to execute."
+        )
+
+
+def _fmt_bytes(n: int) -> str:
+    """Human-readable byte count: 1536 → '1.5 KiB', 1_500_000_000 → '1.4 GiB'."""
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    size = float(n)
+    i = 0
+    while size >= 1024 and i < len(units) - 1:
+        size /= 1024
+        i += 1
+    if i == 0:
+        return f"{int(size)} {units[i]}"
+    return f"{size:.1f} {units[i]}"
+
+
+def _detect_runtime() -> str:
+    """Return the container runtime for prune / check use.
+
+    Reads ``YOLO_RUNTIME`` if set (same env var the run command uses),
+    otherwise falls back to ``podman``.  Kept shallow on purpose —
+    cli.py already has richer runtime detection in the ``run`` path,
+    but prune doesn't need that full machinery.
+    """
+    return os.environ.get("YOLO_RUNTIME") or "podman"
 
 
 # ---------------------------------------------------------------------------
