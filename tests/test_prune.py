@@ -577,7 +577,41 @@ class TestDiskUsageReport:
         report = prune._disk_usage_report(
             workspaces=[], global_storage=tmp_path / "missing"
         )
-        assert report == {"global_storage": 0, "workspaces": 0, "total": 0}
+        assert report["global_storage"] == 0
+        assert report["workspaces"] == 0
+        assert report["total"] == 0
+        assert report["breakdown"] == {}
+
+    def test_breaks_down_global_storage_by_subdir(self, tmp_path):
+        """When 177 GiB is sitting in ~/.local/share/yolo-jail the user
+        needs to know WHICH subdir is fat.  Report carries a
+        ``breakdown`` mapping subdir→bytes for every direct child
+        under GLOBAL_STORAGE so nothing stays hidden."""
+        gs = tmp_path / "yolo-jail"
+        (gs / "cache").mkdir(parents=True)
+        (gs / "cache" / "big").write_bytes(b"x" * 1000)
+        (gs / "mise").mkdir()
+        (gs / "mise" / "v1.bin").write_bytes(b"y" * 2000)
+        (gs / "home").mkdir()
+        (gs / "home" / "f").write_bytes(b"z" * 100)
+        # Unrecognized subdir still appears so nothing goes uncounted.
+        (gs / "mystery").mkdir()
+        (gs / "mystery" / "f").write_bytes(b"m" * 42)
+        # Top-level stray file counted too (important — some logs /
+        # locks sit directly under GLOBAL_STORAGE).
+        (gs / "stray.log").write_bytes(b"l" * 7)
+
+        report = prune._disk_usage_report(workspaces=[], global_storage=gs)
+
+        bd = report["breakdown"]
+        assert bd["cache"] == 1000
+        assert bd["mise"] == 2000
+        assert bd["home"] == 100
+        assert bd["mystery"] == 42
+        # Stray top-level files roll up under a "_files" bucket so the
+        # breakdown dict + top-level total stay consistent.
+        assert bd["_files"] == 7
+        assert report["global_storage"] == 1000 + 2000 + 100 + 42 + 7
 
 
 # ---------------------------------------------------------------------------

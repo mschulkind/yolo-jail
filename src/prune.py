@@ -401,14 +401,44 @@ def _disk_usage_report(*, workspaces: Iterable[Path], global_storage: Path) -> d
     """Per-category byte totals for everything a prune might reclaim.
 
     Keys:
-      - ``global_storage``: size of ``~/.local/share/yolo-jail``
+      - ``global_storage``: total size under ``~/.local/share/yolo-jail``
       - ``workspaces``: sum of ``.yolo/`` sizes across known workspaces
       - ``total``: sum of the above
+      - ``breakdown``: {subdir_name: bytes} for every direct child of
+        ``global_storage`` so the operator can see WHERE the bytes are
+        (cache? mise? containers?).  Stray top-level files roll up
+        into ``"_files"`` so the breakdown sum equals the top-level
+        total exactly — nothing stays hidden.
     """
-    gs_bytes = _dir_size_bytes(global_storage)
+    breakdown: dict[str, int] = {}
+    gs_bytes = 0
+    if global_storage.is_dir():
+        stray = 0
+        try:
+            entries = list(global_storage.iterdir())
+        except OSError:
+            entries = []
+        for child in entries:
+            try:
+                if child.is_symlink():
+                    continue
+                if child.is_dir():
+                    size = _dir_size_bytes(child)
+                    breakdown[child.name] = size
+                    gs_bytes += size
+                elif child.is_file():
+                    size = child.lstat().st_size
+                    stray += size
+                    gs_bytes += size
+            except OSError:
+                continue
+        if stray:
+            breakdown["_files"] = stray
+
     ws_bytes = sum(_dir_size_bytes(ws / ".yolo") for ws in workspaces)
     return {
         "global_storage": gs_bytes,
         "workspaces": ws_bytes,
         "total": gs_bytes + ws_bytes,
+        "breakdown": breakdown,
     }

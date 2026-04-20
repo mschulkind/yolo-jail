@@ -7347,6 +7347,11 @@ def prune_cmd(
         f"(workspaces={_fmt_bytes(before['workspaces'])}, "
         f"global={_fmt_bytes(before['global_storage'])})"
     )
+    breakdown = before.get("breakdown") or {}
+    if breakdown:
+        console.print("  [dim]global-storage breakdown (largest first):[/dim]")
+        for name, size in sorted(breakdown.items(), key=lambda kv: kv[1], reverse=True):
+            console.print(f"    {name:<20} {_fmt_bytes(size):>12}")
 
     total_saved = 0
     total_links = 0
