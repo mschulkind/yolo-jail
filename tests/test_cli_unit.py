@@ -2548,6 +2548,35 @@ class TestHostServices:
 
                 _sh.rmtree(sockets_dir, ignore_errors=True)
 
+    def test_external_service_surfaces_log_tail_on_early_exit(self, tmp_path, capsys):
+        """When a host service crashes before binding its socket, the operator
+        should see the tail of its log on the console — not just an exit
+        code.  Regression: missing-openssl in the OAuth broker used to be
+        invisible unless you went fishing in ~/.local/share/yolo-jail/logs/.
+        """
+        service_script = tmp_path / "noisy-crash.py"
+        service_script.write_text(
+            "import sys\n"
+            "print('BOOM-stdout-marker', flush=True)\n"
+            "print('BOOM-stderr-marker', file=sys.stderr, flush=True)\n"
+            "sys.exit(7)\n"
+        )
+        sockets_dir = _host_service_sockets_dir("yolo-test-svc-noisy")
+        try:
+            spec = {"command": [sys.executable, str(service_script), "{socket}"]}
+            handle = _start_host_service_external("noisy", spec, sockets_dir)
+            assert handle is None
+            captured = capsys.readouterr()
+            combined = captured.out + captured.err
+            assert "exited early" in combined
+            # Either stream is fine — both are merged into the log file.
+            assert "BOOM-stdout-marker" in combined or "BOOM-stderr-marker" in combined
+        finally:
+            if sockets_dir.exists():
+                import shutil as _sh
+
+                _sh.rmtree(sockets_dir, ignore_errors=True)
+
     def test_start_loopholes_skips_apple_container(self):
         """Apple Container can't bind-mount Unix sockets — we skip everything."""
         handles = start_loopholes(

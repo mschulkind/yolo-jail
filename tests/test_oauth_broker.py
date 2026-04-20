@@ -332,6 +332,38 @@ def test_ensure_ca_force_rotates(broker_dirs: Path):
     assert oauth_broker.CA_CRT.read_bytes() != old_crt
 
 
+def test_ensure_ca_clear_error_when_openssl_missing(broker_dirs: Path, monkeypatch):
+    """Without openssl AND without state, ensure_ca_and_leaf must SystemExit
+    with a single actionable line, not a deep subprocess traceback.
+
+    Regression: the daemon previously crashed inside _openssl with
+    FileNotFoundError, which yolo-claude-oauth-broker-host swallowed into
+    a multi-frame traceback in the host-service log.
+    """
+    monkeypatch.setattr(oauth_broker.shutil, "which", lambda _x: None)
+    with pytest.raises(SystemExit) as excinfo:
+        oauth_broker.ensure_ca_and_leaf()
+    msg = str(excinfo.value)
+    assert "openssl" in msg
+    assert "PATH" in msg
+
+
+def test_ensure_ca_skips_openssl_check_when_state_present(
+    broker_dirs: Path, monkeypatch
+):
+    """If CA + leaf already exist, openssl absence at runtime is benign —
+    don't refuse to run."""
+    for p in (
+        oauth_broker.CA_CRT,
+        oauth_broker.CA_KEY,
+        oauth_broker.SERVER_CRT,
+        oauth_broker.SERVER_KEY,
+    ):
+        p.write_bytes(b"placeholder")
+    monkeypatch.setattr(oauth_broker.shutil, "which", lambda _x: None)
+    oauth_broker.ensure_ca_and_leaf()  # must not raise
+
+
 # ---------------------------------------------------------------------------
 # self_check
 # ---------------------------------------------------------------------------

@@ -2123,7 +2123,33 @@ def _start_host_service_external(
 
     log_dir = GLOBAL_STORAGE / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = open(log_dir / f"host-service-{name}.log", "ab")
+    log_path = log_dir / f"host-service-{name}.log"
+    log_file = open(log_path, "ab")
+
+    def _print_log_tail(reason: str, max_lines: int = 5) -> None:
+        """Surface the last few log lines so operators don't have to fish.
+
+        The service's own stderr/stdout already captured the actionable
+        error (e.g. a Python traceback ending in FileNotFoundError); we
+        echo the tail to the console alongside the failure message.
+        """
+        try:
+            log_file.flush()
+        except Exception:
+            pass
+        try:
+            with open(log_path, "rb") as f:
+                tail = f.read()[-4096:].decode(errors="replace").rstrip()
+        except OSError:
+            return
+        if not tail:
+            return
+        lines = tail.splitlines()[-max_lines:]
+        console.print(
+            f"[yellow]Last {len(lines)} line(s) of {log_path} ({reason}):[/yellow]"
+        )
+        for line in lines:
+            console.print(f"  [dim]{line}[/dim]")
 
     try:
         proc = subprocess.Popen(
@@ -2148,6 +2174,7 @@ def _start_host_service_external(
                 f"[red]Host service '{name}' exited early with code "
                 f"{proc.returncode} before binding {host_socket}[/red]"
             )
+            _print_log_tail(f"exit code {proc.returncode}")
             log_file.close()
             return None
         time.sleep(0.05)
@@ -2156,6 +2183,7 @@ def _start_host_service_external(
             f"[red]Host service '{name}' did not bind {host_socket} within "
             f"{startup_timeout_secs:.1f}s — killing[/red]"
         )
+        _print_log_tail("startup timeout")
         try:
             proc.kill()
             proc.wait(timeout=2)

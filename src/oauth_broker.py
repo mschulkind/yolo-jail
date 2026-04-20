@@ -116,6 +116,16 @@ def ensure_ca_and_leaf(force: bool = False) -> None:
     if have_ca and have_leaf and not force:
         return
 
+    # We need openssl to mint anything missing.  Check up front so the
+    # operator gets one actionable error line instead of a Python
+    # traceback from subprocess deep inside _openssl().
+    if shutil.which("openssl") is None:
+        raise SystemExit(
+            "yolo-claude-oauth-broker-host: openssl not found on PATH; "
+            "install openssl on the host so the broker can mint its CA "
+            "(see docs/claude-oauth-mitm-proxy-plan.md)"
+        )
+
     if force or not have_ca:
         _openssl("genrsa", "-out", str(CA_KEY), "4096")
         os.chmod(CA_KEY, 0o600)
