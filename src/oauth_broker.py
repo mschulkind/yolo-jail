@@ -68,11 +68,11 @@ TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
 
-# Shared credentials file — bind-mounted into every jail.  The broker
-# rewrites this file in place (preserving the inode so bind mounts stay
-# valid) whenever it refreshes upstream.
+# Shared credentials file — lives in the directory-mounted shared
+# credentials dir so Claude Code's atomic writer (tmp+rename) works.
 DEFAULT_CREDS_PATH = (
-    Path.home() / ".local/share/yolo-jail/home/.claude/.credentials.json"
+    Path.home()
+    / ".local/share/yolo-jail/home/.claude-shared-credentials/.credentials.json"
 )
 # Host-side Claude Code's own credentials file.  When this file exists
 # AND its refresh token matches the shared file's (meaning host and
@@ -223,7 +223,7 @@ def _refresh_upstream(refresh_token: str) -> Dict[str, Any]:
 
 
 def _write_tokens(creds_path: Path, oauth: Dict[str, Any]) -> None:
-    """In-place truncate+write — preserves the bind-mount inode jails hold."""
+    """Atomic write of the shared credentials file."""
     blob = json.dumps({"claudeAiOauth": oauth}, indent=2)
     fd = os.open(creds_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
