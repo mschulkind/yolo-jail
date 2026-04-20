@@ -22,7 +22,7 @@ import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Tuple
+from typing import Callable, Iterable, List, Tuple
 
 log = logging.getLogger("yolo.prune")
 
@@ -41,6 +41,25 @@ _DEDUPE_SUBTREES = ("npm-global", "local", "go")
 # also not safe.  ``nix-build-root`` and ``build`` are too small to
 # matter and change on every rebuild.
 _GLOBAL_DEDUPE_SUBDIRS = ("cache", "mise", "home")
+
+# Subdirs under ``~/.cache`` that are safe to purge by age — content
+# is pure CAS with a fast re-download path.  ``go-build`` is
+# re-compile-able.  Heavy re-downloads (playwright browsers, HF
+# models) live in a separate opt-in set below.
+CACHE_PURGE_DEFAULT_SUBDIRS = ("uv", "pip", "npm", "go-build", "mise")
+
+# Opt-in.  Same safety profile but the re-fetch cost is meaningful:
+# playwright re-downloads are ~400 MiB per browser; huggingface
+# models can be GiBs each.
+CACHE_PURGE_HEAVY_SUBDIRS = ("ms-playwright", "huggingface")
+
+# Hard-excluded.  These aren't pure caches — they carry live user
+# profile state (cookies, IndexedDB, extensions, bookmarks).
+# ``_purge_cache_by_age`` refuses to touch them even if the caller
+# explicitly names them in ``subdirs``.
+_CACHE_PURGE_FORBIDDEN = frozenset(
+    {"chromium", "google-chrome", "chrome", "mozilla", "firefox", "thunderbird"}
+)
 
 # Hardlink detection reads files in chunks; avoid loading multi-GB
 # binaries into memory all at once.
@@ -211,7 +230,10 @@ def _hash_file(path: Path) -> "str | None":
 
 
 def _hardlink_duplicate_files(
-    entries: List[DedupEntry], *, apply: bool
+    entries: List[DedupEntry],
+    *,
+    apply: bool,
+    progress_cb: "Callable[..., None] | None" = None,
 ) -> Tuple[int, int]:
     """Group ``entries`` by (size, sha256) and hardlink duplicates.
 
@@ -222,6 +244,13 @@ def _hardlink_duplicate_files(
     Returns ``(bytes_saved, links_made)``.  Dry-run (``apply=False``)
     returns the same numbers it WOULD have produced but performs no
     filesystem mutations.
+
+    ``progress_cb``, if passed, is invoked with ``advance=1`` once per
+    duplicate-decision that results in a link (real or dry-run).  It
+    is NOT called for solo / already-linked entries — advancing the
+    bar in those cases would badly over-count, given that typical
+    dedup runs have ~1M input entries but only a small fraction are
+    actual duplicates.
     """
     # Group by size first (cheap filter) — only hash files whose size
     # collides with at least one other file.  Saves reading gigabytes
@@ -265,6 +294,8 @@ def _hardlink_duplicate_files(
                 if not apply:
                     bytes_saved += size
                     links_made += 1
+                    if progress_cb is not None:
+                        progress_cb(advance=1)
                     continue
                 # Atomic link-over-replace: link to a temp name
                 # then rename over the original.  A partial failure
@@ -292,6 +323,8 @@ def _hardlink_duplicate_files(
                     continue
                 bytes_saved += size
                 links_made += 1
+                if progress_cb is not None:
+                    progress_cb(advance=1)
     return bytes_saved, links_made
 
 
@@ -468,3 +501,77 @@ def _disk_usage_report(*, workspaces: Iterable[Path], global_storage: Path) -> d
         "total": gs_bytes + ws_bytes,
         "breakdown": breakdown,
     }
+
+
+# ---------------------------------------------------------------------------
+# Age-based cache purge
+# ---------------------------------------------------------------------------
+
+
+def _purge_cache_by_age(
+    cache_root: Path,
+    *,
+    subdirs: Iterable[str],
+    older_than_days: float,
+    apply: bool,
+) -> Tuple[int, int]:
+    """Remove regular files older than ``older_than_days`` under each
+    named ``subdir`` of ``cache_root``.  Returns
+    ``(bytes_removed, files_removed)``.
+
+    Safety:
+      - Only subdirs the caller explicitly names are scanned — no
+        glob, no recursive allowlist expansion.
+      - Browser profile dirs (chromium family, firefox) are HARD-
+        EXCLUDED even if the caller names them, because they hold
+        live user state (cookies, IndexedDB, extensions) that looks
+        like cache-shaped files but is authoritative session data.
+      - Symlinks are never followed or deleted (target might live
+        outside the cache subtree).
+      - Dry-run (``apply=False``) returns accurate counts but makes
+        no filesystem changes.
+    """
+    import time
+
+    cutoff = time.time() - (older_than_days * 86400)
+
+    bytes_removed = 0
+    files_removed = 0
+
+    for sub in subdirs:
+        if sub in _CACHE_PURGE_FORBIDDEN:
+            log.debug("refusing to purge browser-profile subdir %s", sub)
+            continue
+        root = cache_root / sub
+        if not root.is_dir():
+            continue
+        import stat as _stat
+
+        for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+            dp = Path(dirpath)
+            for name in filenames:
+                p = dp / name
+                try:
+                    st = p.lstat()
+                except OSError:
+                    continue
+                if _stat.S_ISLNK(st.st_mode):
+                    continue
+                if not _stat.S_ISREG(st.st_mode):
+                    continue
+                # Use mtime — atime is often disabled (noatime) or
+                # relatime-delayed, which would under-report
+                # staleness.  mtime of cache files is the download
+                # time and doesn't change after write.
+                if st.st_mtime >= cutoff:
+                    continue
+                size = st.st_size
+                if apply:
+                    try:
+                        p.unlink()
+                    except OSError as e:
+                        log.debug("unlink %s failed: %s", p, e)
+                        continue
+                bytes_removed += size
+                files_removed += 1
+    return bytes_removed, files_removed

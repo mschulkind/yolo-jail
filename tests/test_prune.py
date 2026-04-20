@@ -276,6 +276,145 @@ class TestWalkDedupableFiles:
         assert len(entries) == 2
 
 
+class TestPurgeCacheByAge:
+    """``_purge_cache_by_age(cache_root, subdirs, older_than_days, *, apply)``
+    removes regular files under each explicitly-named subdir whose
+    mtime is older than a cutoff.  Content in those dirs is
+    re-downloadable from PyPI / npm / etc.  The function HARD-EXCLUDES
+    browser profile dirs (chromium-family) even if the caller names
+    them — those carry live user state."""
+
+    def _touch_old(self, p: Path, days_old: int) -> None:
+        import time
+
+        p.write_bytes(b"x" * 10)
+        old = time.time() - (days_old * 86400)
+        os.utime(p, (old, old))
+
+    def test_removes_files_older_than_cutoff(self, tmp_path):
+        cache = tmp_path / "cache"
+        uv = cache / "uv"
+        uv.mkdir(parents=True)
+        old = uv / "ancient.whl"
+        fresh = uv / "recent.whl"
+        self._touch_old(old, days_old=90)
+        self._touch_old(fresh, days_old=3)
+
+        removed_bytes, removed_count = prune._purge_cache_by_age(
+            cache, subdirs=["uv"], older_than_days=30, apply=True
+        )
+
+        assert removed_count == 1
+        assert removed_bytes == 10
+        assert not old.exists()
+        assert fresh.exists()
+
+    def test_dry_run_reports_but_does_not_delete(self, tmp_path):
+        cache = tmp_path / "cache"
+        uv = cache / "uv"
+        uv.mkdir(parents=True)
+        old = uv / "old.whl"
+        self._touch_old(old, days_old=60)
+
+        removed_bytes, removed_count = prune._purge_cache_by_age(
+            cache, subdirs=["uv"], older_than_days=30, apply=False
+        )
+
+        assert removed_count == 1
+        assert removed_bytes == 10
+        assert old.exists(), "dry-run must not delete"
+
+    def test_respects_subdir_allowlist(self, tmp_path):
+        """Only subdirs the caller names may be touched — a typo or
+        over-eager default must not blow away unrelated state."""
+        cache = tmp_path / "cache"
+        pip = cache / "pip"
+        pip.mkdir(parents=True)
+        mysterious = cache / "something-else"
+        mysterious.mkdir(parents=True)
+        self._touch_old(pip / "w.whl", days_old=90)
+        self._touch_old(mysterious / "keep-me", days_old=90)
+
+        prune._purge_cache_by_age(
+            cache, subdirs=["pip"], older_than_days=30, apply=True
+        )
+
+        assert not (pip / "w.whl").exists()
+        assert (mysterious / "keep-me").exists()
+
+    def test_chromium_family_hard_excluded(self, tmp_path):
+        """Even if the caller explicitly names a chromium-family
+        subdir, we must refuse — those carry live user profile state
+        (cookies, IndexedDB, extensions) that would break browsers
+        silently if purged."""
+        cache = tmp_path / "cache"
+        chromium = cache / "chromium"
+        chromium.mkdir(parents=True)
+        self._touch_old(chromium / "Cookies", days_old=365)
+
+        removed_bytes, removed_count = prune._purge_cache_by_age(
+            cache,
+            subdirs=["chromium", "google-chrome", "mozilla"],
+            older_than_days=30,
+            apply=True,
+        )
+
+        assert removed_count == 0
+        assert (chromium / "Cookies").exists()
+
+    def test_missing_subdir_tolerated(self, tmp_path):
+        """Some installs won't have all tool caches — missing subdir
+        contributes 0, doesn't crash."""
+        cache = tmp_path / "cache"
+        cache.mkdir(parents=True)
+
+        removed_bytes, removed_count = prune._purge_cache_by_age(
+            cache, subdirs=["uv", "pip", "npm"], older_than_days=30, apply=True
+        )
+
+        assert removed_bytes == 0
+        assert removed_count == 0
+
+    def test_nested_files_counted(self, tmp_path):
+        """Cache dirs are deeply nested; every descendant old-enough
+        regular file is a purge candidate."""
+        cache = tmp_path / "cache"
+        deep = cache / "uv" / "archives-v0" / "ab" / "cd"
+        deep.mkdir(parents=True)
+        self._touch_old(deep / "wheel-1.whl", days_old=100)
+        self._touch_old(deep / "wheel-2.whl", days_old=100)
+
+        _, removed_count = prune._purge_cache_by_age(
+            cache, subdirs=["uv"], older_than_days=30, apply=True
+        )
+        assert removed_count == 2
+
+    def test_skips_symlinks(self, tmp_path):
+        """Never follow / delete symlinks — the target might live
+        outside the cache subtree."""
+        cache = tmp_path / "cache"
+        uv = cache / "uv"
+        uv.mkdir(parents=True)
+        elsewhere = tmp_path / "elsewhere.txt"
+        elsewhere.write_bytes(b"keep me")
+        (uv / "link").symlink_to(elsewhere)
+        # make the link itself appear old
+        import time
+
+        old = time.time() - (90 * 86400)
+        try:
+            os.utime(uv / "link", (old, old), follow_symlinks=False)
+        except NotImplementedError:
+            # macOS older than 10.14 — skip, irrelevant for correctness
+            pass
+
+        _, removed_count = prune._purge_cache_by_age(
+            cache, subdirs=["uv"], older_than_days=30, apply=True
+        )
+        assert elsewhere.exists()
+        assert removed_count == 0
+
+
 class TestWalkGlobalDedupable:
     """`_walk_global_dedupable(global_storage)` yields regular non-empty
     files under the subtrees that are safe to hardlink-dedupe — the
@@ -426,6 +565,41 @@ class TestHardlinkDuplicateFiles:
         assert bytes_saved == 2 * len(payload)
         assert links_made == 2
         assert len({f.stat().st_ino for f in files}) == 1
+
+    def test_progress_cb_called_per_dup_decision(self, tmp_path):
+        """For a 1.25M-file dedup pass the CLI wants a rich.progress
+        bar.  Accept an optional ``progress_cb(advance=1)`` that fires
+        once per duplicate-decision so the bar advances at the rate
+        of real work — not at the rate of input entries (which may
+        be mostly unique)."""
+        # Two dup pairs (4 files, 2 decisions) and 2 solo uniques.
+        dup_a1 = tmp_path / "a1"
+        dup_a2 = tmp_path / "a2"
+        dup_b1 = tmp_path / "b1"
+        dup_b2 = tmp_path / "b2"
+        solo_c = tmp_path / "c"
+        solo_d = tmp_path / "d"
+        dup_a1.write_bytes(b"AAAA" * 100)
+        dup_a2.write_bytes(b"AAAA" * 100)
+        dup_b1.write_bytes(b"BBBB" * 100)
+        dup_b2.write_bytes(b"BBBB" * 100)
+        solo_c.write_bytes(b"CCCC" * 10)
+        solo_d.write_bytes(b"DDDDDD")
+
+        progress_calls: list[int] = []
+
+        def cb(advance: int = 1):
+            progress_calls.append(advance)
+
+        prune._hardlink_duplicate_files(
+            [self._entry(p) for p in [dup_a1, dup_a2, dup_b1, dup_b2, solo_c, solo_d]],
+            apply=True,
+            progress_cb=cb,
+        )
+        # One callback per dup-link attempt (2 links made); solos
+        # don't advance the bar.
+        assert len(progress_calls) == 2
+        assert all(n == 1 for n in progress_calls)
 
     def test_tolerates_cross_device_link_error(self, tmp_path, monkeypatch):
         """``os.link`` across device boundaries raises OSError(EXDEV).
@@ -798,7 +972,9 @@ class TestPruneCommand:
         monkeypatch.setattr(prune, "_walk_dedupable_files", fake_ws_walk)
         monkeypatch.setattr(prune, "_walk_global_dedupable", fake_global_walk)
         monkeypatch.setattr(
-            prune, "_hardlink_duplicate_files", lambda entries, *, apply: (0, 0)
+            prune,
+            "_hardlink_duplicate_files",
+            lambda entries, *, apply, progress_cb=None: (0, 0),
         )
         monkeypatch.setattr(
             prune, "_prune_stopped_containers", lambda runtime, *, apply: []
@@ -811,6 +987,80 @@ class TestPruneCommand:
 
         assert result.exit_code == 0
         assert called["global"] == 1, "global walker must be invoked"
+
+    def test_cache_age_invokes_purge(self, monkeypatch):
+        """--cache-age N must call _purge_cache_by_age with the
+        default subdir allowlist and the given age."""
+        seen: dict = {}
+
+        def fake_purge(cache_root, *, subdirs, older_than_days, apply):
+            seen["subdirs"] = list(subdirs)
+            seen["older_than_days"] = older_than_days
+            seen["apply"] = apply
+            return (0, 0)
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+        monkeypatch.setattr(prune, "_purge_cache_by_age", fake_purge)
+
+        result = self._invoke(["--cache-age", "30"])
+
+        assert result.exit_code == 0
+        assert seen["older_than_days"] == 30
+        assert seen["apply"] is False  # dry-run default
+        # Default subdirs list, heavy caches NOT included.
+        assert "uv" in seen["subdirs"]
+        assert "huggingface" not in seen["subdirs"]
+        assert "ms-playwright" not in seen["subdirs"]
+
+    def test_purge_heavy_caches_extends_subdirs(self, monkeypatch):
+        seen: dict = {}
+
+        def fake_purge(cache_root, *, subdirs, older_than_days, apply):
+            seen["subdirs"] = list(subdirs)
+            return (0, 0)
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+        monkeypatch.setattr(prune, "_purge_cache_by_age", fake_purge)
+
+        result = self._invoke(["--cache-age", "30", "--purge-heavy-caches"])
+
+        assert result.exit_code == 0
+        assert "huggingface" in seen["subdirs"]
+        assert "ms-playwright" in seen["subdirs"]
+
+    def test_no_cache_age_skips_purge(self, monkeypatch):
+        """Without --cache-age, the purge must be skipped entirely —
+        never a default-on destructive action."""
+        called = {"n": 0}
+
+        def fake_purge(cache_root, *, subdirs, older_than_days, apply):
+            called["n"] += 1
+            return (0, 0)
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+        monkeypatch.setattr(prune, "_purge_cache_by_age", fake_purge)
+
+        result = self._invoke([])
+        assert result.exit_code == 0
+        assert called["n"] == 0
 
     def test_default_skips_global_dedup(self, monkeypatch):
         """Without --dedup-global, the 100+ GiB shared cache is NOT
@@ -825,7 +1075,9 @@ class TestPruneCommand:
             lambda gs: called.__setitem__("global", called["global"] + 1) or [],
         )
         monkeypatch.setattr(
-            prune, "_hardlink_duplicate_files", lambda entries, *, apply: (0, 0)
+            prune,
+            "_hardlink_duplicate_files",
+            lambda entries, *, apply, progress_cb=None: (0, 0),
         )
         monkeypatch.setattr(
             prune, "_prune_stopped_containers", lambda runtime, *, apply: []

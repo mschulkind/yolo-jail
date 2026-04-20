@@ -7324,12 +7324,28 @@ def prune_cmd(
         "--keep-images",
         help="Number of most-recent yolo-jail images to retain (default: 2).",
     ),
+    cache_age: int = typer.Option(
+        0,
+        "--cache-age",
+        help="If >0, purge files under ~/.cache/{uv,pip,npm,go-build,mise} "
+        "older than this many days.  Content is re-downloadable from PyPI/"
+        "npm/go/mise on next install.  Default 0 disables the pass.",
+    ),
+    purge_heavy_caches: bool = typer.Option(
+        False,
+        "--purge-heavy-caches",
+        help="With --cache-age, also purge playwright browsers + huggingface "
+        "models older than the cutoff.  Re-download cost is significant "
+        "(~400 MiB per browser, multi-GiB per HF model) — opt-in.",
+    ),
 ):
     """Reclaim disk space: hardlink-dedup, drop stale containers + old images.
 
     Defaults to dry-run — nothing on disk changes unless you pass --apply.
     Only touches yolo-* containers, yolo-jail images, and files under
-    ``<workspace>/.yolo/home/{npm-global,local,go}``.
+    ``<workspace>/.yolo/home/{npm-global,local,go}``.  Browser profile
+    dirs in the cache (chromium/firefox families) are NEVER touched by
+    the age-based purge — those carry live user state.
     """
     from src import prune as _prune
 
@@ -7368,11 +7384,35 @@ def prune_cmd(
 
     if not no_hardlink and (workspaces or dedup_global):
         console.print("\n[bold]Hardlink dedup[/bold]")
+        from rich.progress import (
+            BarColumn,
+            MofNCompleteColumn,
+            Progress,
+            SpinnerColumn,
+            TextColumn,
+            TimeElapsedColumn,
+            TimeRemainingColumn,
+        )
+
         entries: list = []
-        if workspaces:
-            entries.extend(_prune._walk_dedupable_files(workspaces))
-        if dedup_global:
-            entries.extend(_prune._walk_global_dedupable(GLOBAL_STORAGE))
+        # Walk phase: unknown total, show indeterminate spinner.
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]{task.description}[/bold]"),
+            TextColumn("[dim]{task.completed:,} files scanned[/dim]"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=True,
+        ) as prog:
+            task = prog.add_task("scanning", total=None)
+            if workspaces:
+                for e in _prune._walk_dedupable_files(workspaces):
+                    entries.append(e)
+                    prog.advance(task)
+            if dedup_global:
+                for e in _prune._walk_global_dedupable(GLOBAL_STORAGE):
+                    entries.append(e)
+                    prog.advance(task)
         console.print(f"  candidate files: {len(entries):,}")
         if dedup_global:
             console.print("  [dim]scope: workspaces + global cache/mise/home[/dim]")
@@ -7381,7 +7421,27 @@ def prune_cmd(
                 "  [dim]scope: workspaces only  (pass --dedup-global to include "
                 "the shared caches)[/dim]"
             )
-        saved, links = _prune._hardlink_duplicate_files(entries, apply=apply)
+        # Dedup phase: we don't know how many links we'll make until
+        # we've hashed, so the bar tracks decisions-made as they land.
+        # Total is unknown → spinner-like bar, but with a counter.
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[bold]{task.description}[/bold]"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            console=console,
+            transient=True,
+        ) as prog:
+            task = prog.add_task("deduping", total=None)
+
+            def cb(advance: int = 1):
+                prog.advance(task, advance)
+
+            saved, links = _prune._hardlink_duplicate_files(
+                entries, apply=apply, progress_cb=cb
+            )
         verb = "would save" if not apply else "saved"
         console.print(f"  {verb}: {_fmt_bytes(saved)} across {links:,} hardlinks")
         total_saved += saved
@@ -7411,20 +7471,43 @@ def prune_cmd(
         else:
             console.print("  [dim]none[/dim]")
 
+    cache_bytes = 0
+    cache_files = 0
+    if cache_age > 0:
+        subdirs = list(_prune.CACHE_PURGE_DEFAULT_SUBDIRS)
+        if purge_heavy_caches:
+            subdirs.extend(_prune.CACHE_PURGE_HEAVY_SUBDIRS)
+        console.print(
+            f"\n[bold]Cache purge[/bold]  (subdirs={','.join(subdirs)}, "
+            f"age > {cache_age}d)"
+        )
+        # cache lives at GLOBAL_STORAGE/cache
+        cache_bytes, cache_files = _prune._purge_cache_by_age(
+            GLOBAL_STORAGE / "cache",
+            subdirs=subdirs,
+            older_than_days=cache_age,
+            apply=apply,
+        )
+        verb = "would remove" if not apply else "removed"
+        console.print(
+            f"  {verb}: {_fmt_bytes(cache_bytes)} across {cache_files:,} files"
+        )
+        total_saved += cache_bytes
+
     console.print()
     if apply:
         console.print(
             f"[bold green]Reclaimed {_fmt_bytes(total_saved)}[/bold green] via "
             f"{total_links:,} hardlinks, {len(removed_containers)} container(s), "
-            f"{len(removed_images)} image(s)."
+            f"{len(removed_images)} image(s), {cache_files:,} cache file(s)."
         )
     else:
         console.print(
             f"[bold yellow]DRY-RUN:[/bold yellow] would reclaim "
             f"{_fmt_bytes(total_saved)} via {total_links:,} hardlinks, remove "
             f"{len(removed_containers)} container(s), "
-            f"{len(removed_images)} image(s).  Re-run with [cyan]--apply[/cyan] "
-            "to execute."
+            f"{len(removed_images)} image(s), {cache_files:,} cache file(s).  "
+            f"Re-run with [cyan]--apply[/cyan] to execute."
         )
 
 
