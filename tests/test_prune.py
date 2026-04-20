@@ -276,6 +276,56 @@ class TestWalkDedupableFiles:
         assert len(entries) == 2
 
 
+class TestWalkGlobalDedupable:
+    """`_walk_global_dedupable(global_storage)` yields regular non-empty
+    files under the subtrees that are safe to hardlink-dedupe — the
+    shared pip/uv/mise/npm caches, mise tool-version dirs, the seeded
+    GLOBAL_HOME base — but NOT containers/ or agents/ which carry
+    per-jail state that shouldn't be shared across installs."""
+
+    def test_yields_from_cache_mise_home(self, tmp_path):
+        gs = tmp_path / "yolo-jail"
+        (gs / "cache" / "uv").mkdir(parents=True)
+        (gs / "cache" / "uv" / "w.whl").write_bytes(b"wheel-content")
+        (gs / "mise" / "installs").mkdir(parents=True)
+        (gs / "mise" / "installs" / "lib.so").write_bytes(b"libdata")
+        (gs / "home").mkdir()
+        (gs / "home" / "seed").write_bytes(b"seeddata")
+
+        paths = {e.path.name for e in prune._walk_global_dedupable(gs)}
+        assert paths == {"w.whl", "lib.so", "seed"}
+
+    def test_skips_state_carrying_subdirs(self, tmp_path):
+        """containers/ and agents/ hold per-host bookkeeping that isn't
+        safe to hardlink across machines.  Keep them out."""
+        gs = tmp_path / "yolo-jail"
+        (gs / "containers").mkdir(parents=True)
+        (gs / "containers" / "tracking.json").write_bytes(b"per-host")
+        (gs / "agents").mkdir(parents=True)
+        (gs / "agents" / "record").write_bytes(b"per-jail")
+        (gs / "state").mkdir(parents=True)
+        (gs / "state" / "lock").write_bytes(b"state")
+
+        assert list(prune._walk_global_dedupable(gs)) == []
+
+    def test_skips_symlinks_and_empty_files(self, tmp_path):
+        gs = tmp_path / "yolo-jail"
+        cache = gs / "cache"
+        cache.mkdir(parents=True)
+        real = cache / "real"
+        real.write_bytes(b"data")
+        (cache / "link").symlink_to(real)
+        (cache / "empty").write_bytes(b"")
+
+        names = {e.path.name for e in prune._walk_global_dedupable(gs)}
+        assert names == {"real"}
+
+    def test_missing_global_storage_returns_nothing(self, tmp_path):
+        """Fresh install with no global_storage yet → empty generator,
+        not an error."""
+        assert list(prune._walk_global_dedupable(tmp_path / "missing")) == []
+
+
 # ---------------------------------------------------------------------------
 # Hardlink dedup — the core win
 # ---------------------------------------------------------------------------
@@ -730,6 +780,64 @@ class TestPruneCommand:
 
         assert result.exit_code == 0
         assert seen["keep"] == 5
+
+    def test_dedup_global_includes_cache_entries(self, monkeypatch):
+        """With --dedup-global the pass must walk the shared caches
+        too, not just the per-workspace subtrees."""
+        called = {"workspace": 0, "global": 0}
+
+        def fake_ws_walk(ws):
+            called["workspace"] += 1
+            return []
+
+        def fake_global_walk(gs):
+            called["global"] += 1
+            return []
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(prune, "_walk_dedupable_files", fake_ws_walk)
+        monkeypatch.setattr(prune, "_walk_global_dedupable", fake_global_walk)
+        monkeypatch.setattr(
+            prune, "_hardlink_duplicate_files", lambda entries, *, apply: (0, 0)
+        )
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+
+        result = self._invoke(["--dedup-global"])
+
+        assert result.exit_code == 0
+        assert called["global"] == 1, "global walker must be invoked"
+
+    def test_default_skips_global_dedup(self, monkeypatch):
+        """Without --dedup-global, the 100+ GiB shared cache is NOT
+        scanned — avoids surprising latency on a default run."""
+        called = {"global": 0}
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(prune, "_walk_dedupable_files", lambda ws: [])
+        monkeypatch.setattr(
+            prune,
+            "_walk_global_dedupable",
+            lambda gs: called.__setitem__("global", called["global"] + 1) or [],
+        )
+        monkeypatch.setattr(
+            prune, "_hardlink_duplicate_files", lambda entries, *, apply: (0, 0)
+        )
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+
+        result = self._invoke([])
+
+        assert result.exit_code == 0
+        assert called["global"] == 0
 
 
 # ---------------------------------------------------------------------------

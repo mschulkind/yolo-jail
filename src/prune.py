@@ -33,6 +33,15 @@ log = logging.getLogger("yolo.prune")
 # per-workspace state that must never be shared.
 _DEDUPE_SUBTREES = ("npm-global", "local", "go")
 
+# Under GLOBAL_STORAGE these subtrees hold content-addressable-ish
+# blobs (downloaded wheels, tarballs, prebuilt binaries) that are
+# safe to hardlink across and within.  ``containers`` and ``agents``
+# hold per-host bookkeeping + per-jail state that MUST NOT be shared.
+# ``state`` holds loophole runtime state (flock files, CA keys) —
+# also not safe.  ``nix-build-root`` and ``build`` are too small to
+# matter and change on every rebuild.
+_GLOBAL_DEDUPE_SUBDIRS = ("cache", "mise", "home")
+
 # Hardlink detection reads files in chunks; avoid loading multi-GB
 # binaries into memory all at once.
 _HASH_CHUNK_BYTES = 1 << 20  # 1 MiB
@@ -139,28 +148,45 @@ def _walk_dedupable_files(workspaces: Iterable[Path]) -> Iterable[DedupEntry]:
     for ws in workspaces:
         home = ws / ".yolo" / "home"
         for sub in _DEDUPE_SUBTREES:
-            root = home / sub
-            if not root.is_dir():
-                continue
-            for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
-                dp = Path(dirpath)
-                for name in filenames:
-                    p = dp / name
-                    try:
-                        st = p.lstat()
-                    except OSError:
-                        continue
-                    # Skip symlinks — lstat().st_mode's S_IFLNK bit
-                    # is set for links.
-                    import stat as _stat
+            yield from _walk_dedup_tree(home / sub)
 
-                    if _stat.S_ISLNK(st.st_mode):
-                        continue
-                    if not _stat.S_ISREG(st.st_mode):
-                        continue
-                    if st.st_size == 0:
-                        continue
-                    yield DedupEntry(path=p, size=st.st_size)
+
+def _walk_global_dedupable(global_storage: Path) -> Iterable[DedupEntry]:
+    """Yield a ``DedupEntry`` for every regular, non-empty file under
+    the shared global-storage subtrees that are safe to hardlink-dedup:
+    ``cache/`` (pip/uv/npm/playwright/mise/… downloaded artifacts),
+    ``mise/`` (installed tool versions — often share libraries across
+    patch-level installs), and ``home/`` (the :ro base seed).
+    Never touches ``containers/``, ``agents/``, ``state/``, or the
+    nix/build scratch dirs — those hold per-host bookkeeping or
+    ephemeral build output."""
+    for sub in _GLOBAL_DEDUPE_SUBDIRS:
+        yield from _walk_dedup_tree(global_storage / sub)
+
+
+def _walk_dedup_tree(root: Path) -> Iterable[DedupEntry]:
+    """Shared walker used by both dedup scopes.  Yields regular,
+    non-empty, non-symlink files under ``root`` as ``DedupEntry``s.
+    Silently returns nothing if ``root`` doesn't exist."""
+    if not root.is_dir():
+        return
+    import stat as _stat
+
+    for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
+        dp = Path(dirpath)
+        for name in filenames:
+            p = dp / name
+            try:
+                st = p.lstat()
+            except OSError:
+                continue
+            if _stat.S_ISLNK(st.st_mode):
+                continue
+            if not _stat.S_ISREG(st.st_mode):
+                continue
+            if st.st_size == 0:
+                continue
+            yield DedupEntry(path=p, size=st.st_size)
 
 
 # ---------------------------------------------------------------------------

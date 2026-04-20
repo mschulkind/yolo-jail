@@ -7301,6 +7301,14 @@ def prune_cmd(
         "--no-hardlink",
         help="Skip the cross-workspace hardlink dedup pass.",
     ),
+    dedup_global: bool = typer.Option(
+        False,
+        "--dedup-global",
+        help="Also hardlink-dedupe inside the shared global cache/mise/home "
+        "subtrees.  Opt-in because these can be hundreds of GiB and the "
+        "scan takes real time — but that's where the duplicate wheels "
+        "live.",
+    ),
     no_containers: bool = typer.Option(
         False,
         "--no-containers",
@@ -7358,10 +7366,21 @@ def prune_cmd(
     removed_containers: list[str] = []
     removed_images: list[str] = []
 
-    if not no_hardlink and workspaces:
+    if not no_hardlink and (workspaces or dedup_global):
         console.print("\n[bold]Hardlink dedup[/bold]")
-        entries = list(_prune._walk_dedupable_files(workspaces))
+        entries: list = []
+        if workspaces:
+            entries.extend(_prune._walk_dedupable_files(workspaces))
+        if dedup_global:
+            entries.extend(_prune._walk_global_dedupable(GLOBAL_STORAGE))
         console.print(f"  candidate files: {len(entries):,}")
+        if dedup_global:
+            console.print("  [dim]scope: workspaces + global cache/mise/home[/dim]")
+        else:
+            console.print(
+                "  [dim]scope: workspaces only  (pass --dedup-global to include "
+                "the shared caches)[/dim]"
+            )
         saved, links = _prune._hardlink_duplicate_files(entries, apply=apply)
         verb = "would save" if not apply else "saved"
         console.print(f"  {verb}: {_fmt_bytes(saved)} across {links:,} hardlinks")
