@@ -12,6 +12,18 @@ REPO_ROOT = Path(__file__).parent.parent.resolve()
 
 pytestmark = pytest.mark.slow
 
+# Default subprocess timeout for a single `yolo -- <cmd>` invocation.
+#
+# Cold start on a fresh CI runner exercises: image pull, container
+# create, mise tool install/upgrade, loophole daemon spawn, entrypoint
+# config generation.  On a warm runner the same path is ~10s; cold it
+# spends well over 2 minutes, which was blowing past the old 120s
+# default and failing the FIRST integration test consistently
+# (``test_blocked_tool_curl``).  300s gives enough headroom for a cold
+# boot while still catching a genuinely-hung container within a single
+# test run.
+DEFAULT_JAIL_TIMEOUT = 300
+
 
 def _container_name_for_workspace(workspace: Path) -> str:
     """Mirror cli.py's container_name_for_workspace for cleanup."""
@@ -81,7 +93,7 @@ def temp_project(tmp_path):
     _force_remove_container(project_dir)
 
 
-def run_yolo(project_dir, command, timeout=120):
+def run_yolo(project_dir, command, timeout=DEFAULT_JAIL_TIMEOUT):
     """Run a shell command inside the jail via login shell (bash -lc).
 
     On timeout, force-removes the container to prevent orphaned zombies.
@@ -113,7 +125,7 @@ def run_yolo(project_dir, command, timeout=120):
         raise
 
 
-def run_yolo_cli(project_dir, *args, timeout=120):
+def run_yolo_cli(project_dir, *args, timeout=DEFAULT_JAIL_TIMEOUT):
     """Run a yolo subcommand directly on the host-side CLI."""
     result = subprocess.run(
         [
@@ -134,7 +146,7 @@ def run_yolo_cli(project_dir, *args, timeout=120):
     return result
 
 
-def run_yolo_direct(project_dir, *args, timeout=120):
+def run_yolo_direct(project_dir, *args, timeout=DEFAULT_JAIL_TIMEOUT):
     """Run a command directly via `yolo -- <cmd>`, matching real-world usage.
 
     This mirrors `yolo -- copilot --version` exactly — the command is NOT
@@ -669,7 +681,7 @@ def test_host_port_forwarding_data(tmp_path):
         result = run_yolo(
             project_dir,
             f"curl -s --max-time 5 http://127.0.0.1:{port}/",
-            timeout=120,
+            timeout=DEFAULT_JAIL_TIMEOUT,
         )
         assert marker in result.stdout, (
             f"Expected {marker!r} in stdout, got: {result.stdout!r}\n"
@@ -704,7 +716,7 @@ def test_cgroup_delegation_available(tmp_path):
         "yolo-cglimit --cpu 75 --name test-cgd -- "
         'echo "DELEGATION_OK"; '
         "true",
-        timeout=120,
+        timeout=DEFAULT_JAIL_TIMEOUT,
     )
     stdout = result.stdout
     stderr = result.stderr
@@ -727,7 +739,7 @@ def test_cglimit_helper_available(tmp_path):
     result = run_yolo(
         project_dir,
         "which yolo-cglimit && yolo-cglimit --help",
-        timeout=120,
+        timeout=DEFAULT_JAIL_TIMEOUT,
     )
     assert "yolo-cglimit" in result.stdout, (
         f"yolo-cglimit not found on PATH.\nstdout: {result.stdout}\nstderr: {result.stderr}"
@@ -751,7 +763,7 @@ def test_cglimit_enforces_cpu_limit(tmp_path):
         project_dir,
         # Use yolo-cglimit to run a command with 75% CPU limit
         'set -e; yolo-cglimit --cpu 75 --name test-enforce -- echo "ENFORCE_OK"; true',
-        timeout=120,
+        timeout=DEFAULT_JAIL_TIMEOUT,
     )
     stdout = result.stdout
     stderr = result.stderr
