@@ -340,7 +340,7 @@ def test_ensure_ca_clear_error_when_openssl_missing(broker_dirs: Path, monkeypat
     FileNotFoundError, which yolo-claude-oauth-broker-host swallowed into
     a multi-frame traceback in the host-service log.
     """
-    monkeypatch.setattr(oauth_broker.shutil, "which", lambda _x: None)
+    monkeypatch.setattr(oauth_broker, "_resolve_openssl", lambda: None)
     with pytest.raises(SystemExit) as excinfo:
         oauth_broker.ensure_ca_and_leaf()
     msg = str(excinfo.value)
@@ -360,8 +360,25 @@ def test_ensure_ca_skips_openssl_check_when_state_present(
         oauth_broker.SERVER_KEY,
     ):
         p.write_bytes(b"placeholder")
-    monkeypatch.setattr(oauth_broker.shutil, "which", lambda _x: None)
+    monkeypatch.setattr(oauth_broker, "_resolve_openssl", lambda: None)
     oauth_broker.ensure_ca_and_leaf()  # must not raise
+
+
+def test_resolve_openssl_falls_back_to_known_paths(monkeypatch, tmp_path):
+    """When PATH is empty / stripped, _resolve_openssl must still find
+    openssl via the absolute-path fallback list.
+
+    Regression: the broker daemon was crash-looping with FileNotFoundError
+    even though /usr/bin/openssl existed on the host, because the spawned
+    daemon's PATH didn't include /usr/bin (some launcher layer was
+    stripping it).
+    """
+    fake_openssl = tmp_path / "openssl"
+    fake_openssl.write_text("#!/bin/sh\n")
+    fake_openssl.chmod(0o755)
+    monkeypatch.setattr(oauth_broker.shutil, "which", lambda _x: None)
+    monkeypatch.setattr(oauth_broker, "_OPENSSL_FALLBACK_PATHS", (str(fake_openssl),))
+    assert oauth_broker._resolve_openssl() == str(fake_openssl)
 
 
 # ---------------------------------------------------------------------------

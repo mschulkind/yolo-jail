@@ -89,9 +89,46 @@ log = logging.getLogger("oauth-broker-host")
 # --- CA + leaf cert generation ----------------------------------------------
 
 
+# Common openssl install locations.  The broker is spawned by ``yolo`` as
+# a daemon, and depending on how the user launched yolo (mise activate,
+# uv run, direct shell, IDE integration, etc.) the inherited PATH may
+# not include /usr/bin even on systems where openssl is clearly there.
+# We search these absolute paths as a fallback so the broker doesn't
+# depend on PATH hygiene at spawn time.
+_OPENSSL_FALLBACK_PATHS = (
+    "/usr/bin/openssl",
+    "/bin/openssl",
+    "/usr/local/bin/openssl",
+    "/opt/homebrew/bin/openssl",  # Homebrew on Apple Silicon
+    "/usr/local/opt/openssl/bin/openssl",  # Homebrew on Intel macOS
+    "/run/current-system/sw/bin/openssl",  # NixOS
+)
+
+
+def _resolve_openssl() -> Optional[str]:
+    """Find the openssl binary, by PATH or by walking known install dirs.
+
+    Returns the absolute path on success, or None if no openssl can be
+    located.  See ``_OPENSSL_FALLBACK_PATHS`` for the rationale.
+    """
+    found = shutil.which("openssl")
+    if found:
+        return found
+    for p in _OPENSSL_FALLBACK_PATHS:
+        if os.access(p, os.X_OK):
+            return p
+    return None
+
+
 def _openssl(*args: str, input: Optional[bytes] = None) -> None:
+    binary = _resolve_openssl()
+    if binary is None:
+        # Should be unreachable in practice — ensure_ca_and_leaf
+        # validates this up front — but guard anyway for callers that
+        # bypass the high-level entrypoint.
+        raise RuntimeError("openssl not found; cannot run openssl subcommand")
     proc = subprocess.run(
-        ["openssl", *args],
+        [binary, *args],
         input=input,
         capture_output=True,
         check=False,
@@ -119,11 +156,19 @@ def ensure_ca_and_leaf(force: bool = False) -> None:
     # We need openssl to mint anything missing.  Check up front so the
     # operator gets one actionable error line instead of a Python
     # traceback from subprocess deep inside _openssl().
-    if shutil.which("openssl") is None:
+    if _resolve_openssl() is None:
+        # Include the spawned env's PATH so operators can diagnose
+        # PATH-stripping wrappers (mise, uv run, IDE integrations) that
+        # cause openssl to be missing in the daemon's env even though
+        # it's plainly on the user's interactive shell PATH.
+        spawn_path = os.environ.get("PATH", "<unset>")
+        searched = ":".join(_OPENSSL_FALLBACK_PATHS)
         raise SystemExit(
-            "yolo-claude-oauth-broker-host: openssl not found on PATH; "
-            "install openssl on the host so the broker can mint its CA "
-            "(see docs/claude-oauth-mitm-proxy-plan.md)"
+            "yolo-claude-oauth-broker-host: cannot locate openssl. "
+            f"Searched PATH={spawn_path!r} and fallback locations "
+            f"({searched}). Install openssl, or symlink it into one "
+            "of the fallback locations. "
+            "(See docs/claude-oauth-mitm-proxy-plan.md)"
         )
 
     if force or not have_ca:
@@ -401,7 +446,7 @@ def self_check() -> int:
         warnings.append(
             f"{SERVER_CRT} not yet generated — run `--init-ca` or `just deploy`"
         )
-    if not shutil.which("openssl"):
+    if _resolve_openssl() is None:
         # Only hard-fail if state is also missing (we'd need openssl to
         # generate it).  If state already exists, openssl absence is
         # benign at runtime.

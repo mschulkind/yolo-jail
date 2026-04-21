@@ -4893,6 +4893,96 @@ def _finalize_problem(lines: List[str]) -> "tuple[str, str]":
     return title, "\n".join(detail_lines)
 
 
+def _check_host_service_liveness(ok, warn, fail) -> None:
+    """For each running jail, verify each external host_daemon's socket is alive.
+
+    A loophole's static ``self-check`` (run earlier) only validates the
+    loophole code itself — it doesn't tell us whether the per-jail
+    daemon actually spawned, stayed up, and is currently accepting
+    connections.  Without this probe, a daemon that crash-loops on
+    startup (e.g. broker can't find openssl) shows ``self-check ok``
+    while every jail's broker is dead.
+    """
+    if os.environ.get("YOLO_VERSION") is not None:
+        return  # inside jail — host sockets aren't reachable
+    try:
+        entries = _loopholes.validate_loopholes()
+    except Exception:
+        return
+    externals = [
+        lp
+        for _, lp, err in entries
+        if lp is not None
+        and not err
+        and lp.enabled
+        and lp.requirements_met
+        and lp.lifecycle == "external"
+        and lp.host_daemon is not None
+    ]
+    if not externals:
+        return
+    detected_runtime = _detect_runtime_for_listing()
+    if detected_runtime is None:
+        return
+    try:
+        result = subprocess.run(
+            [
+                detected_runtime,
+                "ps",
+                "--filter",
+                "name=^yolo-",
+                "--format",
+                "{{.Names}}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return
+    cnames = [c.strip() for c in result.stdout.splitlines() if c.strip()]
+    if not cnames:
+        return
+    for cname in cnames:
+        sockets_dir = _host_service_sockets_dir(cname)
+        for lp in externals:
+            sock_path = sockets_dir / f"{lp.name}.sock"
+            label = f"loophole {lp.name} @ {cname}"
+            if not sock_path.exists():
+                fail(
+                    f"{label}: no socket",
+                    f"Expected {sock_path}.  Daemon never started or "
+                    f"crashed at spawn.  Tail "
+                    f"~/.local/share/yolo-jail/logs/host-service-{lp.name}.log "
+                    f"for the reason; restart the jail to respawn.",
+                )
+                continue
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                s.settimeout(2.0)
+                s.connect(str(sock_path))
+                ok(f"{label}: socket accepting")
+            except (OSError, socket.timeout) as e:
+                fail(
+                    f"{label}: socket dead",
+                    f"connect({sock_path}) failed: {e}.  "
+                    f"Daemon process likely exited; restart the jail.",
+                )
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+
+
+def _detect_runtime_for_listing() -> Optional[str]:
+    """Best-effort runtime discovery for read-only doctor probes."""
+    for r in ("podman", "docker"):
+        if shutil.which(r):
+            return r
+    return None
+
+
 @app.command()
 def check(
     build: bool = typer.Option(
@@ -5650,6 +5740,16 @@ def check(
 
     console.print("[bold]Loopholes[/bold]")
     _check_loopholes(ok, warn, fail)
+    console.print()
+
+    # --- Per-jail host-service liveness ---
+    #
+    # Loophole self-checks are static (binary present, config parses).
+    # They don't catch the case where the per-jail daemon was spawned
+    # but immediately crashed.  This probe connects to each running
+    # jail's host-service socket and reports any that aren't listening.
+    console.print("[bold]Per-jail host-service liveness[/bold]")
+    _check_host_service_liveness(ok, warn, fail)
     console.print()
 
     # --- Disk usage (nudges toward `yolo prune` when large) ---
