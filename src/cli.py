@@ -4916,13 +4916,14 @@ def _check_host_service_liveness(ok, warn, fail) -> None:
         and not err
         and lp.enabled
         and lp.requirements_met
-        and lp.lifecycle == "external"
         and lp.host_daemon is not None
     ]
     if not externals:
+        ok("no host-side daemons to probe")
         return
     detected_runtime = _detect_runtime_for_listing()
     if detected_runtime is None:
+        warn("no container runtime found — skipping liveness probe")
         return
     try:
         result = subprocess.run(
@@ -4938,10 +4939,12 @@ def _check_host_service_liveness(ok, warn, fail) -> None:
             text=True,
             timeout=5,
         )
-    except Exception:
+    except Exception as e:
+        warn(f"could not list containers: {e}")
         return
     cnames = [c.strip() for c in result.stdout.splitlines() if c.strip()]
     if not cnames:
+        ok("no jails running — nothing to probe")
         return
     for cname in cnames:
         sockets_dir = _host_service_sockets_dir(cname)
