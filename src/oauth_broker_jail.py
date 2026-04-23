@@ -11,9 +11,12 @@ For ``POST /v1/oauth/token`` with ``grant_type=refresh_token``:
 forward the refresh to the host-side broker over the loophole's Unix
 socket (the flock + single-writer lives there).  For any other
 ``/v1/oauth/token`` grant (``authorization_code`` from ``/login``,
-future PKCE exchanges, …) and for any other path: reverse-proxy to
-the real ``platform.claude.com``.  The broker only exists to
-serialize refreshes — all other flows pass through unchanged.
+future PKCE exchanges, …) and for any other path: ship the request
+over the same socket with ``action=proxy`` and let the host broker
+call the real ``platform.claude.com``.  We can't dial the upstream
+ourselves — ``--add-host`` maps the hostname back to this daemon, so
+a direct ``urllib.urlopen`` loops.  The host has normal DNS, so it
+does the upstream call and returns the response bytes to us.
 
 No privileged host ports, no host-side firewall changes, no tampering
 with the jail's ambient caps.  Binding :443 inside a container is
@@ -27,6 +30,7 @@ Files come from the bind-mounted loophole directory:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -34,8 +38,6 @@ import socket
 import ssl
 import struct
 import sys
-import urllib.error
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -116,33 +118,56 @@ def ask_host_broker(socket_path: str, request: Dict[str, Any]) -> Dict[str, Any]
         raise RuntimeError(f"host broker returned non-JSON: {e}") from e
 
 
-# --- Reverse proxy for non-OAuth paths --------------------------------------
+# --- Reverse proxy for non-refresh traffic ----------------------------------
+#
+# We cannot dial ``platform.claude.com`` from inside the jail directly: the
+# ``--add-host`` that makes Claude Code's TLS land here also makes our own
+# outbound urllib call resolve back to 127.0.0.1 → us, in a loop.  The host
+# broker has normal DNS, so we ship the request over the existing Unix
+# socket and let the host do the upstream call.
 
 
 def _proxy_upstream(
-    method: str, path: str, headers: Dict[str, str], body: bytes
+    host_socket_path: str,
+    method: str,
+    path: str,
+    headers: Dict[str, str],
+    body: bytes,
 ) -> Tuple[int, Dict[str, str], bytes]:
-    url = f"https://{UPSTREAM_HOST}{path}"
-    fwd_headers = {
-        k: v
-        for k, v in headers.items()
-        if k.lower() not in {"host", "connection", "content-length"}
+    request = {
+        "action": "proxy",
+        "method": method,
+        "path": path,
+        "headers": headers,
+        "body_b64": base64.b64encode(body).decode("ascii") if body else "",
     }
-    req = urllib.request.Request(
-        url, data=body or None, method=method, headers=fwd_headers
-    )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, {k: v for k, v in resp.headers.items()}, resp.read()
-    except urllib.error.HTTPError as e:
-        return e.code, {"Content-Type": "application/json"}, e.read()
-    except (urllib.error.URLError, OSError) as e:
-        log.error("proxy upstream error: %s", e)
+        resp = ask_host_broker(host_socket_path, request)
+    except RuntimeError as e:
+        log.error("proxy via host broker failed: %s", e)
         return (
             502,
             {"Content-Type": "application/json"},
-            json.dumps({"error": "upstream_unreachable"}).encode(),
+            json.dumps({"error": "broker_unavailable", "detail": str(e)}).encode(),
         )
+    if "error" in resp:
+        return (
+            502,
+            {"Content-Type": "application/json"},
+            json.dumps(resp).encode(),
+        )
+    try:
+        status = int(resp["status"])
+        resp_headers = {str(k): str(v) for k, v in (resp.get("headers") or {}).items()}
+        resp_body = base64.b64decode((resp.get("body_b64") or "").encode("ascii"))
+    except (KeyError, TypeError, ValueError) as e:
+        log.error("malformed proxy response from host broker: %s (resp=%r)", e, resp)
+        return (
+            502,
+            {"Content-Type": "application/json"},
+            json.dumps({"error": "broker_bad_response", "detail": str(e)}).encode(),
+        )
+    return status, resp_headers, resp_body
 
 
 # --- HTTP handler ------------------------------------------------------------
@@ -222,7 +247,11 @@ class _JailBrokerHandler(BaseHTTPRequestHandler):
             return
 
         status, headers, resp_body = _proxy_upstream(
-            self.command, self.path, dict(self.headers), body
+            self.host_socket_path,
+            self.command,
+            self.path,
+            dict(self.headers),
+            body,
         )
         self._send(status, resp_body, headers)
 

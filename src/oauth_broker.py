@@ -26,6 +26,7 @@ itself is a pure refresh service.
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import json
 import logging
@@ -398,7 +399,102 @@ def do_refresh(
         return _as_oauth_response(new_oauth)
 
 
+# --- Upstream HTTP proxy (for non-refresh traffic) --------------------------
+
+# Hop-by-hop headers we strip on both legs — never forward these upstream and
+# never echo them back to the jail.  ``content-length`` is recomputed.
+_HOP_BY_HOP = frozenset(
+    {
+        "host",
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+    }
+)
+
+
+def do_proxy(
+    method: str, path: str, headers: Dict[str, str], body: bytes
+) -> Dict[str, Any]:
+    """Forward a request to the real ``platform.claude.com``.
+
+    Exists because the jail-side terminator cannot dial the real upstream
+    itself — ``--add-host platform.claude.com:127.0.0.1`` routes the
+    hostname back to the terminator in a loop.  The host broker has
+    normal DNS, so it's the natural place to do the upstream request.
+
+    Returns either ``{status, headers, body_b64}`` on any HTTP response
+    (including 4xx/5xx from upstream, which pass through verbatim) or
+    ``{error, message}`` on transport-level failure.
+    """
+    if not path.startswith("/"):
+        return {"error": "bad_path", "message": f"path must start with '/': {path!r}"}
+    url = f"https://{UPSTREAM_HOST}{path}"
+    fwd_headers = {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
+    req = urllib.request.Request(
+        url, data=body or None, method=method, headers=fwd_headers
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp_status = resp.status
+            resp_headers = {
+                k: v for k, v in resp.headers.items() if k.lower() not in _HOP_BY_HOP
+            }
+            resp_body = resp.read()
+    except urllib.error.HTTPError as e:
+        resp_status = e.code
+        resp_headers = {
+            k: v for k, v in e.headers.items() if k.lower() not in _HOP_BY_HOP
+        }
+        resp_body = e.read()
+    except (urllib.error.URLError, OSError) as e:
+        log.error("proxy upstream error for %s %s: %s", method, path, e)
+        return {"error": "upstream_unreachable", "message": str(e)}
+    return {
+        "status": resp_status,
+        "headers": resp_headers,
+        "body_b64": base64.b64encode(resp_body).decode("ascii"),
+    }
+
+
 # --- host_service handler ---------------------------------------------------
+
+
+def _decode_proxy_request(req: Dict[str, Any]) -> "Dict[str, Any] | str":
+    """Validate a proxy request; return kwargs for ``do_proxy`` or an error
+    message string."""
+    method = req.get("method")
+    path = req.get("path")
+    headers = req.get("headers") or {}
+    body_b64 = req.get("body_b64") or ""
+    if not isinstance(method, str) or not method:
+        return "proxy: missing/invalid 'method'"
+    if not isinstance(path, str) or not path:
+        return "proxy: missing/invalid 'path'"
+    if not isinstance(headers, dict):
+        return "proxy: 'headers' must be an object"
+    if not isinstance(body_b64, str):
+        return "proxy: 'body_b64' must be a string"
+    try:
+        body = (
+            base64.b64decode(body_b64.encode("ascii"), validate=True)
+            if body_b64
+            else b""
+        )
+    except (ValueError, UnicodeEncodeError) as e:
+        return f"proxy: invalid base64 body: {e}"
+    return {
+        "method": method,
+        "path": path,
+        "headers": {str(k): str(v) for k, v in headers.items()},
+        "body": body,
+    }
 
 
 def build_handler(creds_path: Path, host_creds_path: Optional[Path] = None):
@@ -414,6 +510,13 @@ def build_handler(creds_path: Path, host_creds_path: Optional[Path] = None):
                 session.json({"error": "no_cached_token"})
             else:
                 session.json(_as_oauth_response(cached))
+            return
+        if action == "proxy":
+            decoded = _decode_proxy_request(req)
+            if isinstance(decoded, str):
+                session.json({"error": "bad_request", "message": decoded})
+                return
+            session.json(do_proxy(**decoded))
             return
         session.stderr(f"unknown action: {action!r}\n")
         session.exit(2)

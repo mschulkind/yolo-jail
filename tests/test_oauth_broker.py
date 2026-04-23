@@ -2,14 +2,18 @@
 
 Post-split architecture: the broker no longer terminates TLS or binds a
 TCP port.  It exposes a handler-via-host_service over a Unix socket.
-Tests here cover the refresh flow, CA generation, and self-check.
+Tests here cover the refresh flow, the generic upstream-proxy action
+(for ``/login`` traffic the jail can't dial directly), CA generation,
+and self-check.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import shutil
 import time
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -259,6 +263,160 @@ def test_do_refresh_returns_error_dict_when_no_refresh_token(
     )
     resp = oauth_broker.do_refresh(creds)
     assert resp.get("error") == "no_refresh_token"
+
+
+# ---------------------------------------------------------------------------
+# do_proxy — generic upstream proxy (used for /login and future non-refresh
+# paths the jail can't dial directly because of the --add-host loop)
+# ---------------------------------------------------------------------------
+
+
+class _FakeResp:
+    def __init__(self, status: int, headers: dict, body: bytes):
+        self.status = status
+        self.headers = headers
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+def test_do_proxy_forwards_request_and_returns_b64_body(monkeypatch):
+    captured: dict = {}
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        captured["method"] = req.get_method()
+        captured["headers"] = dict(req.header_items())
+        captured["data"] = req.data
+        return _FakeResp(
+            200,
+            {"Content-Type": "application/json", "X-Trace": "abc"},
+            b'{"access_token":"tok"}',
+        )
+
+    monkeypatch.setattr(oauth_broker.urllib.request, "urlopen", fake_urlopen)
+    out = oauth_broker.do_proxy(
+        "POST",
+        "/v1/oauth/token",
+        {"Content-Type": "application/json", "anthropic-beta": "oauth-2025-04-20"},
+        b'{"grant_type":"authorization_code","code":"xyz"}',
+    )
+    assert captured["url"] == "https://platform.claude.com/v1/oauth/token"
+    assert captured["method"] == "POST"
+    assert captured["data"] == b'{"grant_type":"authorization_code","code":"xyz"}'
+    # urllib title-cases header names on ``header_items()`` — match case-insensitively.
+    hdrs_lower = {k.lower(): v for k, v in captured["headers"].items()}
+    assert hdrs_lower["content-type"] == "application/json"
+    assert hdrs_lower["anthropic-beta"] == "oauth-2025-04-20"
+    assert out["status"] == 200
+    # Hop-by-hop headers must not leak in the response.
+    assert "Content-Type" in out["headers"]
+    assert base64.b64decode(out["body_b64"]) == b'{"access_token":"tok"}'
+
+
+def test_do_proxy_strips_hop_by_hop_headers_on_request(monkeypatch):
+    captured: dict = {}
+
+    def fake_urlopen(req, timeout):
+        captured["headers"] = {k.lower(): v for k, v in req.header_items()}
+        return _FakeResp(200, {}, b"")
+
+    monkeypatch.setattr(oauth_broker.urllib.request, "urlopen", fake_urlopen)
+    oauth_broker.do_proxy(
+        "POST",
+        "/v1/oauth/token",
+        {
+            "Host": "platform.claude.com",  # stripped; urllib sets Host from URL
+            "Connection": "keep-alive",  # hop-by-hop
+            "Content-Length": "42",  # recomputed
+            "X-Keep": "me",
+        },
+        b"",
+    )
+    assert "host" not in captured["headers"]
+    assert "connection" not in captured["headers"]
+    assert "content-length" not in captured["headers"]
+    assert captured["headers"].get("x-keep") == "me"
+
+
+def test_do_proxy_passes_through_http_error_as_status(monkeypatch):
+    """Upstream 4xx must surface verbatim — not become a 502 — so Claude
+    Code sees the real error (e.g. ``invalid_grant``) instead of a
+    broker-manufactured one."""
+    import io
+
+    def fake_urlopen(_req, timeout):
+        raise urllib.error.HTTPError(
+            url="https://platform.claude.com/v1/oauth/token",
+            code=400,
+            msg="Bad Request",
+            hdrs={"Content-Type": "application/json"},
+            fp=io.BytesIO(b'{"error":"invalid_grant"}'),
+        )
+
+    monkeypatch.setattr(oauth_broker.urllib.request, "urlopen", fake_urlopen)
+    out = oauth_broker.do_proxy(
+        "POST",
+        "/v1/oauth/token",
+        {"Content-Type": "application/json"},
+        b'{"grant_type":"authorization_code","code":"bad"}',
+    )
+    assert out["status"] == 400
+    assert base64.b64decode(out["body_b64"]) == b'{"error":"invalid_grant"}'
+
+
+def test_do_proxy_returns_error_dict_on_network_failure(monkeypatch):
+    def fake_urlopen(_req, timeout):
+        raise urllib.error.URLError("dns failure")
+
+    monkeypatch.setattr(oauth_broker.urllib.request, "urlopen", fake_urlopen)
+    out = oauth_broker.do_proxy("GET", "/whatever", {}, b"")
+    assert out.get("error") == "upstream_unreachable"
+    assert "dns failure" in out.get("message", "")
+
+
+def test_do_proxy_rejects_path_without_leading_slash():
+    """Defensive — a relative path would make ``https://host + path``
+    collapse into a different URL."""
+    out = oauth_broker.do_proxy("GET", "v1/oauth/token", {}, b"")
+    assert out.get("error") == "bad_path"
+
+
+def test_decode_proxy_request_validates_shape():
+    ok = oauth_broker._decode_proxy_request(
+        {
+            "action": "proxy",
+            "method": "POST",
+            "path": "/v1/oauth/token",
+            "headers": {"Content-Type": "application/json"},
+            "body_b64": base64.b64encode(b"hi").decode(),
+        }
+    )
+    assert isinstance(ok, dict)
+    assert ok["method"] == "POST"
+    assert ok["body"] == b"hi"
+
+    assert isinstance(oauth_broker._decode_proxy_request({"path": "/x"}), str)
+    assert isinstance(oauth_broker._decode_proxy_request({"method": "GET"}), str)
+    assert isinstance(
+        oauth_broker._decode_proxy_request(
+            {"method": "POST", "path": "/x", "headers": "not-a-dict"}
+        ),
+        str,
+    )
+    assert isinstance(
+        oauth_broker._decode_proxy_request(
+            {"method": "POST", "path": "/x", "body_b64": "!!not-base64!!"}
+        ),
+        str,
+    )
 
 
 # ---------------------------------------------------------------------------
