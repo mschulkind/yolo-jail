@@ -830,13 +830,28 @@ class TestClaudeConfig:
         assert "mcpServers" not in settings
 
     def test_yolo_mode_default(self, jail_home):
-        """settings.json has allow-all rules with acceptEdits mode (root-safe)."""
+        """settings.json has allow-all rules with acceptEdits mode.
+
+        Claude Code's permission matcher treats a bare tool name like
+        ``"Bash"`` as "match the Bash tool with no pattern" — which
+        never matches any real invocation, so every ``Bash(...)`` call
+        still prompts.  The allow-all form needs the wildcard pattern:
+        ``Bash(*)``.  Same for other tools that take arguments (Edit,
+        Read, WebFetch).  Was blocking /voice, /usage, and generic
+        bash commands inside jails — see screenshots 2026-04-22."""
         entrypoint.configure_claude()
         cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
         perms = cfg["permissions"]
-        assert "Bash" in perms["allow"]
-        assert "Edit" in perms["allow"]
-        assert "Read" in perms["allow"]
+        # Wildcard pattern — not bare tool name.
+        assert "Bash(*)" in perms["allow"]
+        assert "Edit(*)" in perms["allow"]
+        assert "Read(*)" in perms["allow"]
+        assert "WebFetch(*)" in perms["allow"]
+        # Bare tool names are inert; ensure we aren't shipping them.
+        assert "Bash" not in perms["allow"]
+        assert "Edit" not in perms["allow"]
+        assert "Read" not in perms["allow"]
+        assert "WebFetch" not in perms["allow"]
         # mcp__* is NOT a valid rule — see test_mcp_per_server_rules below.
         assert "mcp__*" not in perms["allow"]
         assert perms["defaultMode"] == "acceptEdits"
@@ -933,7 +948,7 @@ class TestClaudeConfig:
         entrypoint.configure_claude()
         cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
         assert cfg["myCustomKey"] is True
-        assert "Bash" in cfg["permissions"]["allow"]
+        assert "Bash(*)" in cfg["permissions"]["allow"]
 
     def test_preserves_existing_claude_json(self, jail_home):
         """configure_claude merges MCP into existing ~/.claude.json."""
@@ -952,7 +967,7 @@ class TestClaudeConfig:
         (entrypoint.CLAUDE_DIR / "settings.json").write_text("not json{{{")
         entrypoint.configure_claude()  # should not raise
         cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
-        assert "Bash" in cfg["permissions"]["allow"]
+        assert "Bash(*)" in cfg["permissions"]["allow"]
 
     def test_migrates_bypass_permissions(self, jail_home):
         """Existing bypassPermissions is replaced with acceptEdits."""
@@ -962,7 +977,7 @@ class TestClaudeConfig:
         entrypoint.configure_claude()
         cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
         assert cfg["permissions"]["defaultMode"] == "acceptEdits"
-        assert "Bash" in cfg["permissions"]["allow"]
+        assert "Bash(*)" in cfg["permissions"]["allow"]
         assert cfg["skipDangerousModePermissionPrompt"] is True
 
     def test_removes_stale_mcp_from_settings(self, jail_home):

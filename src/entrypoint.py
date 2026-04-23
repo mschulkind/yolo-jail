@@ -1312,11 +1312,17 @@ def configure_claude():
         mcp_allow_rules = [f"mcp__{name}" for name in sorted(configured_servers)]
 
         permissions = settings.setdefault("permissions", {})
+        # Wildcard pattern (Tool(*)) is required — bare tool names
+        # like "Bash" match "the Bash tool with no pattern", which
+        # doesn't match any real invocation, so every Bash(...) call
+        # falls through to the prompt.  Claude Code's matcher only
+        # pattern-compares rules with parentheses, so we have to
+        # provide the universal pattern explicitly.
         permissions["allow"] = [
-            "Bash",
-            "Edit",
-            "Read",
-            "WebFetch",
+            "Bash(*)",
+            "Edit(*)",
+            "Read(*)",
+            "WebFetch(*)",
             *mcp_allow_rules,
             "Agent(*)",
         ]
