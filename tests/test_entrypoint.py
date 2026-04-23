@@ -1863,3 +1863,110 @@ class TestMainFunction:
         with patch("subprocess.run"):
             entrypoint.main()
         mock_exec.assert_called_once()
+
+
+# -- jail_daemon_supervisor single-instance gate --
+
+
+class TestSupervisorSingleInstance:
+    """``start_jail_daemon_supervisor`` must be idempotent across repeated
+    entrypoint invocations.  Root cause of duplicated supervisors (see
+    handover follow-up #3): entrypoint.main() runs on every ``podman
+    exec yolo-entrypoint <cmd>``, calling us; each extra supervisor
+    forks a fresh oauth_broker_jail that tries to bind :443 and
+    crashloops with EADDRINUSE.  Guard with a PID file + liveness
+    probe so re-entrant exec calls observe the existing supervisor and
+    no-op."""
+
+    def _set_daemons_env(self, monkeypatch):
+        """Supervisor is only spawned when YOLO_JAIL_DAEMONS is non-empty."""
+        monkeypatch.setenv(
+            "YOLO_JAIL_DAEMONS",
+            '[{"name":"x","cmd":["/bin/true"],"restart":"no"}]',
+        )
+
+    def test_first_call_spawns_supervisor(self, jail_home, monkeypatch, tmp_path):
+        self._set_daemons_env(monkeypatch)
+        monkeypatch.setattr(entrypoint, "SUPERVISOR_PID_FILE", tmp_path / "sup.pid")
+
+        popen_called = {"n": 0}
+
+        class FakePopen:
+            def __init__(self, *a, **kw):
+                popen_called["n"] += 1
+                self.pid = 99999  # unlikely PID; kill(pid,0) will raise
+
+        monkeypatch.setattr(entrypoint.subprocess, "Popen", FakePopen)
+        entrypoint.start_jail_daemon_supervisor()
+        assert popen_called["n"] == 1
+        assert (tmp_path / "sup.pid").read_text().strip() == "99999"
+
+    def test_second_call_when_pidfile_points_at_live_process_skips(
+        self, jail_home, monkeypatch, tmp_path
+    ):
+        """If the PID file points at a live process, do nothing — this is
+        the re-entrant exec case that caused the duplication in the
+        first place."""
+        self._set_daemons_env(monkeypatch)
+        # os.getpid() is guaranteed-live — use it as "the running supervisor".
+        pid_file = tmp_path / "sup.pid"
+        pid_file.write_text(str(os.getpid()))
+        monkeypatch.setattr(entrypoint, "SUPERVISOR_PID_FILE", pid_file)
+
+        popen_called = {"n": 0}
+
+        class FakePopen:
+            def __init__(self, *a, **kw):
+                popen_called["n"] += 1
+                self.pid = 99999
+
+        monkeypatch.setattr(entrypoint.subprocess, "Popen", FakePopen)
+        entrypoint.start_jail_daemon_supervisor()
+        assert popen_called["n"] == 0
+
+    def test_stale_pidfile_triggers_respawn(self, jail_home, monkeypatch, tmp_path):
+        """A PID file left by a crashed / killed supervisor must not
+        pin us out of respawning.  Dead PIDs are detected via
+        ``os.kill(pid, 0)`` raising ProcessLookupError."""
+        self._set_daemons_env(monkeypatch)
+        pid_file = tmp_path / "sup.pid"
+        # PID 999999 is very unlikely to exist; test would be flaky if
+        # it did, so fake the liveness probe to be deterministic.
+        pid_file.write_text("999999")
+        monkeypatch.setattr(entrypoint, "SUPERVISOR_PID_FILE", pid_file)
+
+        def fake_kill(pid, sig):
+            raise ProcessLookupError("no such pid")
+
+        monkeypatch.setattr(entrypoint.os, "kill", fake_kill)
+
+        popen_called = {"n": 0}
+
+        class FakePopen:
+            def __init__(self, *a, **kw):
+                popen_called["n"] += 1
+                self.pid = 12345
+
+        monkeypatch.setattr(entrypoint.subprocess, "Popen", FakePopen)
+        entrypoint.start_jail_daemon_supervisor()
+        assert popen_called["n"] == 1
+        # PID file now points at the new supervisor.
+        assert pid_file.read_text().strip() == "12345"
+
+    def test_empty_jail_daemons_is_noop(self, jail_home, monkeypatch, tmp_path):
+        """YOLO_JAIL_DAEMONS empty/unset → still a no-op, unchanged from
+        the pre-guard behavior.  Guard must not add work for loopholes
+        with nothing to supervise."""
+        monkeypatch.delenv("YOLO_JAIL_DAEMONS", raising=False)
+        monkeypatch.setattr(entrypoint, "SUPERVISOR_PID_FILE", tmp_path / "sup.pid")
+
+        popen_called = {"n": 0}
+
+        class FakePopen:
+            def __init__(self, *a, **kw):
+                popen_called["n"] += 1
+
+        monkeypatch.setattr(entrypoint.subprocess, "Popen", FakePopen)
+        entrypoint.start_jail_daemon_supervisor()
+        assert popen_called["n"] == 0
+        assert not (tmp_path / "sup.pid").exists()

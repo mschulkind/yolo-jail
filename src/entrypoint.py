@@ -1826,23 +1826,61 @@ def setup_published_port_localnet():
             )
 
 
+# /tmp is a per-container tmpfs on both podman and docker, so a PID
+# file here is naturally scoped to this jail and evaporates on restart.
+# Serves as the single-instance lock for the supervisor: entrypoint.main()
+# re-runs on every ``podman exec yolo-entrypoint <cmd>``, and without
+# this guard each exec would fork another supervisor that tries to
+# bind the same port (:443 for the oauth broker) and crashloops on
+# EADDRINUSE.  See handover #3 for the full story.
+SUPERVISOR_PID_FILE = Path("/tmp/yolo-jail-supervisor.pid")
+
+
+def _supervisor_is_alive(pid_file: Path) -> bool:
+    """Read ``pid_file`` and return True iff the PID it names is still a
+    live process.  Missing/unreadable/corrupt file → False.  Signal 0
+    is the canonical Unix liveness probe — it permission-checks the
+    target but doesn't actually deliver anything."""
+    try:
+        pid = int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # PID exists but we can't signal it — still counts as alive
+        # for our purposes (don't spawn another).
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def start_jail_daemon_supervisor():
-    """Fork ``src.jail_daemon_supervisor`` as a detached child.
+    """Fork ``src.jail_daemon_supervisor`` as a detached child, once.
 
     The supervisor reads ``YOLO_JAIL_DAEMONS`` from the env and spawns
     each loophole-declared jail daemon with restart-on-failure
-    semantics.  Absent or empty env means nothing to do; this function
-    exits quickly in that case.
+    semantics.  Absent or empty env means nothing to do.
 
-    We launch it via ``python -m`` rather than a direct import + fork to
-    keep it out of the entrypoint's GC roots and allow it to evolve
-    independently.  The child inherits PID 1's env, including the
-    daemon list.
+    Guarded by a tmpfs PID file so repeated ``podman exec yolo-entrypoint``
+    calls (the way every ``yolo -- <cmd>`` after the first lands) don't
+    stack additional supervisors inside the same container.  Extras
+    would each try to bind the same loophole port and crashloop.
+
+    We launch via ``python -m`` rather than a direct import + fork to
+    keep the supervisor out of the entrypoint's GC roots and let it
+    evolve independently.  The child inherits PID 1's env, including
+    the daemon list.
     """
     if not os.environ.get("YOLO_JAIL_DAEMONS", "").strip():
         return
+    if _supervisor_is_alive(SUPERVISOR_PID_FILE):
+        return
     repo_root = os.environ.get("YOLO_REPO_ROOT", "/opt/yolo-jail")
-    subprocess.Popen(
+    proc = subprocess.Popen(
         [sys.executable, "-m", "src.jail_daemon_supervisor"],
         env={**os.environ, "PYTHONPATH": repo_root},
         stdout=subprocess.DEVNULL,
@@ -1850,6 +1888,12 @@ def start_jail_daemon_supervisor():
         close_fds=True,
         start_new_session=False,  # stay in the same process group as PID 1
     )
+    try:
+        SUPERVISOR_PID_FILE.write_text(f"{proc.pid}\n")
+    except OSError:
+        # Best-effort: losing the PID file just means a re-entrant
+        # exec may spawn a redundant supervisor.  Don't abort boot.
+        pass
 
 
 def generate_yolo_wrapper():
