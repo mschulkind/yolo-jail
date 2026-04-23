@@ -389,6 +389,73 @@ def test_do_proxy_rejects_path_without_leading_slash():
     assert out.get("error") == "bad_path"
 
 
+# ---------------------------------------------------------------------------
+# Upstream User-Agent — avoid Cloudflare bot-signature bans (error 1010)
+# ---------------------------------------------------------------------------
+
+
+def _captured_headers(monkeypatch) -> dict:
+    """Capture title-cased header items urllib would send upstream."""
+    captured: dict = {}
+
+    def fake_urlopen(req, timeout):
+        captured["headers"] = {k.lower(): v for k, v in req.header_items()}
+        return _FakeResp(
+            200,
+            {"Content-Type": "application/json"},
+            b'{"access_token":"t","refresh_token":"r","expires_in":3600}',
+        )
+
+    monkeypatch.setattr(oauth_broker.urllib.request, "urlopen", fake_urlopen)
+    return captured
+
+
+def test_refresh_upstream_sends_identifying_user_agent(monkeypatch):
+    """The default urllib User-Agent is ``Python-urllib/3.X``, which
+    Cloudflare's bot-signature layer blocks with error 1010.  That's
+    exactly what broke ``claude /voice`` refresh on 2026-04-22.  Send
+    a User-Agent that identifies us as the yolo-jail broker."""
+    captured = _captured_headers(monkeypatch)
+    oauth_broker._refresh_upstream("some-refresh-token")
+    ua = captured["headers"].get("user-agent", "")
+    assert ua, (
+        "broker must set a User-Agent (default Python-urllib/* trips Cloudflare 1010)"
+    )
+    assert not ua.lower().startswith("python-"), (
+        f"broker User-Agent {ua!r} still looks like the default urllib UA"
+    )
+
+
+def test_do_proxy_sends_identifying_user_agent_when_none_supplied(monkeypatch):
+    """Same vector via the /login passthrough path.  If the client
+    didn't send a User-Agent (or stripped ours), we must still send
+    something non-default — otherwise Cloudflare blocks the proxied
+    /v1/oauth/token call the same way."""
+    captured = _captured_headers(monkeypatch)
+    oauth_broker.do_proxy(
+        "POST",
+        "/v1/oauth/token",
+        {"Content-Type": "application/json"},  # no UA
+        b'{"grant_type":"authorization_code","code":"x"}',
+    )
+    ua = captured["headers"].get("user-agent", "")
+    assert ua
+    assert not ua.lower().startswith("python-")
+
+
+def test_do_proxy_preserves_caller_supplied_user_agent(monkeypatch):
+    """If the caller (Claude Code) sent a User-Agent, pass it through
+    verbatim — don't clobber a real browser-style UA with our fallback."""
+    captured = _captured_headers(monkeypatch)
+    oauth_broker.do_proxy(
+        "POST",
+        "/v1/oauth/token",
+        {"Content-Type": "application/json", "User-Agent": "claude-cli/2.1.101"},
+        b"{}",
+    )
+    assert captured["headers"]["user-agent"] == "claude-cli/2.1.101"
+
+
 def test_decode_proxy_request_validates_shape():
     ok = oauth_broker._decode_proxy_request(
         {

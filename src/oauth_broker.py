@@ -69,6 +69,25 @@ TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 OAUTH_BETA_HEADER = "oauth-2025-04-20"
 
+
+# Cloudflare's bot-signature filter on platform.claude.com returns
+# HTTP 403 with body ``error code: 1010`` for the default
+# ``Python-urllib/<ver>`` User-Agent.  Any non-default UA we've tested
+# passes; identifying ourselves honestly also makes Anthropic-side
+# log forensics sane.  We try to get the installed yolo-jail version
+# from package metadata but fall back to an unversioned string if
+# we're running from source or the wheel metadata is unreadable.
+def _broker_user_agent() -> str:
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        return f"yolo-jail-oauth-broker/{_pkg_version('yolo-jail')}"
+    except Exception:
+        return "yolo-jail-oauth-broker"
+
+
+USER_AGENT = _broker_user_agent()
+
 # Shared credentials file — lives in the directory-mounted shared
 # credentials dir so Claude Code's atomic writer (tmp+rename) works.
 DEFAULT_CREDS_PATH = (
@@ -272,6 +291,9 @@ def _refresh_upstream(refresh_token: str) -> Dict[str, Any]:
         headers={
             "Content-Type": "application/json",
             "anthropic-beta": OAUTH_BETA_HEADER,
+            # Cloudflare bot-filter blocks Python-urllib's default UA with
+            # error 1010.  See USER_AGENT definition up top.
+            "User-Agent": USER_AGENT,
         },
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
@@ -437,6 +459,12 @@ def do_proxy(
         return {"error": "bad_path", "message": f"path must start with '/': {path!r}"}
     url = f"https://{UPSTREAM_HOST}{path}"
     fwd_headers = {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
+    # If the caller (Claude Code) already sent a User-Agent, pass it
+    # through verbatim — that's the most authentic request.  Otherwise
+    # identify ourselves; Python-urllib's default UA triggers Cloudflare
+    # 1010 on platform.claude.com.
+    if not any(k.lower() == "user-agent" for k in fwd_headers):
+        fwd_headers["User-Agent"] = USER_AGENT
     req = urllib.request.Request(
         url, data=body or None, method=method, headers=fwd_headers
     )
