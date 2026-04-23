@@ -724,6 +724,64 @@ class TestRunCommandInternals:
             assert "--yolo" in cmd_str
 
 
+class TestInjectAgentYoloFlags:
+    """``_inject_agent_yolo_flags`` mutates the command in place.  It's
+    the single source of truth for "did we make this agent actually
+    yolo" — testing it directly is faster and more robust than
+    exercising the entire ``yolo run`` attach path through CliRunner."""
+
+    def _inject(self, argv):
+        from cli import _inject_agent_yolo_flags
+
+        cmd = list(argv)
+        _inject_agent_yolo_flags(cmd)
+        return cmd
+
+    def test_claude_gets_dangerously_skip_permissions(self):
+        """YOLO mode is ``--dangerously-skip-permissions``.  The
+        settings.json allow-list that used to serve as "yolo" was
+        half-broken (bare ``"Bash"`` doesn't match invocations); the
+        flag bypasses the permission system entirely.  IS_SANDBOX=1
+        in the jail env suppresses the flag's own launch confirmation
+        so it runs cleanly."""
+        out = self._inject(["claude", "--continue"])
+        assert "--dangerously-skip-permissions" in out
+
+    def test_claude_flag_goes_before_user_args(self):
+        """Flag must land as argv[1] so the rest of the user's args
+        stay in order (Claude parses positional-like options)."""
+        out = self._inject(["claude", "-p", "hello"])
+        assert out[:2] == ["claude", "--dangerously-skip-permissions"]
+
+    def test_claude_does_not_duplicate_dangerously_flag(self):
+        """If the user happened to pass it themselves, don't duplicate
+        — Claude rejects the duplicate with a clear error."""
+        out = self._inject(["claude", "--dangerously-skip-permissions"])
+        assert out.count("--dangerously-skip-permissions") == 1
+
+    def test_non_claude_command_left_alone(self):
+        """Plain bash / ls / anything-else must not get the flag."""
+        for argv in (
+            ["bash", "-lc", "true"],
+            ["ls", "-la"],
+            ["python", "-c", "print(1)"],
+        ):
+            out = self._inject(argv)
+            assert "--dangerously-skip-permissions" not in out
+
+    def test_gemini_and_copilot_yolo_preserved(self):
+        """Regression-safety for the existing gemini/copilot behavior."""
+        assert "--yolo" in self._inject(["gemini"])
+        copilot = self._inject(["copilot"])
+        assert "--yolo" in copilot
+        assert "--no-auto-update" in copilot
+
+    def test_empty_command_no_crash(self):
+        """Defensive — empty list must be a no-op, not IndexError."""
+        out = self._inject([])
+        assert out == []
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Test: _resolve_repo_root (installed package path)
 # ═══════════════════════════════════════════════════════════════════════════════

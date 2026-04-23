@@ -1300,32 +1300,15 @@ def configure_claude():
         # skipDangerousModePermissionPrompt suppresses the one-time confirmation
         # Claude shows when defaultMode is first set in a workspace.
         #
-        # MCP rules: Claude's permission matcher (`w46` in the 2.1.x binary)
-        # uses strict equality on server name — there is NO glob matching.
-        # `"mcp__*"` parses via `Om()` to {serverName: "*", toolName: undefined}
-        # which then fails the `K.serverName === _.serverName` check against
-        # any real server.  We have to enumerate the configured servers and
-        # emit one `mcp__<name>` rule per server.  The rule with no
-        # double-underscore suffix matches ALL tools of that server because
-        # `Om("mcp__foo")` returns toolName=undefined, and the matcher accepts
-        # `K.toolName === void 0 || K.toolName === "*"` as "any tool".
-        mcp_allow_rules = [f"mcp__{name}" for name in sorted(configured_servers)]
-
         permissions = settings.setdefault("permissions", {})
-        # Wildcard pattern (Tool(*)) is required — bare tool names
-        # like "Bash" match "the Bash tool with no pattern", which
-        # doesn't match any real invocation, so every Bash(...) call
-        # falls through to the prompt.  Claude Code's matcher only
-        # pattern-compares rules with parentheses, so we have to
-        # provide the universal pattern explicitly.
-        permissions["allow"] = [
-            "Bash(*)",
-            "Edit(*)",
-            "Read(*)",
-            "WebFetch(*)",
-            *mcp_allow_rules,
-            "Agent(*)",
-        ]
+        # YOLO is ``--dangerously-skip-permissions`` on the CLI (cli.py
+        # injects it into claude invocations); the per-tool allow-list
+        # that used to live here was fragile and half-broken for weeks.
+        # We set ``acceptEdits`` + ``additionalDirectories=["/"]`` as a
+        # defence-in-depth fallback so dropping the flag degrades to
+        # "prompt for non-edit bash/web" rather than "prompt for
+        # everything", but the real policy is the flag.
+        permissions["allow"] = []
         permissions["deny"] = []
         permissions["defaultMode"] = "acceptEdits"
         # Pre-authorize reads everywhere. The jail container is the security

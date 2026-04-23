@@ -830,77 +830,54 @@ class TestClaudeConfig:
         assert "mcpServers" not in settings
 
     def test_yolo_mode_default(self, jail_home):
-        """settings.json has allow-all rules with acceptEdits mode.
+        """settings.json is intentionally minimal — actual YOLO comes
+        from cli.py injecting ``--dangerously-skip-permissions`` into
+        the claude command.  That flag bypasses the permission system
+        entirely, so maintaining a per-tool allow-list here was both
+        redundant and fragile (we kept missing new tools + new MCP
+        servers).  What remains is defensive: ``acceptEdits`` default
+        mode and ``additionalDirectories=["/"]`` so *if* the flag is
+        ever dropped the jail still fails relatively open rather than
+        prompting for everything.
 
-        Claude Code's permission matcher treats a bare tool name like
-        ``"Bash"`` as "match the Bash tool with no pattern" — which
-        never matches any real invocation, so every ``Bash(...)`` call
-        still prompts.  The allow-all form needs the wildcard pattern:
-        ``Bash(*)``.  Same for other tools that take arguments (Edit,
-        Read, WebFetch).  Was blocking /voice, /usage, and generic
-        bash commands inside jails — see screenshots 2026-04-22."""
+        See handover bug 2026-04-22: bare ``Bash`` in the allow-list
+        was inert (pattern required), so our "yolo" was half-permissioned
+        for weeks.  The flag is the single source of truth now."""
         entrypoint.configure_claude()
         cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
         perms = cfg["permissions"]
-        # Wildcard pattern — not bare tool name.
-        assert "Bash(*)" in perms["allow"]
-        assert "Edit(*)" in perms["allow"]
-        assert "Read(*)" in perms["allow"]
-        assert "WebFetch(*)" in perms["allow"]
-        # Bare tool names are inert; ensure we aren't shipping them.
-        assert "Bash" not in perms["allow"]
-        assert "Edit" not in perms["allow"]
-        assert "Read" not in perms["allow"]
-        assert "WebFetch" not in perms["allow"]
-        # mcp__* is NOT a valid rule — see test_mcp_per_server_rules below.
-        assert "mcp__*" not in perms["allow"]
-        assert perms["defaultMode"] == "acceptEdits"
+        # Minimal safety net; real YOLO is the CLI flag.
+        assert perms.get("defaultMode") == "acceptEdits"
+        assert perms.get("additionalDirectories") == ["/"]
         assert cfg["skipDangerousModePermissionPrompt"] is True
-        # Pre-authorize reads everywhere. The jail is the security boundary;
-        # a per-directory allowlist was whack-a-mole (/ctx, /waykeeper-state,
-        # etc). "/" matches any path so yolo mode is actually yolo.
-        assert perms["additionalDirectories"] == ["/"]
+        # No fragile allow-list entries — the flag makes them irrelevant.
+        allow = perms.get("allow") or []
+        assert "Bash" not in allow, "bare-name rules are inert; drop them"
+        assert "Bash(*)" not in allow, (
+            "allow-list per-tool is irrelevant under --dangerously-skip-permissions"
+        )
+        assert "mcp__*" not in allow
 
-    def test_mcp_per_server_rules(self, jail_home, monkeypatch):
-        """One `mcp__<name>` rule per configured MCP server.
-
-        Claude's permission matcher does strict-equality server-name matching
-        (no glob support), so `"mcp__*"` never matches any real MCP tool call.
-        The entrypoint must enumerate the configured servers and emit one
-        explicit `mcp__<name>` rule per server.  The rule without a
-        double-underscore suffix matches all tools of that server because the
-        matcher treats `toolName === undefined` as "any tool".
-        """
+    def test_allow_list_is_empty_under_dangerously_skip_permissions(
+        self, jail_home, monkeypatch
+    ):
+        """Per-tool ``mcp__<name>`` / ``Bash(*)`` rules used to live
+        here to work around Claude's pattern matcher.  The flag makes
+        them all irrelevant — nothing checks the allow-list when
+        ``--dangerously-skip-permissions`` is on.  Keep the list empty
+        so a future reader doesn't have to read 20 lines of commentary
+        to understand whether the list matters."""
         monkeypatch.setenv(
             "YOLO_MCP_PRESETS",
             json.dumps(["chrome-devtools", "sequential-thinking"]),
         )
-        entrypoint.configure_claude()
-        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
-        allow = cfg["permissions"]["allow"]
-        # Explicit per-server rules for every preset
-        assert "mcp__chrome-devtools" in allow
-        assert "mcp__sequential-thinking" in allow
-        # And no bogus glob
-        assert "mcp__*" not in allow
-
-    def test_mcp_per_server_rules_with_workspace_override(self, jail_home, monkeypatch):
-        """Workspace-provided MCP servers also get explicit allow rules."""
         monkeypatch.setenv(
             "YOLO_MCP_SERVERS",
             json.dumps({"probe-mcp": {"command": "/workspace/probe-mcp.py"}}),
         )
         entrypoint.configure_claude()
         cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
-        assert "mcp__probe-mcp" in cfg["permissions"]["allow"]
-
-    def test_mcp_no_servers_no_mcp_rules(self, jail_home):
-        """With no MCP servers configured, allow list has no mcp__ rules."""
-        entrypoint.configure_claude()
-        cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
-        allow = cfg["permissions"]["allow"]
-        mcp_rules = [r for r in allow if r.startswith("mcp__")]
-        assert mcp_rules == []
+        assert cfg["permissions"]["allow"] == []
 
     def test_workspace_project_auto_approves_mcp(self, jail_home, monkeypatch):
         """The /workspace project entry has enableAllProjectMcpServers=True.
@@ -948,7 +925,7 @@ class TestClaudeConfig:
         entrypoint.configure_claude()
         cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
         assert cfg["myCustomKey"] is True
-        assert "Bash(*)" in cfg["permissions"]["allow"]
+        assert cfg["permissions"].get("defaultMode") == "acceptEdits"
 
     def test_preserves_existing_claude_json(self, jail_home):
         """configure_claude merges MCP into existing ~/.claude.json."""
@@ -967,7 +944,7 @@ class TestClaudeConfig:
         (entrypoint.CLAUDE_DIR / "settings.json").write_text("not json{{{")
         entrypoint.configure_claude()  # should not raise
         cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
-        assert "Bash(*)" in cfg["permissions"]["allow"]
+        assert cfg["permissions"].get("defaultMode") == "acceptEdits"
 
     def test_migrates_bypass_permissions(self, jail_home):
         """Existing bypassPermissions is replaced with acceptEdits."""
@@ -977,7 +954,7 @@ class TestClaudeConfig:
         entrypoint.configure_claude()
         cfg = json.loads((entrypoint.CLAUDE_DIR / "settings.json").read_text())
         assert cfg["permissions"]["defaultMode"] == "acceptEdits"
-        assert "Bash(*)" in cfg["permissions"]["allow"]
+        assert cfg["permissions"].get("defaultMode") == "acceptEdits"
         assert cfg["skipDangerousModePermissionPrompt"] is True
 
     def test_removes_stale_mcp_from_settings(self, jail_home):

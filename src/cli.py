@@ -5878,6 +5878,37 @@ def _check_config_changes(workspace: Path, config: Dict[str, Any]) -> bool:
     return False
 
 
+def _inject_agent_yolo_flags(full_command: "list[str]") -> None:
+    """Mutate ``full_command`` in place to inject agent-specific YOLO
+    flags based on the leading binary name.
+
+    - ``gemini``: prepend ``--yolo`` (unless the user passed ``-y`` /
+      ``--yolo`` themselves).
+    - ``copilot``: prepend ``--yolo`` AND ``--no-auto-update`` on the
+      same no-duplicate basis.
+    - ``claude``: prepend ``--dangerously-skip-permissions``.  The
+      settings.json allow-list that used to serve as YOLO was
+      half-broken for weeks (bare ``"Bash"`` is inert, Claude Code's
+      matcher needs a pattern).  The flag is the single source of
+      truth; ``IS_SANDBOX=1`` in the jail env already suppresses the
+      flag's own confirmation prompt.
+
+    All other commands are left alone.
+    """
+    if not full_command:
+        return
+    head = full_command[0]
+    if head in ("gemini", "copilot"):
+        if "--yolo" not in full_command and "-y" not in full_command:
+            full_command.insert(1, "--yolo")
+    if head == "copilot":
+        if "--no-auto-update" not in full_command:
+            full_command.insert(1, "--no-auto-update")
+    if head == "claude":
+        if "--dangerously-skip-permissions" not in full_command:
+            full_command.insert(1, "--dangerously-skip-permissions")
+
+
 @app.command(
     context_settings={"allow_extra_args": True, "ignore_unknown_options": True}
 )
@@ -5938,17 +5969,7 @@ def run(
 
     target_cmd = "bash"
     if full_command:
-        # If calling gemini or copilot, inject --yolo
-        if full_command[0] in ["gemini", "copilot"]:
-            if "--yolo" not in full_command and "-y" not in full_command:
-                full_command.insert(1, "--yolo")
-        if full_command[0] == "copilot":
-            if "--no-auto-update" not in full_command:
-                full_command.insert(1, "--no-auto-update")
-        # Claude YOLO mode: settings.json already grants full permissions via
-        # the "allow" list.  Do NOT inject --dangerously-skip-permissions — it
-        # shows its own confirmation prompt and refuses to run as UID 0.
-        # (IS_SANDBOX=1 bypasses the root check, but the prompt is still annoying.)
+        _inject_agent_yolo_flags(full_command)
         target_cmd = shlex.join(full_command)
 
     # Collect identity env vars early — needed for both exec and run paths
