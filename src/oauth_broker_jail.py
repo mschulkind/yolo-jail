@@ -224,15 +224,24 @@ class _JailBrokerHandler(BaseHTTPRequestHandler):
 
     def _handle(self) -> None:
         body = self._read_body()
-        if (
-            self.command == "POST"
-            and self.path.startswith("/v1/oauth/token")
-            and _is_refresh_grant(body)
-        ):
+        ua = self.headers.get("User-Agent", "-")
+        is_token_path = self.command == "POST" and self.path.startswith(
+            "/v1/oauth/token"
+        )
+        is_refresh = is_token_path and _is_refresh_grant(body)
+        log.info(
+            "request: %s %s body_len=%d is_refresh=%s ua=%r",
+            self.command,
+            self.path,
+            len(body),
+            is_refresh,
+            ua,
+        )
+        if is_refresh:
             try:
                 resp = ask_host_broker(self.host_socket_path, {"action": "refresh"})
             except RuntimeError as e:
-                log.error("host broker error: %s", e)
+                log.error("refresh: host broker error: %s", e)
                 self._send(
                     502,
                     json.dumps(
@@ -241,8 +250,17 @@ class _JailBrokerHandler(BaseHTTPRequestHandler):
                 )
                 return
             if "error" in resp:
+                log.warning(
+                    "refresh: broker returned error=%s (%s)",
+                    resp.get("error"),
+                    resp.get("message") or resp.get("body") or "",
+                )
                 self._send(400, json.dumps(resp).encode())
                 return
+            log.info(
+                "refresh: OK expires_in=%s",
+                resp.get("expires_in"),
+            )
             self._send(200, json.dumps(resp).encode())
             return
 
@@ -252,6 +270,13 @@ class _JailBrokerHandler(BaseHTTPRequestHandler):
             self.path,
             dict(self.headers),
             body,
+        )
+        log.info(
+            "proxy: %s %s -> %d body_len=%d",
+            self.command,
+            self.path,
+            status,
+            len(resp_body),
         )
         self._send(status, resp_body, headers)
 

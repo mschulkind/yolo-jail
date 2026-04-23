@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import base64
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -104,6 +105,49 @@ DEFAULT_HOST_CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
 
 
 log = logging.getLogger("oauth-broker-host")
+
+
+# --- Debug logging helpers --------------------------------------------------
+#
+# The shared-identity bug on 2026-04-23 — host Claude rotated the shared
+# refresh token out from under the broker — was invisible in the logs
+# because we only logged "cache miss" / "cache hit" without the *which*
+# token.  These helpers let us fingerprint tokens (non-reversibly; safe to
+# emit to the log file) so we can correlate rotations across processes and
+# notice when the shared file's refresh token diverges from what host
+# Claude believes it holds.
+
+
+def _token_fp(tok: Optional[str]) -> str:
+    """Stable 8-hex-char fingerprint of a token.  sha256 prefix — impossible
+    to reverse, but equal tokens share a fingerprint, so you can eyeball
+    rotations and cross-process consistency in the log."""
+    if not tok:
+        return "(none)"
+    return hashlib.sha256(tok.encode()).hexdigest()[:8]
+
+
+def _describe_creds(path: Path) -> str:
+    """One-line summary of a creds file for logging: mtime, access and
+    refresh token fingerprints, expiresAt.  Handles missing / unreadable /
+    malformed files without raising."""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return f"{path}: <absent>"
+    except OSError as e:
+        return f"{path}: stat_error={e}"
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        return f"{path}: mtime={int(st.st_mtime)} read_error={e}"
+    oa = data.get("claudeAiOauth") or {}
+    return (
+        f"{path}: mtime={int(st.st_mtime)} "
+        f"at={_token_fp(oa.get('accessToken'))} "
+        f"rt={_token_fp(oa.get('refreshToken'))} "
+        f"exp={oa.get('expiresAt')}"
+    )
 
 
 # --- CA + leaf cert generation ----------------------------------------------
@@ -316,15 +360,29 @@ def _mirror_to_host_if_same_identity(
     """If the host creds file shares ``old_refresh_token`` with the shared
     file, mirror the refreshed tokens into it so host Claude Code stays
     logged in.  Best-effort: missing/differing/unreadable host files are
-    fine — those cases mean independent identities or no host Claude."""
+    fine — those cases mean independent identities or no host Claude.
+
+    NB: this one-way mirror is the source of the 2026-04-23 incident —
+    host Claude's own refresh flow rotates ``old_refresh_token`` upstream
+    without telling us, so the shared file is left holding a dead token.
+    See ``.yolo/handover.md``; the planned fix is to stop mirroring
+    entirely and keep host & jail identities independent."""
     if not host_path.is_file():
+        log.info("mirror skip: host creds %s absent", host_path)
         return
     try:
         host_data = json.loads(host_path.read_text())
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as e:
+        log.info("mirror skip: host creds %s unreadable: %s", host_path, e)
         return
     host_oauth = host_data.get("claudeAiOauth") or {}
-    if host_oauth.get("refreshToken") != old_refresh_token:
+    host_rt = host_oauth.get("refreshToken")
+    if host_rt != old_refresh_token:
+        log.info(
+            "mirror skip: host_rt=%s != shared_old_rt=%s (different identity)",
+            _token_fp(host_rt),
+            _token_fp(old_refresh_token),
+        )
         return
     merged = dict(host_oauth)
     merged["accessToken"] = new_oauth["accessToken"]
@@ -340,7 +398,12 @@ def _mirror_to_host_if_same_identity(
             os.ftruncate(fd, len(blob))
         finally:
             os.close(fd)
-        log.info("mirrored refresh into host creds %s", host_path)
+        log.info(
+            "mirror done: host_path=%s rt %s -> %s",
+            host_path,
+            _token_fp(old_refresh_token),
+            _token_fp(new_oauth.get("refreshToken")),
+        )
     except OSError as e:
         log.warning("could not mirror into host creds %s: %s", host_path, e)
 
@@ -386,11 +449,23 @@ def do_refresh(
     there too — keeps a host-side Claude Code in sync.
     """
     REFRESH_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    # Pre-lock snapshot — logged regardless of what we end up doing, so
+    # tomorrow's debugger can reconstruct the state the broker saw when
+    # it was asked to refresh.  Most important: if shared_rt and host_rt
+    # differ, host Claude has rotated out-of-band and shared is stale.
+    log.info("do_refresh: shared=%s", _describe_creds(creds_path))
+    if host_creds_path is not None:
+        log.info("do_refresh: host  =%s", _describe_creds(host_creds_path))
     with open(REFRESH_LOCK, "w") as lockf:
         fcntl.flock(lockf, fcntl.LOCK_EX)
         cached = _cached_tokens(creds_path)
         if cached is not None:
-            log.info("cache hit")
+            log.info(
+                "cache hit: at=%s rt=%s exp=%s",
+                _token_fp(cached.get("accessToken")),
+                _token_fp(cached.get("refreshToken")),
+                cached.get("expiresAt"),
+            )
             return _as_oauth_response(cached)
 
         try:
@@ -400,14 +475,21 @@ def do_refresh(
             return {"error": "creds_unreadable", "message": str(e)}
         refresh_token = current.get("refreshToken")
         if not refresh_token:
+            log.error("no_refresh_token: shared creds missing refreshToken")
             return {"error": "no_refresh_token"}
 
-        log.info("cache miss: refreshing upstream")
+        log.info(
+            "cache miss: refreshing upstream with rt=%s (old_exp=%s)",
+            _token_fp(refresh_token),
+            current.get("expiresAt"),
+        )
         try:
             resp = _refresh_upstream(refresh_token)
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:200]
-            log.error("upstream %s: %s", e.code, body)
+            log.error(
+                "upstream %s for rt=%s: %s", e.code, _token_fp(refresh_token), body
+            )
             return {"error": "upstream_http", "status": e.code, "body": body}
         except (urllib.error.URLError, OSError) as e:
             log.error("upstream network error: %s", e)
@@ -415,9 +497,15 @@ def do_refresh(
 
         new_oauth = _normalize_oauth(resp, previous=current)
         _write_tokens(creds_path, new_oauth)
+        log.info(
+            "refreshed: rt %s -> %s, at -> %s, exp=%s",
+            _token_fp(refresh_token),
+            _token_fp(new_oauth.get("refreshToken")),
+            _token_fp(new_oauth.get("accessToken")),
+            new_oauth.get("expiresAt"),
+        )
         if host_creds_path is not None:
             _mirror_to_host_if_same_identity(host_creds_path, refresh_token, new_oauth)
-        log.info("refreshed; new expiresAt=%s", new_oauth.get("expiresAt"))
         return _as_oauth_response(new_oauth)
 
 
@@ -456,6 +544,7 @@ def do_proxy(
     ``{error, message}`` on transport-level failure.
     """
     if not path.startswith("/"):
+        log.warning("do_proxy rejected: bad path %r", path)
         return {"error": "bad_path", "message": f"path must start with '/': {path!r}"}
     url = f"https://{UPSTREAM_HOST}{path}"
     fwd_headers = {k: v for k, v in headers.items() if k.lower() not in _HOP_BY_HOP}
@@ -465,6 +554,13 @@ def do_proxy(
     # 1010 on platform.claude.com.
     if not any(k.lower() == "user-agent" for k in fwd_headers):
         fwd_headers["User-Agent"] = USER_AGENT
+    log.info(
+        "do_proxy -> %s %s body_len=%d ua=%r",
+        method,
+        path,
+        len(body or b""),
+        fwd_headers.get("User-Agent", "(none)"),
+    )
     req = urllib.request.Request(
         url, data=body or None, method=method, headers=fwd_headers
     )
@@ -484,6 +580,13 @@ def do_proxy(
     except (urllib.error.URLError, OSError) as e:
         log.error("proxy upstream error for %s %s: %s", method, path, e)
         return {"error": "upstream_unreachable", "message": str(e)}
+    log.info(
+        "do_proxy <- %s %s status=%d body_len=%d",
+        method,
+        path,
+        resp_status,
+        len(resp_body),
+    )
     return {
         "status": resp_status,
         "headers": resp_headers,
@@ -529,23 +632,38 @@ def build_handler(creds_path: Path, host_creds_path: Optional[Path] = None):
     def handler(session: "host_service.Session") -> None:
         req = session.request
         action = str(req.get("action") or "refresh")
+        log.info(
+            "action=%s method=%s path=%s",
+            action,
+            req.get("method", "-"),
+            req.get("path", "-"),
+        )
         if action == "refresh":
             session.json(do_refresh(creds_path, host_creds_path))
             return
         if action == "cached":
             cached = _cached_tokens(creds_path)
             if cached is None:
+                log.info("action=cached: no_cached_token")
                 session.json({"error": "no_cached_token"})
             else:
+                log.info(
+                    "action=cached: hit at=%s rt=%s exp=%s",
+                    _token_fp(cached.get("accessToken")),
+                    _token_fp(cached.get("refreshToken")),
+                    cached.get("expiresAt"),
+                )
                 session.json(_as_oauth_response(cached))
             return
         if action == "proxy":
             decoded = _decode_proxy_request(req)
             if isinstance(decoded, str):
+                log.warning("action=proxy bad_request: %s", decoded)
                 session.json({"error": "bad_request", "message": decoded})
                 return
             session.json(do_proxy(**decoded))
             return
+        log.warning("unknown action: %r (req keys: %s)", action, sorted(req.keys()))
         session.stderr(f"unknown action: {action!r}\n")
         session.exit(2)
 
@@ -683,6 +801,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     host_creds_path: Optional[Path] = (
         None if str(host_creds) in ("/dev/null", "") else host_creds
     )
+    # Startup snapshot of both creds files.  Lets tomorrow's debugger see
+    # the starting state and cross-reference it with the drift detection
+    # in do_refresh.
+    log.info("startup: shared=%s", _describe_creds(args.creds_file))
+    if host_creds_path is not None:
+        log.info("startup: host  =%s", _describe_creds(host_creds_path))
+    else:
+        log.info("startup: host mirroring disabled")
     host_service.serve(build_handler(args.creds_file, host_creds_path), args.socket)
     return 0
 
