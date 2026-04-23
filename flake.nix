@@ -283,6 +283,7 @@
           imagePkgs.uv
           imagePkgs.iptables      # DNAT rules (published port → localhost fixup)
           imagePkgs.socat         # host port forwarding into the jail
+          imagePkgs.sox           # Claude Code's `/voice` recorder depends on it
           # Timezone database — without it, glibc can't resolve
           # ``TZ=America/New_York`` etc. and silently falls back to UTC,
           # so `date` inside the jail reports wall-clock time that
