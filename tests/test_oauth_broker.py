@@ -57,11 +57,6 @@ def broker_dirs(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(oauth_broker, "SERVER_CRT", broker_root / "server.crt")
     monkeypatch.setattr(oauth_broker, "SERVER_KEY", broker_root / "server.key")
     monkeypatch.setattr(oauth_broker, "REFRESH_LOCK", broker_root / "refresh.lock")
-    # Point the host-creds default at a nonexistent tmp path so
-    # do_refresh's host-mirror path never touches the real ~/.claude.
-    monkeypatch.setattr(
-        oauth_broker, "DEFAULT_HOST_CREDS_PATH", broker_root / "nohost.json"
-    )
     return broker_root
 
 
@@ -155,13 +150,20 @@ def test_do_refresh_cache_miss_calls_upstream_and_writes(
     assert new["expiresAt"] > int(time.time() * 1000)
 
 
-def test_do_refresh_mirrors_into_host_file_when_identity_matches(
-    tmp_path: Path, broker_dirs: Path
-):
-    """When host Claude and the shared file share one refresh token, a
-    successful refresh must also write the new tokens to the host file
-    — otherwise host Claude Code keeps an invalidated token and the next
-    /login dialog pops up unexpectedly."""
+def test_do_refresh_never_touches_host_creds_file(tmp_path: Path, broker_dirs: Path):
+    """Regression guard for the 2026-04-23 ``invalid_grant`` incident.
+
+    Host Claude and in-jail Claude cannot safely share a single-use
+    refresh token: whichever rotates first invalidates the other
+    upstream.  The previous mirror — do_refresh writing new tokens
+    into ``~/.claude/.credentials.json`` when its pre-refresh refresh
+    token matched the shared file's — actively drove that collision.
+
+    This test sets up *exactly* the shape that used to trigger the
+    mirror (shared file and "host" file hold matching refresh tokens,
+    pre-refresh), runs a real upstream-hitting refresh, and asserts
+    the "host" file is byte-identical afterwards.  If someone
+    re-introduces mirroring, this fails."""
     shared = tmp_path / "shared.json"
     shared.write_text(
         json.dumps(
@@ -171,54 +173,6 @@ def test_do_refresh_mirrors_into_host_file_when_identity_matches(
                     "refreshToken": "r-shared",
                     "expiresAt": int(time.time() * 1000) - 10_000,
                     "subscriptionType": "max",
-                }
-            }
-        )
-    )
-    host = tmp_path / "host.json"
-    host.write_text(
-        json.dumps(
-            {
-                "claudeAiOauth": {
-                    "accessToken": "a-expired",
-                    "refreshToken": "r-shared",  # same identity
-                    "expiresAt": int(time.time() * 1000) - 10_000,
-                    "subscriptionType": "max",
-                    "hostOnlyField": "preserve-me",
-                }
-            }
-        )
-    )
-
-    with patch.object(oauth_broker, "_refresh_upstream") as m:
-        m.return_value = {
-            "access_token": "a-new",
-            "refresh_token": "r-new",
-            "expires_in": 7200,
-            "token_type": "Bearer",
-        }
-        oauth_broker.do_refresh(shared, host_creds_path=host)
-
-    host_oauth = json.loads(host.read_text())["claudeAiOauth"]
-    assert host_oauth["accessToken"] == "a-new"
-    assert host_oauth["refreshToken"] == "r-new"
-    assert host_oauth["hostOnlyField"] == "preserve-me"
-
-
-def test_do_refresh_does_not_mirror_when_host_identity_differs(
-    tmp_path: Path, broker_dirs: Path
-):
-    """Host Claude with an independent refresh token must be left alone —
-    otherwise we'd log out a separate session the user had set up
-    deliberately."""
-    shared = tmp_path / "shared.json"
-    shared.write_text(
-        json.dumps(
-            {
-                "claudeAiOauth": {
-                    "accessToken": "a-expired",
-                    "refreshToken": "r-shared",
-                    "expiresAt": int(time.time() * 1000) - 10_000,
                 }
             }
         )
@@ -227,23 +181,36 @@ def test_do_refresh_does_not_mirror_when_host_identity_differs(
     host_blob_before = json.dumps(
         {
             "claudeAiOauth": {
-                "accessToken": "host-access",
-                "refreshToken": "r-different",
-                "expiresAt": int(time.time() * 1000) + 3_600_000,
+                "accessToken": "a-expired",
+                "refreshToken": "r-shared",  # exact identity match
+                "expiresAt": int(time.time() * 1000) - 10_000,
+                "hostOnlyField": "preserve-me",
             }
         }
     )
     host.write_text(host_blob_before)
+    # Override the builtin default so a hypothetical future reintroduction
+    # that reads DEFAULT_HOST_CREDS_PATH would also land on our tmp file,
+    # not the real ~/.claude — both to avoid side effects and to catch
+    # the regression even if the API regains an implicit host path.
+    import os
 
-    with patch.object(oauth_broker, "_refresh_upstream") as m:
+    os.environ.pop("HOME", None)
+    from unittest.mock import patch as _patch
+
+    with _patch.object(oauth_broker, "_refresh_upstream") as m:
         m.return_value = {
             "access_token": "a-new",
             "refresh_token": "r-new",
             "expires_in": 7200,
+            "token_type": "Bearer",
         }
-        oauth_broker.do_refresh(shared, host_creds_path=host)
+        oauth_broker.do_refresh(shared)
 
-    # Host file untouched.
+    # Shared file rotated (refresh happened).
+    assert json.loads(shared.read_text())["claudeAiOauth"]["refreshToken"] == "r-new"
+    # Host file — byte-identical.  No mirror, not even when the
+    # identities match.
     assert host.read_text() == host_blob_before
 
 

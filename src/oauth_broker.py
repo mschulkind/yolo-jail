@@ -95,13 +95,15 @@ DEFAULT_CREDS_PATH = (
     Path.home()
     / ".local/share/yolo-jail/home/.claude-shared-credentials/.credentials.json"
 )
-# Host-side Claude Code's own credentials file.  When this file exists
-# AND its refresh token matches the shared file's (meaning host and
-# jail share one identity, the default state after first-boot sync),
-# the broker mirrors each refresh here too — keeps host Claude Code
-# logged in.  If the refresh tokens differ, host has an independent
-# identity and the broker leaves this file alone.
-DEFAULT_HOST_CREDS_PATH = Path.home() / ".claude" / ".credentials.json"
+# NOTE: the broker used to also know about ``~/.claude/.credentials.json``
+# and mirror refreshes into it when the two files held the same refresh
+# token.  That caused the 2026-04-23 ``invalid_grant`` incident: host
+# Claude refreshes on its own schedule via native OAuth, rotates the
+# shared refresh token upstream, and the next broker refresh attempt
+# dies.  Two independent OAuth clients cannot share a single-use
+# refresh token safely.  Jails now share ONE identity rooted in this
+# shared file; host Claude has its own identity in its own file; the
+# broker never touches the host path.
 
 
 log = logging.getLogger("oauth-broker-host")
@@ -354,60 +356,6 @@ def _write_tokens(creds_path: Path, oauth: Dict[str, Any]) -> None:
         os.close(fd)
 
 
-def _mirror_to_host_if_same_identity(
-    host_path: Path, old_refresh_token: str, new_oauth: Dict[str, Any]
-) -> None:
-    """If the host creds file shares ``old_refresh_token`` with the shared
-    file, mirror the refreshed tokens into it so host Claude Code stays
-    logged in.  Best-effort: missing/differing/unreadable host files are
-    fine — those cases mean independent identities or no host Claude.
-
-    NB: this one-way mirror is the source of the 2026-04-23 incident —
-    host Claude's own refresh flow rotates ``old_refresh_token`` upstream
-    without telling us, so the shared file is left holding a dead token.
-    See ``.yolo/handover.md``; the planned fix is to stop mirroring
-    entirely and keep host & jail identities independent."""
-    if not host_path.is_file():
-        log.info("mirror skip: host creds %s absent", host_path)
-        return
-    try:
-        host_data = json.loads(host_path.read_text())
-    except (OSError, json.JSONDecodeError) as e:
-        log.info("mirror skip: host creds %s unreadable: %s", host_path, e)
-        return
-    host_oauth = host_data.get("claudeAiOauth") or {}
-    host_rt = host_oauth.get("refreshToken")
-    if host_rt != old_refresh_token:
-        log.info(
-            "mirror skip: host_rt=%s != shared_old_rt=%s (different identity)",
-            _token_fp(host_rt),
-            _token_fp(old_refresh_token),
-        )
-        return
-    merged = dict(host_oauth)
-    merged["accessToken"] = new_oauth["accessToken"]
-    merged["refreshToken"] = new_oauth["refreshToken"]
-    merged["expiresAt"] = new_oauth["expiresAt"]
-    host_data["claudeAiOauth"] = merged
-    try:
-        blob = json.dumps(host_data, separators=(",", ":")).encode()
-        fd = os.open(host_path, os.O_WRONLY)
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
-            os.write(fd, blob)
-            os.ftruncate(fd, len(blob))
-        finally:
-            os.close(fd)
-        log.info(
-            "mirror done: host_path=%s rt %s -> %s",
-            host_path,
-            _token_fp(old_refresh_token),
-            _token_fp(new_oauth.get("refreshToken")),
-        )
-    except OSError as e:
-        log.warning("could not mirror into host creds %s: %s", host_path, e)
-
-
 def _normalize_oauth(
     upstream_resp: Dict[str, Any], previous: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -437,25 +385,26 @@ def _as_oauth_response(oauth: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def do_refresh(
-    creds_path: Path, host_creds_path: Optional[Path] = DEFAULT_HOST_CREDS_PATH
-) -> Dict[str, Any]:
-    """Flock-serialized refresh.  Returns a dict either
-    ``{access_token, refresh_token, expires_in, token_type}`` on success
-    or ``{error, ...}`` on any failure.
+def do_refresh(creds_path: Path) -> Dict[str, Any]:
+    """Flock-serialized refresh of the shared credentials file.
 
-    If ``host_creds_path`` is provided and its refresh token matches the
-    shared file's pre-refresh refresh token, the new tokens are mirrored
-    there too — keeps a host-side Claude Code in sync.
+    Returns a dict: either
+    ``{access_token, refresh_token, expires_in, token_type}`` on
+    success, or ``{error, ...}`` on any failure.
+
+    Scope: the broker owns exactly one identity — the one in
+    ``creds_path`` — and never touches any other credentials file on
+    the host.  Host-side Claude Code maintains its own independent
+    identity in ``~/.claude/.credentials.json`` via native OAuth.
+    The earlier cross-file mirror caused the 2026-04-23 invalid_grant
+    incident when host's out-of-band refresh rotated the shared file's
+    token upstream.
     """
     REFRESH_LOCK.parent.mkdir(parents=True, exist_ok=True)
     # Pre-lock snapshot — logged regardless of what we end up doing, so
     # tomorrow's debugger can reconstruct the state the broker saw when
-    # it was asked to refresh.  Most important: if shared_rt and host_rt
-    # differ, host Claude has rotated out-of-band and shared is stale.
+    # it was asked to refresh.
     log.info("do_refresh: shared=%s", _describe_creds(creds_path))
-    if host_creds_path is not None:
-        log.info("do_refresh: host  =%s", _describe_creds(host_creds_path))
     with open(REFRESH_LOCK, "w") as lockf:
         fcntl.flock(lockf, fcntl.LOCK_EX)
         cached = _cached_tokens(creds_path)
@@ -504,8 +453,6 @@ def do_refresh(
             _token_fp(new_oauth.get("accessToken")),
             new_oauth.get("expiresAt"),
         )
-        if host_creds_path is not None:
-            _mirror_to_host_if_same_identity(host_creds_path, refresh_token, new_oauth)
         return _as_oauth_response(new_oauth)
 
 
@@ -628,7 +575,7 @@ def _decode_proxy_request(req: Dict[str, Any]) -> "Dict[str, Any] | str":
     }
 
 
-def build_handler(creds_path: Path, host_creds_path: Optional[Path] = None):
+def build_handler(creds_path: Path):
     def handler(session: "host_service.Session") -> None:
         req = session.request
         action = str(req.get("action") or "refresh")
@@ -639,7 +586,7 @@ def build_handler(creds_path: Path, host_creds_path: Optional[Path] = None):
             req.get("path", "-"),
         )
         if action == "refresh":
-            session.json(do_refresh(creds_path, host_creds_path))
+            session.json(do_refresh(creds_path))
             return
         if action == "cached":
             cached = _cached_tokens(creds_path)
@@ -749,16 +696,6 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Shared credentials file (default: the one jails bind-mount)",
     )
     parser.add_argument(
-        "--host-creds-file",
-        type=Path,
-        default=DEFAULT_HOST_CREDS_PATH,
-        help=(
-            "Host-side Claude Code creds file.  Mirrored when it shares the "
-            "same refresh token as --creds-file; left alone otherwise.  Pass "
-            "/dev/null to disable mirroring."
-        ),
-    )
-    parser.add_argument(
         "--init-ca",
         action="store_true",
         help="Generate CA + leaf cert and exit (idempotent)",
@@ -797,19 +734,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     # without them yet shouldn't crash — just generate on the fly.
     ensure_ca_and_leaf()
 
-    host_creds = args.host_creds_file.expanduser()
-    host_creds_path: Optional[Path] = (
-        None if str(host_creds) in ("/dev/null", "") else host_creds
-    )
-    # Startup snapshot of both creds files.  Lets tomorrow's debugger see
-    # the starting state and cross-reference it with the drift detection
-    # in do_refresh.
+    # Startup snapshot of the shared creds file — lets tomorrow's
+    # debugger see the starting state and cross-reference it with the
+    # drift detection in do_refresh.
     log.info("startup: shared=%s", _describe_creds(args.creds_file))
-    if host_creds_path is not None:
-        log.info("startup: host  =%s", _describe_creds(host_creds_path))
-    else:
-        log.info("startup: host mirroring disabled")
-    host_service.serve(build_handler(args.creds_file, host_creds_path), args.socket)
+    host_service.serve(build_handler(args.creds_file), args.socket)
     return 0
 
 
