@@ -78,34 +78,44 @@ def _recv_all(conn: socket.socket, n: int) -> Optional[bytes]:
 
 def ask_host_broker(socket_path: str, request: Dict[str, Any]) -> Dict[str, Any]:
     """Send a request to the host-side OAuth broker over its Unix socket,
-    return the parsed JSON response.  Raises ``RuntimeError`` on protocol
-    errors — caller translates those into 502s for Claude."""
+    return the parsed JSON response.  Raises ``RuntimeError`` on any
+    transport or protocol failure — caller translates those into 502s for
+    Claude.  OSErrors (host daemon dead, socket bind-mount stale,
+    connection refused, read timeout) are wrapped as RuntimeError so a
+    single ``except RuntimeError`` in callers catches every failure
+    mode; otherwise the exception escapes the HTTP handler and Claude
+    sees a torn TLS connection mid-response — which during ``/login``
+    looks like "socket closed too soon after I pasted the code"."""
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     conn.settimeout(30.0)
     try:
-        conn.connect(socket_path)
-        body = json.dumps(request).encode()
-        conn.sendall(struct.pack(">I", len(body)))
-        conn.sendall(body)
-        stdout = bytearray()
-        rc: Optional[int] = None
-        while True:
-            header = _recv_all(conn, 5)
-            if header is None:
-                break
-            stream_id, length = struct.unpack(">BI", header)
-            payload = _recv_all(conn, length) if length else b""
-            if payload is None:
-                break
-            if stream_id == STREAM_STDOUT:
-                stdout.extend(payload)
-            elif stream_id == STREAM_STDERR:
-                log.warning(
-                    "host broker stderr: %s", payload.decode(errors="replace").strip()
-                )
-            elif stream_id == STREAM_EXIT:
-                (rc,) = struct.unpack(">i", payload)
-                break
+        try:
+            conn.connect(socket_path)
+            body = json.dumps(request).encode()
+            conn.sendall(struct.pack(">I", len(body)))
+            conn.sendall(body)
+            stdout = bytearray()
+            rc: Optional[int] = None
+            while True:
+                header = _recv_all(conn, 5)
+                if header is None:
+                    break
+                stream_id, length = struct.unpack(">BI", header)
+                payload = _recv_all(conn, length) if length else b""
+                if payload is None:
+                    break
+                if stream_id == STREAM_STDOUT:
+                    stdout.extend(payload)
+                elif stream_id == STREAM_STDERR:
+                    log.warning(
+                        "host broker stderr: %s",
+                        payload.decode(errors="replace").strip(),
+                    )
+                elif stream_id == STREAM_EXIT:
+                    (rc,) = struct.unpack(">i", payload)
+                    break
+        except OSError as e:
+            raise RuntimeError(f"host broker socket {socket_path}: {e}") from e
     finally:
         conn.close()
     if rc is None:

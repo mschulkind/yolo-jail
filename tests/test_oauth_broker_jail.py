@@ -139,6 +139,41 @@ def test_proxy_upstream_returns_502_on_upstream_error_dict(monkeypatch):
     assert parsed["error"] == "upstream_unreachable"
 
 
+def test_ask_host_broker_wraps_oserror_as_runtimeerror(tmp_path):
+    """Regression: ``ask_host_broker`` used to leak ``OSError``/
+    ``FileNotFoundError``/``ConnectionRefusedError`` from ``conn.connect``
+    when the host daemon was dead or the socket bind-mount was stale.
+    Callers (``_proxy_upstream``, the refresh path) catch only
+    ``RuntimeError``; the OSError escaped past the HTTP handler and
+    Claude saw a torn TLS connection mid-response.  During ``/login``
+    that surfaced as "socket closed too soon after I pasted the code".
+
+    Lock in: any transport failure becomes a ``RuntimeError`` so the
+    single ``except RuntimeError`` in callers catches it and returns a
+    proper 502 instead of aborting the connection."""
+    import pytest
+
+    missing_sock = tmp_path / "definitely-not-here.sock"
+    with pytest.raises(RuntimeError) as exc:
+        oauth_broker_jail.ask_host_broker(str(missing_sock), {"action": "ping"})
+    assert str(missing_sock) in str(exc.value)
+
+
+def test_proxy_upstream_returns_502_when_host_socket_missing(tmp_path):
+    """End-to-end check of the same regression at the call-site level:
+    a missing host socket should produce a 502 ``broker_unavailable``,
+    not propagate an exception out of the HTTP handler."""
+    missing_sock = tmp_path / "definitely-not-here.sock"
+    status, headers, body = oauth_broker_jail._proxy_upstream(
+        str(missing_sock), "POST", "/v1/oauth/token", {}, b'{"grant_type":"x"}'
+    )
+    assert status == 502
+    assert headers["Content-Type"] == "application/json"
+    parsed = json.loads(body)
+    assert parsed["error"] == "broker_unavailable"
+    assert str(missing_sock) in parsed["detail"]
+
+
 def test_proxy_upstream_handles_empty_body(monkeypatch):
     """GETs have no body; we shouldn't send a stray base64 ``=`` chunk."""
     captured: dict = {}
