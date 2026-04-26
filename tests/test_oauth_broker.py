@@ -372,6 +372,252 @@ class _FakeSession:
         self.events.append(("exit", code))
 
 
+# ---------------------------------------------------------------------------
+# Proxy-side credential mirror
+#
+# When a /login flow's authorization_code exchange comes through the proxy
+# action, the upstream response is the new credentials.  Without
+# propagation, only Claude in the originating jail sees them; every other
+# jail's broker refresh attempt then fails because the shared creds file
+# still holds the now-invalidated refresh token.  These tests lock in
+# that the proxy ALSO writes the new tokens to the shared file, breaking
+# the "log in everywhere" cascade.
+# ---------------------------------------------------------------------------
+
+
+def _proxy_call(handler, *, method, path, body):
+    """Drive build_handler() with a synthetic proxy action so we can
+    assert the side effects on the shared creds file."""
+    sess = _FakeSession(
+        {
+            "action": "proxy",
+            "method": method,
+            "path": path,
+            "headers": {"Content-Type": "application/json"},
+            "body_b64": base64.b64encode(body).decode("ascii"),
+        }
+    )
+    handler(sess)
+    return sess
+
+
+def _ok_token_response(*, access, refresh, expires_in=7200):
+    """Stand-in for what _refresh_upstream / urllib would return for a
+    successful token-endpoint response."""
+    return {
+        "status": 200,
+        "headers": {"Content-Type": "application/json"},
+        "body_b64": base64.b64encode(
+            json.dumps(
+                {
+                    "access_token": access,
+                    "refresh_token": refresh,
+                    "expires_in": expires_in,
+                    "token_type": "Bearer",
+                }
+            ).encode()
+        ).decode("ascii"),
+    }
+
+
+def test_proxy_propagates_authorization_code_to_shared_creds(
+    tmp_path, broker_dirs, monkeypatch
+):
+    """The /login response (grant_type=authorization_code) must also
+    land in the shared creds file so other jails don't have to /login
+    too.  This was the 2026-04-25 cascade."""
+    creds = tmp_path / "shared.json"
+    # Pre-existing creds — simulate a stale identity from before /login.
+    creds.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "stale-at",
+                    "refreshToken": "stale-rt",
+                    "expiresAt": int(time.time() * 1000) - 60_000,
+                    "subscriptionType": "max",
+                    "scopes": ["user:inference"],
+                }
+            }
+        )
+    )
+
+    monkeypatch.setattr(
+        oauth_broker,
+        "do_proxy",
+        lambda **_: _ok_token_response(access="fresh-at", refresh="fresh-rt"),
+    )
+    handler = oauth_broker.build_handler(creds)
+    _proxy_call(
+        handler,
+        method="POST",
+        path="/v1/oauth/token",
+        body=json.dumps({"grant_type": "authorization_code", "code": "x"}).encode(),
+    )
+
+    on_disk = json.loads(creds.read_text())["claudeAiOauth"]
+    assert on_disk["accessToken"] == "fresh-at"
+    assert on_disk["refreshToken"] == "fresh-rt"
+    # Existing fields (subscriptionType, scopes) must survive — the
+    # response from the token endpoint doesn't include them.
+    assert on_disk["subscriptionType"] == "max"
+    assert on_disk["scopes"] == ["user:inference"]
+
+
+def test_proxy_does_not_write_for_non_token_path(tmp_path, broker_dirs, monkeypatch):
+    """Only /v1/oauth/token responses get mirrored; an unrelated proxy
+    call (e.g. /v1/messages) must leave the creds file alone."""
+    creds = tmp_path / "shared.json"
+    original = json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": "keep",
+                "refreshToken": "keep",
+                "expiresAt": int(time.time() * 1000) + 3_600_000,
+            }
+        }
+    )
+    creds.write_text(original)
+
+    monkeypatch.setattr(
+        oauth_broker,
+        "do_proxy",
+        lambda **_: _ok_token_response(access="should-not-write", refresh="x"),
+    )
+    handler = oauth_broker.build_handler(creds)
+    _proxy_call(handler, method="POST", path="/v1/messages", body=b"{}")
+
+    assert creds.read_text() == original
+
+
+def test_proxy_does_not_write_on_non_200(tmp_path, broker_dirs, monkeypatch):
+    """A 4xx/5xx token response is NOT a successful exchange — leave
+    shared file alone."""
+    creds = tmp_path / "shared.json"
+    original = json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": "keep",
+                "refreshToken": "keep",
+                "expiresAt": int(time.time() * 1000) + 3_600_000,
+            }
+        }
+    )
+    creds.write_text(original)
+
+    monkeypatch.setattr(
+        oauth_broker,
+        "do_proxy",
+        lambda **_: {
+            "status": 400,
+            "headers": {"Content-Type": "application/json"},
+            "body_b64": base64.b64encode(b'{"error":"invalid_grant"}').decode(),
+        },
+    )
+    handler = oauth_broker.build_handler(creds)
+    _proxy_call(
+        handler,
+        method="POST",
+        path="/v1/oauth/token",
+        body=json.dumps({"grant_type": "authorization_code", "code": "x"}).encode(),
+    )
+
+    assert creds.read_text() == original
+
+
+def test_proxy_does_not_write_on_transport_error(tmp_path, broker_dirs, monkeypatch):
+    """Upstream-unreachable returns ``{error: ...}`` (no status / body
+    fields).  Don't try to mirror nothing into the shared file."""
+    creds = tmp_path / "shared.json"
+    creds.write_text(
+        json.dumps(
+            {"claudeAiOauth": {"accessToken": "k", "refreshToken": "k", "expiresAt": 1}}
+        )
+    )
+    snapshot = creds.read_text()
+
+    monkeypatch.setattr(
+        oauth_broker,
+        "do_proxy",
+        lambda **_: {"error": "upstream_unreachable", "message": "no DNS"},
+    )
+    handler = oauth_broker.build_handler(creds)
+    _proxy_call(
+        handler,
+        method="POST",
+        path="/v1/oauth/token",
+        body=json.dumps({"grant_type": "authorization_code", "code": "x"}).encode(),
+    )
+    assert creds.read_text() == snapshot
+
+
+def test_proxy_skips_when_response_body_not_token_shaped(
+    tmp_path, broker_dirs, monkeypatch
+):
+    """A 200 response that lacks access_token/refresh_token (some
+    weird endpoint variant we don't recognize) must not corrupt the
+    creds file — better to skip than to write a half-built record."""
+    creds = tmp_path / "shared.json"
+    original = json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": "keep",
+                "refreshToken": "keep",
+                "expiresAt": int(time.time() * 1000) + 3_600_000,
+            }
+        }
+    )
+    creds.write_text(original)
+
+    monkeypatch.setattr(
+        oauth_broker,
+        "do_proxy",
+        lambda **_: {
+            "status": 200,
+            "headers": {"Content-Type": "application/json"},
+            "body_b64": base64.b64encode(b'{"hello":"world"}').decode(),
+        },
+    )
+    handler = oauth_broker.build_handler(creds)
+    _proxy_call(
+        handler,
+        method="POST",
+        path="/v1/oauth/token",
+        body=b"{}",
+    )
+
+    assert creds.read_text() == original
+
+
+def test_proxy_skips_when_response_body_unparseable(tmp_path, broker_dirs, monkeypatch):
+    """Garbage in body_b64 ==> log + skip; never corrupt the shared file."""
+    creds = tmp_path / "shared.json"
+    creds.write_text(
+        json.dumps(
+            {"claudeAiOauth": {"accessToken": "k", "refreshToken": "k", "expiresAt": 1}}
+        )
+    )
+    snapshot = creds.read_text()
+
+    monkeypatch.setattr(
+        oauth_broker,
+        "do_proxy",
+        lambda **_: {
+            "status": 200,
+            "headers": {},
+            "body_b64": "!!!not-base64!!!",
+        },
+    )
+    handler = oauth_broker.build_handler(creds)
+    _proxy_call(
+        handler,
+        method="POST",
+        path="/v1/oauth/token",
+        body=b"{}",
+    )
+    assert creds.read_text() == snapshot
+
+
 def test_handler_ping_returns_pong_without_touching_upstream_or_creds(
     tmp_path, broker_dirs, monkeypatch
 ):

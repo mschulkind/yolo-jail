@@ -575,6 +575,78 @@ def _decode_proxy_request(req: Dict[str, Any]) -> "Dict[str, Any] | str":
     }
 
 
+def _maybe_propagate_token_response(
+    creds_path: Path,
+    decoded: Dict[str, Any],
+    response: Dict[str, Any],
+) -> None:
+    """If ``response`` is a successful ``POST /v1/oauth/token`` exchange
+    (the OAuth code grant from ``/login``, or a refresh that came
+    through the proxy path for some reason), mirror the new tokens
+    into the shared creds file at ``creds_path``.
+
+    Why this exists: the OAuth authorization-code grant comes from ONE
+    jail (whichever one ran ``/login``).  Claude there writes the
+    response to its local ``.credentials.json``.  But the SHARED creds
+    file (the one every other jail's broker refresh path reads) is
+    left holding the OLD refresh token — which Anthropic invalidated
+    upstream the instant the new tokens were minted.  Next refresh in
+    any other jail then fails with ``invalid_grant``, forcing another
+    ``/login`` there.  Cascade.
+
+    Mirroring the response into the shared file here breaks the
+    cascade: one ``/login``, every jail converges on the new identity
+    on its next refresh.
+
+    Side-effect-free on every non-success path — wrong method, wrong
+    path, error response, non-200 status, malformed body, body without
+    token fields.  Acquires the same flock the refresh path uses so
+    a concurrent refresh can't interleave its write.
+    """
+    if decoded.get("method") != "POST":
+        return
+    path = decoded.get("path") or ""
+    if not path.startswith("/v1/oauth/token"):
+        return
+    if response.get("error"):
+        return
+    if response.get("status") != 200:
+        return
+    body_b64 = response.get("body_b64") or ""
+    if not isinstance(body_b64, str) or not body_b64:
+        return
+    try:
+        body = base64.b64decode(body_b64.encode("ascii"), validate=True)
+        upstream_resp = json.loads(body.decode())
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        log.debug("proxy mirror: skipping non-JSON / non-b64 body")
+        return
+    if not isinstance(upstream_resp, dict):
+        return
+    if "access_token" not in upstream_resp or "refresh_token" not in upstream_resp:
+        log.debug("proxy mirror: skipping body without access_token+refresh_token")
+        return
+
+    REFRESH_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(REFRESH_LOCK, "w") as lockf:
+            fcntl.flock(lockf, fcntl.LOCK_EX)
+            try:
+                previous = json.loads(creds_path.read_text()).get("claudeAiOauth") or {}
+            except (OSError, json.JSONDecodeError):
+                previous = {}
+            new_oauth = _normalize_oauth(upstream_resp, previous=previous)
+            _write_tokens(creds_path, new_oauth)
+            log.info(
+                "proxy mirror: wrote shared creds (rt %s -> %s, at -> %s)",
+                _token_fp(previous.get("refreshToken")),
+                _token_fp(new_oauth.get("refreshToken")),
+                _token_fp(new_oauth.get("accessToken")),
+            )
+    except OSError as e:
+        log.warning("proxy mirror: could not write %s: %s", creds_path, e)
+
+
 def build_handler(creds_path: Path):
     def handler(session: "host_service.Session") -> None:
         req = session.request
@@ -608,7 +680,16 @@ def build_handler(creds_path: Path):
                 log.warning("action=proxy bad_request: %s", decoded)
                 session.json({"error": "bad_request", "message": decoded})
                 return
-            session.json(do_proxy(**decoded))
+            response = do_proxy(**decoded)
+            # If this proxy round-trip was a successful token-endpoint
+            # exchange (i.e. /login's authorization_code grant), the
+            # response contains a fresh refresh token that has just
+            # invalidated whatever the shared file held.  Mirror it
+            # into the shared file so every other jail's next refresh
+            # finds the new identity instead of failing with
+            # invalid_grant and prompting for /login.
+            _maybe_propagate_token_response(creds_path, decoded, response)
+            session.json(response)
             return
         if action == "ping":
             # Liveness probe.  Never touches upstream or the creds file —
