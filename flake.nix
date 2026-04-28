@@ -78,7 +78,7 @@
         # variant can skip the bulky and/or unused plumbing.
         mkBinPathLinks = { withChromium ? true, withNestedPodman ? true }:
           imagePkgs.runCommand "bin-path-links" {} (''
-          mkdir -p $out/usr/bin $out/bin $out/lib64 $out/lib $out/usr/lib $out/etc $out/usr/share/fonts
+          mkdir -p $out/usr/bin $out/bin $out/lib64 $out/lib $out/usr/lib $out/etc $out/usr/share/fonts $out/usr/share
           ln -s ${imagePkgs.coreutils}/bin/env $out/usr/bin/env
           ln -s ${imagePkgs.bashInteractive}/bin/bash $out/bin/bash
           ln -s ${imagePkgs.bashInteractive}/bin/sh $out/bin/sh
@@ -86,6 +86,11 @@
           ln -s ${imagePkgs.gnused}/bin/sed $out/bin/sed
           ln -s ${imagePkgs.gnugrep}/bin/grep $out/bin/grep
           ln -s ${imagePkgs.findutils}/bin/find $out/bin/find
+          # /usr/share/zoneinfo → tzdata store path.  glibc already
+          # reads TZDIR, but Python's ``zoneinfo`` module + other
+          # clients search the standard FHS path first, so symlink
+          # it so both paths work.
+          ln -s ${imagePkgs.tzdata}/share/zoneinfo $out/usr/share/zoneinfo
         '' + imagePkgs.lib.optionalString withChromium ''
           ln -s ${imagePkgs.chromium}/bin/chromium $out/usr/bin/chromium
           ln -s ${imagePkgs.chromium}/bin/chromium $out/usr/bin/google-chrome
@@ -185,6 +190,26 @@
           cat > $out/etc/containers/registries.conf <<REGISTRIES
           unqualified-search-registries = ["docker.io"]
           REGISTRIES
+        '' + ''
+
+          # /etc/ld.so.cache so non-nix binaries that don't read
+          # LD_LIBRARY_PATH (setuid helpers, some dlopen callers) can
+          # still find libstdc++, glibc, etc.  The symlinks created
+          # above under /lib and /usr/lib are the scan roots.
+          #
+          # ``-r $out`` tells ldconfig to treat $out as root while it
+          # scans, so the paths it records in the cache are absolute
+          # paths that will resolve at runtime inside the container.
+          # Failure shouldn't abort the image build — if ldconfig
+          # can't index something we fall back to LD_LIBRARY_PATH
+          # which is already wired for every standard path.
+          {
+            echo "/lib"
+            echo "/usr/lib"
+            echo "/usr/lib/${linuxMultilib}"
+          } > $out/etc/ld.so.conf
+          ${imagePkgs.glibc.bin}/bin/ldconfig \
+            -r $out -C /etc/ld.so.cache -f /etc/ld.so.conf || true
         '');
 
         binPathLinks = mkBinPathLinks { };
@@ -258,6 +283,13 @@
           imagePkgs.uv
           imagePkgs.iptables      # DNAT rules (published port → localhost fixup)
           imagePkgs.socat         # host port forwarding into the jail
+          imagePkgs.sox           # Claude Code's `/voice` recorder depends on it
+          # Timezone database — without it, glibc can't resolve
+          # ``TZ=America/New_York`` etc. and silently falls back to UTC,
+          # so `date` inside the jail reports wall-clock time that
+          # disagrees with the host.  TZDIR in the image env below
+          # points glibc at this store path.
+          imagePkgs.tzdata
         ];
 
         # Extras that bulk the image up but aren't exercised by the
@@ -331,6 +363,10 @@
                 "LD_LIBRARY_PATH=/lib:/usr/lib:/usr/lib/${linuxMultilib}"
                 "FONTCONFIG_FILE=/etc/fonts/fonts.conf"
                 "FONTCONFIG_PATH=/etc/fonts"
+                # Point glibc at the tzdata store path so ``TZ=<zone>``
+                # passed from the host resolves (otherwise date + glibc
+                # fall back to UTC, diverging from the host clock).
+                "TZDIR=${imagePkgs.tzdata}/share/zoneinfo"
               ];
               WorkingDir = "/workspace";
             };

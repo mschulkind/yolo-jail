@@ -50,6 +50,12 @@ ls ~/.local/share/yolo-jail/logs/host-service-claude-oauth-broker-*.log
 cat ~/.local/state/yolo-jail-daemons/claude-oauth-broker.log
 ```
 
-## Interaction with the refresher
+## On-demand refresh
 
-`claude-token-refresher` (systemd timer) can coexist — broker handles real-time refresh requests from jails (synchronous); refresher proactively keeps the shared file ahead of expiry (eager). If you want broker-only, set `claude_token_refresher: false` in `~/.config/yolo-jail/config.jsonc`.
+The broker refreshes on request: when a jail POSTs to `/v1/oauth/token`, the host daemon takes the flock, checks on-disk expiry, and either returns the cached tokens (still valid, ≥ 90 s headroom) or calls Anthropic once and rewrites the shared file. There is no background timer — the broker was the original rationale for the legacy `claude-token-refresher`, and once the broker became the single refresh authority the refresher had nothing left to do. It was removed.
+
+The broker operates on ONE credentials file — the shared jail file at `~/.local/share/yolo-jail/home/.claude-shared-credentials/.credentials.json` — and never touches host Claude's `~/.claude/.credentials.json`. Host and in-jail Claude maintain independent OAuth identities (separate refresh tokens minted by separate `/login` flows). Anthropic's OAuth issuer supports multiple concurrent active refresh tokens per account, so this is cheap and safe.
+
+The earlier "mirror-if-identity-matches" behavior caused the 2026-04-23 `invalid_grant` incident: host Claude refreshed out-of-band via native OAuth, upstream invalidated the shared file's now-stale refresh token, and every in-jail request started failing. Two independent clients cannot safely share a single-use refresh token. Separate identities eliminate the whole failure mode.
+
+If you used to rely on the shared identity, expect to run `/login` **once** on host (to re-establish its independent identity) after the fix lands.

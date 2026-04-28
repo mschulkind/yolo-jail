@@ -114,9 +114,7 @@ def test_broker_self_check_ok_when_state_missing(broker_state, capsys, monkeypat
 
     creds = Path(tempfile.mkdtemp(prefix="yjt-")) / "creds.json"
     creds.write_text('{"claudeAiOauth": {"accessToken": "x", "expiresAt": 0}}')
-    from src import claude_refresher
-
-    monkeypatch.setattr(claude_refresher, "DEFAULT_CREDS_PATH", creds)
+    monkeypatch.setattr(oauth_broker, "DEFAULT_CREDS_PATH", creds)
 
     rc = oauth_broker.self_check()
     out = capsys.readouterr().out
@@ -133,15 +131,18 @@ def test_broker_self_check_fails_when_openssl_and_state_both_missing(
 ):
     """If state is missing AND openssl is missing, the user can't
     recover via --init-ca.  That's a real failure that should hard-fail
-    doctor, not just warn."""
-    monkeypatch.setattr(oauth_broker.shutil, "which", lambda _x: None)
+    doctor, not just warn.
+
+    Patches ``_resolve_openssl`` directly — the broker's openssl
+    resolution walks fallback absolute paths when ``shutil.which``
+    misses, so CI runners with openssl preinstalled at ``/usr/bin``
+    would otherwise report it present despite the mock."""
+    monkeypatch.setattr(oauth_broker, "_resolve_openssl", lambda: None)
     import tempfile
 
     creds = Path(tempfile.mkdtemp(prefix="yjt-")) / "creds.json"
     creds.write_text('{"claudeAiOauth": {}}')
-    from src import claude_refresher
-
-    monkeypatch.setattr(claude_refresher, "DEFAULT_CREDS_PATH", creds)
+    monkeypatch.setattr(oauth_broker, "DEFAULT_CREDS_PATH", creds)
 
     rc = oauth_broker.self_check()
     assert rc == 1

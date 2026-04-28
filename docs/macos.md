@@ -79,6 +79,9 @@ container system start
 
 # Verify it's working
 container system info
+
+# Install the recommended Linux kernel (required on first use)
+container system kernel set --recommended
 ```
 
 **Key advantages:**
@@ -148,10 +151,84 @@ sudo launchctl kickstart -k system/systems.determinate.nix-daemon
 
 **Option B — NixOS linux-builder (built-in)**
 
+The built-in NixOS linux-builder starts a QEMU VM that acts as a remote Nix
+builder. Unlike Colima, it requires no extra installation — just Nix itself.
+However, it needs several configuration steps to work correctly.
+
+**Step 1 — Start the builder VM** (in a dedicated terminal / tmux pane):
+
 ```bash
-# Using the built-in NixOS linux-builder (starts a QEMU VM)
 nix run nixpkgs#darwin.linux-builder
 ```
+
+The VM stays running in the foreground. To stop it, press `Ctrl+C` in the
+terminal. If `Ctrl+C` is intercepted (e.g. auto-login loops), try `Ctrl+A`
+then `X` to quit the QEMU session, or kill the process from another terminal.
+
+> **Note:** If your terminal multiplexer uses `Ctrl+A` as its prefix key
+> (e.g. tmux), press `Ctrl+A` twice so the first is consumed by the
+> multiplexer and the second reaches QEMU.
+
+**Step 2 — Ensure your user is trusted by the Nix daemon:**
+
+```bash
+echo 'trusted-users = root <your-username>' | sudo tee -a /etc/nix/nix.custom.conf
+```
+
+**Step 3 — Create an SSH config entry for the builder.**
+
+The `darwin.linux-builder` VM listens on port 31022 and ships an SSH key at
+`/etc/nix/builder_ed25519`. That key is owned by root, so copy it for your
+user first:
+
+```bash
+sudo cp /etc/nix/builder_ed25519 ~/.ssh/nix-builder-key
+sudo chown $(whoami) ~/.ssh/nix-builder-key
+chmod 600 ~/.ssh/nix-builder-key
+```
+
+Then add an SSH host alias:
+
+```bash
+cat >> ~/.ssh/config <<'EOF'
+
+Host nix-linux-builder
+  HostName localhost
+  Port 31022
+  User builder
+  IdentityFile ~/.ssh/nix-builder-key
+  StrictHostKeyChecking accept-new
+EOF
+```
+
+Copy the SSH config for root as well, since the Nix daemon runs as root:
+
+```bash
+sudo mkdir -p /var/root/.ssh
+sudo cp ~/.ssh/config /var/root/.ssh/config
+```
+
+**Step 4 — Register the builder with Nix:**
+
+```bash
+echo 'ssh-ng://nix-linux-builder aarch64-linux /etc/nix/builder_ed25519 4 1 benchmark,big-parallel,kvm - -' \
+  | sudo tee /etc/nix/machines
+```
+
+**Step 5 — Restart the Nix daemon** to pick up the new config:
+
+```bash
+sudo launchctl kickstart -k system/systems.determinate.nix-daemon
+```
+
+**Step 6 — Verify the builder is reachable:**
+
+```bash
+ssh nix-linux-builder echo ok
+```
+
+You should see `ok` printed. If SSH asks for a password, the key wasn't copied
+correctly — revisit Step 3.
 
 **Option C — Remote Linux host**
 
@@ -437,6 +514,15 @@ Apple's Virtualization.framework has a hard limit of ~22 directory sharing
 devices (bind mounts). YOLO Jail works around this by consolidating the
 workspace state into a single `/home/agent` mount instead of individual
 overlays. If you add many custom mounts, you may hit this limit.
+
+### Apple Container: "default kernel not configured for architecture arm64"
+
+Apple Container needs a Linux kernel to boot its VMs. Install the recommended
+one:
+
+```bash
+container system kernel set --recommended
+```
 
 ### Apple Container: image load fails
 

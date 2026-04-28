@@ -435,6 +435,261 @@ def test_requires_command_on_path_active_when_present(mods_dir: Path):
     assert loaded[0].inactive_reason is None
 
 
+# ---------------------------------------------------------------------------
+# requires.file_exists — "host has this socket/file" activation gate
+# ---------------------------------------------------------------------------
+
+
+def test_requires_file_exists_active_when_path_present(mods_dir: Path, tmp_path: Path):
+    """``file_exists: <path>`` flips the loophole active iff the named
+    path exists on the host.  Used by the audio loophole to gate on
+    the PipeWire/Pulse socket at ``$XDG_RUNTIME_DIR/pulse/native``."""
+    present = tmp_path / "present.sock"
+    present.write_bytes(b"")
+    mod = mods_dir / "needs-path"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "needs-path",
+            "description": "x",
+            "requires": {"file_exists": str(present)},
+        },
+    )
+    loaded = loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    assert loaded[0].requirements_met is True
+    assert loaded[0].active is True
+    assert loaded[0].inactive_reason is None
+
+
+def test_requires_file_exists_inactive_when_path_missing(
+    mods_dir: Path, tmp_path: Path
+):
+    missing = tmp_path / "nope.sock"
+    mod = mods_dir / "needs-path"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "needs-path",
+            "description": "x",
+            "requires": {"file_exists": str(missing)},
+        },
+    )
+    loaded = loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    assert loaded[0].active is False
+    assert str(missing) in (loaded[0].inactive_reason or "")
+
+
+def test_requires_file_exists_expands_env_vars(
+    mods_dir: Path, tmp_path: Path, monkeypatch
+):
+    """The common case for this predicate is a user-runtime path like
+    ``${XDG_RUNTIME_DIR}/pulse/native``.  Must be expanded against
+    the host env at check time, not stored literally."""
+    runtime = tmp_path / "run-1000"
+    (runtime / "pulse").mkdir(parents=True)
+    sock = runtime / "pulse" / "native"
+    sock.write_bytes(b"")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+    mod = mods_dir / "audio-like"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "audio-like",
+            "description": "x",
+            "requires": {"file_exists": "${XDG_RUNTIME_DIR}/pulse/native"},
+        },
+    )
+    loaded = loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    assert loaded[0].active is True
+
+    # Remove the file, expansion should now see it missing.
+    sock.unlink()
+    loaded = loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    assert loaded[0].active is False
+
+
+def test_requires_file_exists_collapses_when_env_var_unset(mods_dir: Path, monkeypatch):
+    """If ``$XDG_RUNTIME_DIR`` isn't set, the path expands to something
+    nonsensical (e.g. literal ``/pulse/native``).  Treat as missing
+    rather than accidentally matching some unrelated absolute path."""
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    mod = mods_dir / "audio-like"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "audio-like",
+            "description": "x",
+            "requires": {"file_exists": "${XDG_RUNTIME_DIR}/pulse/native"},
+        },
+    )
+    loaded = loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    assert loaded[0].active is False
+
+
+# ---------------------------------------------------------------------------
+# host_bind_mounts — pass existing host-owned sockets / dirs into the jail
+# ---------------------------------------------------------------------------
+
+
+def test_host_bind_mounts_parsed_from_manifest(mods_dir: Path, tmp_path: Path):
+    """The manifest carries a list of {host, container, readonly} entries;
+    the parser turns them into structured objects on the Loophole."""
+    sock = tmp_path / "pulse-native"
+    sock.write_bytes(b"")
+    mod = mods_dir / "audio-like"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "audio-like",
+            "description": "x",
+            "host_bind_mounts": [
+                {
+                    "host": str(sock),
+                    "container": "/run/pulse/native",
+                    "readonly": False,
+                }
+            ],
+        },
+    )
+    loaded = loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    mounts = loaded[0].host_bind_mounts
+    assert len(mounts) == 1
+    assert mounts[0].host == sock
+    assert mounts[0].container == "/run/pulse/native"
+    assert mounts[0].readonly is False
+
+
+def test_host_bind_mounts_expand_env_in_host_path(
+    mods_dir: Path, tmp_path: Path, monkeypatch
+):
+    runtime = tmp_path / "run-1000"
+    (runtime / "pulse").mkdir(parents=True)
+    sock = runtime / "pulse" / "native"
+    sock.write_bytes(b"")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+
+    mod = mods_dir / "audio-like"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "audio-like",
+            "description": "x",
+            "host_bind_mounts": [
+                {
+                    "host": "${XDG_RUNTIME_DIR}/pulse/native",
+                    "container": "/run/pulse/native",
+                }
+            ],
+        },
+    )
+    loaded = loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    assert loaded[0].host_bind_mounts[0].host == sock
+
+
+def test_host_bind_mounts_emitted_as_docker_args(mods_dir: Path, tmp_path: Path):
+    """Active loophole's host_bind_mounts produce ``-v host:container`` docker
+    flags.  Readonly entries get ``:ro``."""
+    rw_src = tmp_path / "rw-sock"
+    rw_src.write_bytes(b"")
+    ro_src = tmp_path / "ro-file"
+    ro_src.write_bytes(b"")
+
+    mod = mods_dir / "audio-like"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "audio-like",
+            "description": "x",
+            "transport": "none",
+            "host_bind_mounts": [
+                {
+                    "host": str(rw_src),
+                    "container": "/run/pulse/native",
+                    "readonly": False,
+                },
+                {
+                    "host": str(ro_src),
+                    "container": "/etc/some-config",
+                    "readonly": True,
+                },
+            ],
+        },
+    )
+    loaded = loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    args = loopholes.docker_args_for(loaded)
+    joined = " ".join(args)
+    assert f"{rw_src}:/run/pulse/native" in joined
+    assert f"{ro_src}:/etc/some-config:ro" in joined
+    # rw mount must NOT carry :ro suffix
+    assert f"{rw_src}:/run/pulse/native:ro" not in joined
+
+
+def test_host_bind_mounts_skip_when_source_missing(
+    mods_dir: Path, tmp_path: Path, capsys
+):
+    """If a host_bind_mount's source path disappeared between
+    activation gating and actual spawn (race, or operator deleted it),
+    don't crash the whole jail — skip that one mount and continue.
+    The loophole stays partially wired; user may need to reinstall /
+    restart pipewire.  Better than failing the whole yolo run."""
+    gone = tmp_path / "gone.sock"  # never created
+    mod = mods_dir / "audio-like"
+    mod.mkdir()
+    _write_manifest(
+        mod,
+        {
+            "name": "audio-like",
+            "description": "x",
+            "transport": "none",
+            # Don't gate on file_exists here — we want to exercise the
+            # docker_args_for path, not the active check.
+            "host_bind_mounts": [
+                {"host": str(gone), "container": "/run/pulse/native"},
+            ],
+        },
+    )
+    loaded = loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    args = loopholes.docker_args_for(loaded)
+    # No -v for the missing source.
+    joined = " ".join(args)
+    assert f"{gone}:/run/pulse/native" not in joined
+
+
+# ---------------------------------------------------------------------------
+# Bundled audio loophole — manifest parses + wires correctly
+# ---------------------------------------------------------------------------
+
+
+def test_bundled_audio_loophole_parses(monkeypatch, tmp_path):
+    """Smoke-test the shipped src/bundled_loopholes/audio/manifest.jsonc:
+    parser accepts it, expansion works, docker_args_for renders the
+    expected -v + PULSE_SERVER when the socket is present."""
+    from src import loopholes as _l
+
+    runtime = tmp_path / "run-1000"
+    (runtime / "pulse").mkdir(parents=True)
+    sock = runtime / "pulse" / "native"
+    sock.write_bytes(b"")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+
+    bundled = _l.bundled_loopholes_dir() / "audio"
+    assert bundled.is_dir(), "audio loophole must be shipped in the wheel"
+    # Discover only the audio loophole in isolation.
+    loaded = [_l.load_loophole(bundled)]
+    assert loaded[0].active is True
+    args = _l.docker_args_for(loaded)
+    joined = " ".join(args)
+    assert f"{sock}:/run/pulse/native" in joined
+    assert "PULSE_SERVER=unix:/run/pulse/native" in joined
+
+
 def test_inactive_loopholes_skipped_in_docker_args(mods_dir: Path):
     mod = mods_dir / "inactive-mod"
     mod.mkdir()

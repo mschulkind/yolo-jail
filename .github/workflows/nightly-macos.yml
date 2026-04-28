@@ -9,11 +9,16 @@ on:
 permissions:
   contents: read
 
+# Opt every JavaScript action into Node.js 24 ahead of GitHub's
+# 2026-06-02 default switch.  See ci.yml for full rationale.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   build-image:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -29,7 +34,7 @@ jobs:
           ./result > /tmp/jail-image.tar
 
       - name: Upload jail image
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: jail-image
           path: /tmp/jail-image.tar
@@ -41,12 +46,12 @@ jobs:
     runs-on: macos-13
     needs: build-image
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v7
 
       - name: Install Python dependencies
         run: uv sync --group dev
@@ -57,7 +62,7 @@ jobs:
           colima start --cpu 2 --memory 4 --disk 30 --mount-type sshfs
 
       - name: Download jail image
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: jail-image
           path: /tmp

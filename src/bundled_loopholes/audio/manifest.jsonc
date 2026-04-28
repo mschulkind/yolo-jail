@@ -1,0 +1,45 @@
+// Bundled yolo-jail loophole — ships with the wheel.
+// Passes the user's PipeWire / PulseAudio socket through to the jail so
+// microphone + playback work inside the container.  Powers
+// ``claude /voice``, any other Claude Code audio features, and
+// generally anything that uses `sox`, `ffmpeg`, `parecord`, etc.
+//
+// macOS is deliberately unsupported: Docker Desktop / Apple Container
+// don't bridge host CoreAudio, so there's no socket to pass through.
+// The ``requires.file_exists`` gate keeps this loophole silently
+// inactive on macOS (XDG_RUNTIME_DIR is unset or the socket doesn't
+// exist), so no error noise.
+{
+  "name": "audio",
+  "description": "PipeWire/PulseAudio socket pass-through — enables microphone and playback inside the jail (Claude Code /voice, sox, ffmpeg).",
+  "version": 1,
+  "enabled": true,
+
+  // Only activate when the Linux user audio socket is actually
+  // present.  Works for both PipeWire (which ships a Pulse-compatible
+  // socket via pipewire-pulse) and classic PulseAudio.
+  "requires": {
+    "file_exists": "${XDG_RUNTIME_DIR}/pulse/native"
+  },
+
+  // No TLS intercept, no daemon — we're just granting the jail access
+  // to an existing host socket.
+  "transport": "none",
+  "lifecycle": "external",
+
+  "host_bind_mounts": [
+    {
+      "host": "${XDG_RUNTIME_DIR}/pulse/native",
+      "container": "/run/pulse/native",
+      // Bidirectional by design — audio frames flow both ways.
+      "readonly": false
+    }
+  ],
+
+  // Point libpulse / Pulse-compatible clients at the bound socket.
+  // pipewire-pulse, pa-clients, sox's pulse driver, ffmpeg's pulse
+  // input all honor this.
+  "jail_env": {
+    "PULSE_SERVER": "unix:/run/pulse/native"
+  }
+}

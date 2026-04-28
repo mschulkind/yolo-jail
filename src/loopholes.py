@@ -72,13 +72,17 @@ the next ``yolo run``.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import pyjson5
+
+log = logging.getLogger("yolo.loopholes")
 
 
 # Both podman and docker translate the literal "host-gateway" into the
@@ -141,6 +145,23 @@ class HostDaemon:
 
 
 @dataclass
+class HostBindMount:
+    """A host path to surface inside the jail as a bind mount.
+
+    Used for loopholes that pass through an already-existing,
+    host-managed resource — the PipeWire/Pulse socket is the
+    canonical example — where there's no daemon to spawn on our
+    side, we're just granting the jail access to a socket or path
+    it otherwise wouldn't see.  Read-only by default so the default
+    blast radius stays narrow; socket sources need ``readonly=False``
+    to accept writes (audio playback/record does this)."""
+
+    host: Path
+    container: str
+    readonly: bool = True
+
+
+@dataclass
 class Requires:
     """Activation preconditions.  A loophole is *present* regardless —
     but it's only *active* (docker wiring, daemons spawned) when every
@@ -152,6 +173,15 @@ class Requires:
     # ``"command_on_path": "claude"`` — no point running the Claude OAuth
     # broker if there's no Claude to refresh for.
     command_on_path: Optional[str] = None
+
+    # A host path that must exist.  Supports ``${VAR}`` expansion
+    # against the host env at check time.  Example (audio loophole):
+    # ``"file_exists": "${XDG_RUNTIME_DIR}/pulse/native"`` — only
+    # activate when the user's PipeWire/Pulse socket is actually
+    # there.  An unresolved ``${VAR}`` expands to empty, which never
+    # matches a real path, so the loophole stays inactive rather than
+    # accidentally landing on ``/pulse/native`` at the root.
+    file_exists: Optional[str] = None
 
 
 @dataclass
@@ -171,6 +201,7 @@ class Loophole:
     doctor_cmd: Optional[List[str]] = None
     host_daemon: Optional[HostDaemon] = None
     jail_daemon: Optional[JailDaemon] = None
+    host_bind_mounts: List[HostBindMount] = field(default_factory=list)
     requires: Requires = field(default_factory=Requires)
     # Where this loophole was loaded from: bundled / user / config.
     # Back-compat: from_config stays as a property below.
@@ -194,6 +225,10 @@ class Loophole:
 
             if _shutil.which(req.command_on_path) is None:
                 return False
+        if req.file_exists is not None:
+            expanded = _expand_env(req.file_exists)
+            if not expanded or not Path(expanded).exists():
+                return False
         return True
 
     @property
@@ -215,6 +250,12 @@ class Loophole:
 
             if _shutil.which(req.command_on_path) is None:
                 return f"{req.command_on_path!r} not on PATH"
+        if req.file_exists is not None:
+            expanded = _expand_env(req.file_exists)
+            if not expanded or not Path(expanded).exists():
+                raw = req.file_exists
+                shown = expanded if expanded else "<empty after env expansion>"
+                return f"host path {raw!r} missing (resolved to {shown!r})"
         return None
 
     @property
@@ -225,6 +266,34 @@ class Loophole:
 
 class LoopholeError(ValueError):
     """Raised when a manifest is malformed."""
+
+
+_ENV_REF = re.compile(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _expand_env(s: str) -> str:
+    """Expand ``${VAR}`` and ``$VAR`` refs against the host env.
+
+    Unresolved refs collapse to empty string (unlike shell, which
+    leaves the literal ``$VAR`` in place).  That's deliberate: a
+    loophole gating on ``${XDG_RUNTIME_DIR}/pulse/native`` while
+    ``XDG_RUNTIME_DIR`` is unset shouldn't accidentally match
+    ``/pulse/native`` at the filesystem root — that'd be a
+    surprising activation gate.  Empty strings fail the subsequent
+    ``Path.exists`` check, which is the honest outcome.
+    """
+
+    def _sub(m: "re.Match[str]") -> str:
+        name = m.group(1) or m.group(2)
+        return os.environ.get(name, "")
+
+    return _ENV_REF.sub(_sub, s)
+
+
+def load_loophole(module_path: Path) -> Loophole:
+    """Public entrypoint: load a single loophole from its dir.  Useful
+    for ad-hoc inspection (e.g. tests) without running full discovery."""
+    return _load_manifest(module_path)
 
 
 def _load_manifest(module_path: Path) -> Loophole:
@@ -304,6 +373,9 @@ def _load_manifest(module_path: Path) -> Loophole:
 
     host_daemon = _parse_host_daemon(manifest_path, data.get("host_daemon"))
     jail_daemon = _parse_jail_daemon(manifest_path, data.get("jail_daemon"))
+    host_bind_mounts = _parse_host_bind_mounts(
+        manifest_path, data.get("host_bind_mounts")
+    )
     requires = _parse_requires(manifest_path, data.get("requires"))
 
     return Loophole(
@@ -320,6 +392,7 @@ def _load_manifest(module_path: Path) -> Loophole:
         doctor_cmd=doctor_cmd,
         host_daemon=host_daemon,
         jail_daemon=jail_daemon,
+        host_bind_mounts=host_bind_mounts,
         requires=requires,
     )
 
@@ -334,7 +407,54 @@ def _parse_requires(manifest_path: Path, raw: Any) -> Requires:
         raise LoopholeError(
             f"{manifest_path}: 'requires.command_on_path' must be a string"
         )
-    return Requires(command_on_path=command_on_path)
+    file_exists = raw.get("file_exists")
+    if file_exists is not None and not isinstance(file_exists, str):
+        raise LoopholeError(f"{manifest_path}: 'requires.file_exists' must be a string")
+    return Requires(command_on_path=command_on_path, file_exists=file_exists)
+
+
+def _parse_host_bind_mounts(manifest_path: Path, raw: Any) -> List[HostBindMount]:
+    """Parse the ``host_bind_mounts`` array.
+
+    Each entry: ``{host: str, container: str, readonly: bool=True}``.
+    The host path may contain ``${VAR}`` refs; we expand them at parse
+    time so downstream code sees concrete ``Path`` objects.  Empty
+    expansions (unset env var) keep the Path as-is; ``docker_args_for``
+    will skip such mounts with a log message instead of crashing."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise LoopholeError(f"{manifest_path}: 'host_bind_mounts' must be a list")
+    out: List[HostBindMount] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise LoopholeError(
+                f"{manifest_path}: host_bind_mounts[{i}] must be a mapping"
+            )
+        host_raw = entry.get("host")
+        container = entry.get("container")
+        if not isinstance(host_raw, str) or not host_raw:
+            raise LoopholeError(
+                f"{manifest_path}: host_bind_mounts[{i}].host must be a non-empty string"
+            )
+        if not isinstance(container, str) or not container:
+            raise LoopholeError(
+                f"{manifest_path}: host_bind_mounts[{i}].container must be a non-empty string"
+            )
+        readonly_raw = entry.get("readonly", True)
+        if not isinstance(readonly_raw, bool):
+            raise LoopholeError(
+                f"{manifest_path}: host_bind_mounts[{i}].readonly must be a boolean"
+            )
+        expanded = _expand_env(host_raw)
+        out.append(
+            HostBindMount(
+                host=Path(expanded),
+                container=container,
+                readonly=readonly_raw,
+            )
+        )
+    return out
 
 
 def _parse_host_daemon(manifest_path: Path, raw: Any) -> Optional[HostDaemon]:
@@ -640,6 +760,24 @@ def docker_args_for(loopholes: List[Loophole]) -> List[str]:
                     "restart": m.jail_daemon.restart,
                 }
             )
+
+        for bm in m.host_bind_mounts:
+            # Skip mounts whose source vanished between manifest
+            # parse and now (e.g. user stopped pipewire).  podman
+            # rejects missing-source bind mounts with an opaque
+            # error; logging + skipping keeps the rest of the
+            # jail up and the operator can reinstall / restart.
+            if not bm.host.exists():
+                log.warning(
+                    "loophole %s: skipping bind mount, host source missing: %s",
+                    m.name,
+                    bm.host,
+                )
+                continue
+            spec = f"{bm.host}:{bm.container}"
+            if bm.readonly:
+                spec += ":ro"
+            args.extend(["-v", spec])
 
         for k, v in m.jail_env.items():
             args.extend(["-e", f"{k}={v}"])

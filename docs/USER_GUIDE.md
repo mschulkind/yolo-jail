@@ -124,19 +124,19 @@ brew install mschulkind-oss/tap/yolo-jail
 
 This is the recommended path for users who just want to run yolo-jail. The Homebrew formula is published to [mschulkind-oss/homebrew-tap](https://github.com/mschulkind-oss/homebrew-tap) automatically on every release via the `brew` job in `.github/workflows/publish.yml`.
 
-**Note:** the Homebrew install does **not** set up the host-side Claude OAuth token refresher. If you run many jails in parallel against one Claude account and want to avoid refresh-token races, either install from source (Option B) to get the systemd timer, or follow [scripts/README.md](../scripts/README.md) to install the refresher manually via launchd (macOS) or systemd user units (Linux).
+**Note:** the Homebrew install skips the Claude OAuth broker state init. If you run many jails in parallel against one Claude account, install from source (Option B) so `just deploy` can prime the broker's CA + leaf certs.
 
 #### Option B — Install from source
 
-Required if you want the token refresher auto-installed via `just deploy`, or if you're hacking on yolo-jail. Identical on Linux and macOS:
+Required if you want the Claude OAuth broker primed via `just deploy`, or if you're hacking on yolo-jail. Identical on Linux and macOS:
 
 ```bash
 git clone https://github.com/mschulkind-oss/yolo-jail.git
 cd yolo-jail
-just deploy      # builds + installs yolo CLI + host-side token refresher
+just deploy      # builds + installs yolo CLI + primes claude-oauth-broker state
 ```
 
-`just deploy` is idempotent and safe to re-run. On Linux it installs a systemd `--user` timer for the Claude OAuth token refresher. On macOS (no systemd `--user`), the same script is installable via cron or launchd — see [scripts/README.md](../scripts/README.md) for launchd instructions.
+`just deploy` is idempotent and safe to re-run.
 
 To upgrade later:
 
@@ -191,19 +191,15 @@ claude                 # Runs /login on first launch
 
 Tokens are stored in `~/.local/share/yolo-jail/home/` on the host (same path on Linux and macOS) and persist across jail restarts. You do **not** need to re-authenticate each time, and on Docker/Podman runtimes a `/login` in any jail propagates to every other jail automatically.
 
-### Claude OAuth token refresher
+### Claude OAuth broker (refresh serialization)
 
-Anthropic uses single-use refresh tokens — when multiple jails share the same `.credentials.json` and two of them try to refresh the OAuth token in the same window, one loses the race and gets logged out. YOLO Jail ships a **host-side refresher** that keeps the shared token fresh on a timer, so jails never refresh on their own.
+Anthropic uses single-use refresh tokens — when multiple jails share the same `.credentials.json` and two of them try to refresh in the same window, one loses the race and gets logged out. YOLO Jail ships the **claude-oauth-broker** loophole: a host-side daemon that serializes refreshes behind a flock. Jails route their refresh requests through it instead of calling Anthropic directly.
 
-`just deploy` installs the refresher. On Linux, it runs as a systemd `--user` timer (every 10 minutes, refreshes when the token has under 30 minutes of headroom). On macOS, install via launchd or cron — see [scripts/README.md](../scripts/README.md).
+The broker refreshes on demand — when a jail asks for a refresh, if the on-disk token has headroom we return it cached, otherwise we refresh upstream once and hand the result back. No background timer, no proactive refresh, no wasted refresh-token rotations.
 
-Once installed, `yolo doctor` (alias for `yolo check`) includes a "Claude Token Refresher" section that reports:
+`just deploy` primes the broker's CA + leaf certs into `~/.local/share/yolo-jail/state/claude-oauth-broker/`. Jails activate the loophole automatically when `claude` is on PATH. `yolo doctor` includes a broker self-check covering cert state and credentials parseability.
 
-- Script presence + executable
-- Credentials parse + remaining headroom
-- (Linux) systemd unit installed, timer enabled + active, last run state, next scheduled tick
-
-> **Security note:** Auth tokens are stored separately from your host credentials. The jail never accesses your host `~/.ssh/`, `~/.gitconfig`, or cloud credentials. The token refresher reads only `~/.local/share/yolo-jail/home/.claude/.credentials.json` — never your host `~/.claude/`.
+> **Security note:** Auth tokens are stored separately from your host credentials. The jail never accesses your host `~/.ssh/`, `~/.gitconfig`, or cloud credentials. The broker refreshes `~/.local/share/yolo-jail/home/.claude/.credentials.json` and, when it shares the same refresh token as your host `~/.claude/.credentials.json`, mirrors the new tokens there too so host Claude Code stays logged in.
 
 ---
 
@@ -953,7 +949,7 @@ YOLO Jail runs on Linux and macOS as first-class platforms. Everything in this g
 
 ## Troubleshooting
 
-Start with `yolo check` — it validates your entire setup on both platforms: runtime (podman/docker/container), nix, config, image, running containers, GPU (Linux only), macOS VM backend (macOS only), and the Claude token refresher.
+Start with `yolo check` — it validates your entire setup on both platforms: runtime (podman/docker/container), nix, config, image, running containers, GPU (Linux only), macOS VM backend (macOS only), and the Claude OAuth broker loophole.
 
 ```bash
 yolo check                    # full check including nix build
@@ -1015,12 +1011,9 @@ yolo check --no-build         # fast — skip nix build
 
 **Claude keeps logging out across jails**
 
-- Full triage walkthrough: [docs/claude-token-logouts.md](claude-token-logouts.md). It maps each `yolo doctor` symptom to a fix and escalates to the MITM broker when needed.
-- Usually means the host-side token refresher isn't running. Check with `yolo check` — it has a dedicated "Claude Token Refresher" section.
-- Linux: `systemctl --user status claude-token-refresher.timer` and `journalctl --user -u claude-token-refresher -n 30`
-- macOS: check your launchd/cron setup per [scripts/README.md](../scripts/README.md)
-- Background: Anthropic rotates refresh tokens single-use, so multiple jails refreshing simultaneously race each other. The refresher serializes refreshes on the host so jails never race.
-- When the refresher isn't enough, install the `claude-oauth-broker` loophole (bundled with `just deploy`; see [docs/loopholes.md](loopholes.md) for the loophole system and [loopholes/claude-oauth-broker/README.md](../loopholes/claude-oauth-broker/README.md) for operator notes). The broker terminates TLS for `platform.claude.com` on the host so jails can't refresh independently — eliminating the race class entirely.
+- Full triage walkthrough: [docs/claude-token-logouts.md](claude-token-logouts.md). It maps each `yolo doctor` symptom to a fix.
+- Background: Anthropic rotates refresh tokens single-use, so multiple jails refreshing simultaneously race each other. The `claude-oauth-broker` loophole (bundled, active by default when `claude` is on PATH) serializes refreshes behind an `flock` on the host so jails can't race — eliminating the class entirely.
+- Run `yolo check` and look at the Loopholes section for broker health. Common recoveries: `yolo-claude-oauth-broker-host --init-ca` if certs are missing, then restart your jail.
 
 ### Linux-Specific Issues
 

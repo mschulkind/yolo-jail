@@ -7,11 +7,16 @@ loophole.  Claude Code inside the jail opens TLS to
 ``127.0.0.1``, and this daemon terminates the TLS with a leaf cert the
 jail trusts (via ``NODE_EXTRA_CA_CERTS``).
 
-For ``POST /v1/oauth/token``: forward the refresh request to the
-host-side broker over the loophole's Unix socket (the flock +
-single-writer lives there).  For any other path: reverse-proxy to the
-real ``platform.claude.com`` so ``/login`` and any future endpoints
-keep working.
+For ``POST /v1/oauth/token`` with ``grant_type=refresh_token``:
+forward the refresh to the host-side broker over the loophole's Unix
+socket (the flock + single-writer lives there).  For any other
+``/v1/oauth/token`` grant (``authorization_code`` from ``/login``,
+future PKCE exchanges, …) and for any other path: ship the request
+over the same socket with ``action=proxy`` and let the host broker
+call the real ``platform.claude.com``.  We can't dial the upstream
+ourselves — ``--add-host`` maps the hostname back to this daemon, so
+a direct ``urllib.urlopen`` loops.  The host has normal DNS, so it
+does the upstream call and returns the response bytes to us.
 
 No privileged host ports, no host-side firewall changes, no tampering
 with the jail's ambient caps.  Binding :443 inside a container is
@@ -25,6 +30,7 @@ Files come from the bind-mounted loophole directory:
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import os
@@ -32,8 +38,6 @@ import socket
 import ssl
 import struct
 import sys
-import urllib.error
-import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -74,34 +78,44 @@ def _recv_all(conn: socket.socket, n: int) -> Optional[bytes]:
 
 def ask_host_broker(socket_path: str, request: Dict[str, Any]) -> Dict[str, Any]:
     """Send a request to the host-side OAuth broker over its Unix socket,
-    return the parsed JSON response.  Raises ``RuntimeError`` on protocol
-    errors — caller translates those into 502s for Claude."""
+    return the parsed JSON response.  Raises ``RuntimeError`` on any
+    transport or protocol failure — caller translates those into 502s for
+    Claude.  OSErrors (host daemon dead, socket bind-mount stale,
+    connection refused, read timeout) are wrapped as RuntimeError so a
+    single ``except RuntimeError`` in callers catches every failure
+    mode; otherwise the exception escapes the HTTP handler and Claude
+    sees a torn TLS connection mid-response — which during ``/login``
+    looks like "socket closed too soon after I pasted the code"."""
     conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     conn.settimeout(30.0)
     try:
-        conn.connect(socket_path)
-        body = json.dumps(request).encode()
-        conn.sendall(struct.pack(">I", len(body)))
-        conn.sendall(body)
-        stdout = bytearray()
-        rc: Optional[int] = None
-        while True:
-            header = _recv_all(conn, 5)
-            if header is None:
-                break
-            stream_id, length = struct.unpack(">BI", header)
-            payload = _recv_all(conn, length) if length else b""
-            if payload is None:
-                break
-            if stream_id == STREAM_STDOUT:
-                stdout.extend(payload)
-            elif stream_id == STREAM_STDERR:
-                log.warning(
-                    "host broker stderr: %s", payload.decode(errors="replace").strip()
-                )
-            elif stream_id == STREAM_EXIT:
-                (rc,) = struct.unpack(">i", payload)
-                break
+        try:
+            conn.connect(socket_path)
+            body = json.dumps(request).encode()
+            conn.sendall(struct.pack(">I", len(body)))
+            conn.sendall(body)
+            stdout = bytearray()
+            rc: Optional[int] = None
+            while True:
+                header = _recv_all(conn, 5)
+                if header is None:
+                    break
+                stream_id, length = struct.unpack(">BI", header)
+                payload = _recv_all(conn, length) if length else b""
+                if payload is None:
+                    break
+                if stream_id == STREAM_STDOUT:
+                    stdout.extend(payload)
+                elif stream_id == STREAM_STDERR:
+                    log.warning(
+                        "host broker stderr: %s",
+                        payload.decode(errors="replace").strip(),
+                    )
+                elif stream_id == STREAM_EXIT:
+                    (rc,) = struct.unpack(">i", payload)
+                    break
+        except OSError as e:
+            raise RuntimeError(f"host broker socket {socket_path}: {e}") from e
     finally:
         conn.close()
     if rc is None:
@@ -114,36 +128,81 @@ def ask_host_broker(socket_path: str, request: Dict[str, Any]) -> Dict[str, Any]
         raise RuntimeError(f"host broker returned non-JSON: {e}") from e
 
 
-# --- Reverse proxy for non-OAuth paths --------------------------------------
+# --- Reverse proxy for non-refresh traffic ----------------------------------
+#
+# We cannot dial ``platform.claude.com`` from inside the jail directly: the
+# ``--add-host`` that makes Claude Code's TLS land here also makes our own
+# outbound urllib call resolve back to 127.0.0.1 → us, in a loop.  The host
+# broker has normal DNS, so we ship the request over the existing Unix
+# socket and let the host do the upstream call.
 
 
 def _proxy_upstream(
-    method: str, path: str, headers: Dict[str, str], body: bytes
+    host_socket_path: str,
+    method: str,
+    path: str,
+    headers: Dict[str, str],
+    body: bytes,
 ) -> Tuple[int, Dict[str, str], bytes]:
-    url = f"https://{UPSTREAM_HOST}{path}"
-    fwd_headers = {
-        k: v
-        for k, v in headers.items()
-        if k.lower() not in {"host", "connection", "content-length"}
+    request = {
+        "action": "proxy",
+        "method": method,
+        "path": path,
+        "headers": headers,
+        "body_b64": base64.b64encode(body).decode("ascii") if body else "",
     }
-    req = urllib.request.Request(
-        url, data=body or None, method=method, headers=fwd_headers
-    )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, {k: v for k, v in resp.headers.items()}, resp.read()
-    except urllib.error.HTTPError as e:
-        return e.code, {"Content-Type": "application/json"}, e.read()
-    except (urllib.error.URLError, OSError) as e:
-        log.error("proxy upstream error: %s", e)
+        resp = ask_host_broker(host_socket_path, request)
+    except RuntimeError as e:
+        log.error("proxy via host broker failed: %s", e)
         return (
             502,
             {"Content-Type": "application/json"},
-            json.dumps({"error": "upstream_unreachable"}).encode(),
+            json.dumps({"error": "broker_unavailable", "detail": str(e)}).encode(),
         )
+    if "error" in resp:
+        return (
+            502,
+            {"Content-Type": "application/json"},
+            json.dumps(resp).encode(),
+        )
+    try:
+        status = int(resp["status"])
+        resp_headers = {str(k): str(v) for k, v in (resp.get("headers") or {}).items()}
+        resp_body = base64.b64decode((resp.get("body_b64") or "").encode("ascii"))
+    except (KeyError, TypeError, ValueError) as e:
+        log.error("malformed proxy response from host broker: %s (resp=%r)", e, resp)
+        return (
+            502,
+            {"Content-Type": "application/json"},
+            json.dumps({"error": "broker_bad_response", "detail": str(e)}).encode(),
+        )
+    return status, resp_headers, resp_body
 
 
 # --- HTTP handler ------------------------------------------------------------
+
+
+def _is_refresh_grant(body: bytes) -> bool:
+    """True iff ``body`` is a JSON object with
+    ``grant_type == "refresh_token"``.
+
+    The broker serializes the single-use refresh-token rotation.
+    Anything else that hits ``/v1/oauth/token`` — most importantly
+    ``grant_type=authorization_code`` from ``/login`` — must be
+    proxied through untouched so the upstream server can mint the
+    initial credential.  Unparseable / empty bodies fall through to
+    the proxy path too; the upstream will reject them with its own
+    (honest) error message instead of the broker returning a
+    misleading ``no_refresh_token``.
+    """
+    if not body:
+        return False
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return isinstance(parsed, dict) and parsed.get("grant_type") == "refresh_token"
 
 
 class _JailBrokerHandler(BaseHTTPRequestHandler):
@@ -175,11 +234,24 @@ class _JailBrokerHandler(BaseHTTPRequestHandler):
 
     def _handle(self) -> None:
         body = self._read_body()
-        if self.command == "POST" and self.path.startswith("/v1/oauth/token"):
+        ua = self.headers.get("User-Agent", "-")
+        is_token_path = self.command == "POST" and self.path.startswith(
+            "/v1/oauth/token"
+        )
+        is_refresh = is_token_path and _is_refresh_grant(body)
+        log.info(
+            "request: %s %s body_len=%d is_refresh=%s ua=%r",
+            self.command,
+            self.path,
+            len(body),
+            is_refresh,
+            ua,
+        )
+        if is_refresh:
             try:
                 resp = ask_host_broker(self.host_socket_path, {"action": "refresh"})
             except RuntimeError as e:
-                log.error("host broker error: %s", e)
+                log.error("refresh: host broker error: %s", e)
                 self._send(
                     502,
                     json.dumps(
@@ -188,13 +260,33 @@ class _JailBrokerHandler(BaseHTTPRequestHandler):
                 )
                 return
             if "error" in resp:
+                log.warning(
+                    "refresh: broker returned error=%s (%s)",
+                    resp.get("error"),
+                    resp.get("message") or resp.get("body") or "",
+                )
                 self._send(400, json.dumps(resp).encode())
                 return
+            log.info(
+                "refresh: OK expires_in=%s",
+                resp.get("expires_in"),
+            )
             self._send(200, json.dumps(resp).encode())
             return
 
         status, headers, resp_body = _proxy_upstream(
-            self.command, self.path, dict(self.headers), body
+            self.host_socket_path,
+            self.command,
+            self.path,
+            dict(self.headers),
+            body,
+        )
+        log.info(
+            "proxy: %s %s -> %d body_len=%d",
+            self.command,
+            self.path,
+            status,
+            len(resp_body),
         )
         self._send(status, resp_body, headers)
 
