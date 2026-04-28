@@ -3057,3 +3057,79 @@ class TestHostServiceLivenessProbe:
         assert any("host-processes" in m for m in fails)
         # Sanity: sockets_dir is still the one we set up (no use-after-free).
         assert sockets_dir.is_dir()
+
+
+class TestBrokerCredsFreshness:
+    """Symptom-level health check: alarm when shared creds are about
+    to expire.  Handoff 2026-04-28 called this out as the actually
+    useful metric — refreshes either land or they don't, and doctor
+    should surface that without us needing to know WHY (Claude not
+    asking, refresher not running, server-side revocation, etc.)."""
+
+    def _write_creds(self, tmp_path, expires_in_seconds):
+        import time as _time
+
+        creds_dir = tmp_path / "home" / ".claude-shared-credentials"
+        creds_dir.mkdir(parents=True)
+        creds_file = creds_dir / ".credentials.json"
+        expires_ms = int((_time.time() + expires_in_seconds) * 1000)
+        creds_file.write_text(
+            json.dumps(
+                {
+                    "claudeAiOauth": {
+                        "accessToken": "sk-ant-xxx",
+                        "refreshToken": "sk-ant-rt-xxx",
+                        "expiresAt": expires_ms,
+                    }
+                }
+            )
+        )
+        return creds_file
+
+    def _run(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("cli.GLOBAL_HOME", tmp_path / "home")
+        events: list = []
+        cli._check_broker_creds_freshness(
+            lambda m, *a, **kw: events.append(("ok", m)),
+            lambda m, *a, **kw: events.append(("warn", m)),
+            lambda m, *a, **kw: events.append(("fail", m)),
+        )
+        return events
+
+    def test_ok_when_fresh(self, monkeypatch, tmp_path):
+        self._write_creds(tmp_path, 6 * 3600)  # 6h remaining
+        events = self._run(monkeypatch, tmp_path)
+        kinds = {kind for kind, _ in events}
+        assert kinds == {"ok"}, f"expected only ok events, got {events}"
+
+    def test_warn_when_expiring_soon(self, monkeypatch, tmp_path):
+        self._write_creds(tmp_path, 30 * 60)  # 30min remaining
+        events = self._run(monkeypatch, tmp_path)
+        warns = [m for kind, m in events if kind == "warn"]
+        assert warns, f"expected warn for near-expiry creds, got {events}"
+
+    def test_fail_when_expired(self, monkeypatch, tmp_path):
+        self._write_creds(tmp_path, -300)  # expired 5min ago
+        events = self._run(monkeypatch, tmp_path)
+        fails = [m for kind, m in events if kind == "fail"]
+        assert fails, f"expected fail for expired creds, got {events}"
+
+    def test_silent_when_creds_missing(self, monkeypatch, tmp_path):
+        # First /login hasn't happened yet — nothing to check.
+        events = self._run(monkeypatch, tmp_path)
+        assert events == [], f"expected silent skip when creds absent, got {events}"
+
+    def test_warn_when_creds_unreadable(self, monkeypatch, tmp_path):
+        monkeypatch.setattr("cli.GLOBAL_HOME", tmp_path / "home")
+        creds_dir = tmp_path / "home" / ".claude-shared-credentials"
+        creds_dir.mkdir(parents=True)
+        (creds_dir / ".credentials.json").write_text("not json {{{")
+        events: list = []
+        cli._check_broker_creds_freshness(
+            lambda m, *a, **kw: events.append(("ok", m)),
+            lambda m, *a, **kw: events.append(("warn", m)),
+            lambda m, *a, **kw: events.append(("fail", m)),
+        )
+        assert any(kind == "warn" for kind, _ in events), (
+            f"expected warn for unreadable creds, got {events}"
+        )
