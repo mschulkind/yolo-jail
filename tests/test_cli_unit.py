@@ -2950,3 +2950,110 @@ class TestBrokerSingleton:
         assert result.exit_code == 0, result.output
         assert order == ["kill", "spawn"]
         assert "restarted" in result.output.lower()
+
+
+class TestHostServiceLivenessProbe:
+    """``_check_host_service_liveness`` probes per-jail UNIX sockets to
+    confirm the daemons spawned by ``start_loopholes`` are alive.  But
+    the broker is a SINGLETON now (post-e7b7073) — its bind-mount source
+    on the host is a zero-byte placeholder, not a real socket.  Probing
+    that path always fails with ECONNREFUSED, so doctor was reporting
+    the broker as dead while the actual singleton was healthy.
+
+    Lock in the fix: the per-jail probe must skip the broker name and
+    leave broker liveness reporting to ``_check_loopholes``'s singleton
+    probe (which uses ``_broker_status`` against the singleton path)."""
+
+    def _common_setup(self, monkeypatch, tmp_path):
+        from unittest.mock import MagicMock as _MM
+
+        # Pretend we're on the host — the probe early-returns inside a jail.
+        monkeypatch.delenv("YOLO_VERSION", raising=False)
+        # Pretend a runtime is available.
+        monkeypatch.setattr(cli, "_detect_runtime_for_listing", lambda: "podman")
+        # Pretend one jail is running.
+        run_result = _MM(stdout="yolo-test-cname-abc12345\n", returncode=0)
+        monkeypatch.setattr(cli.subprocess, "run", lambda *a, **kw: run_result)
+        # Per-jail sockets dir; we'll touch a placeholder broker socket
+        # in here to mimic the host-side bind-mount source.
+        sockets_dir = tmp_path / "yolo-host-services-test"
+        sockets_dir.mkdir()
+        # Zero-byte regular file — exactly what the broker bind-mount source
+        # looks like on the host.  A connect() against it raises ENOTSOCK.
+        (sockets_dir / f"{cli.BROKER_LOOPHOLE_NAME}.sock").touch()
+        monkeypatch.setattr(
+            cli, "_host_service_sockets_dir", lambda _cname: sockets_dir
+        )
+        return sockets_dir
+
+    def _broker_loophole_entry(self):
+        """Return a (path, loophole, err) entry shaped like
+        ``_loopholes.validate_loopholes`` produces, with a broker
+        loophole that has a ``host_daemon`` field set."""
+        from unittest.mock import MagicMock as _MM
+        from src.loopholes import HostDaemon
+
+        lp = _MM()
+        lp.name = cli.BROKER_LOOPHOLE_NAME
+        lp.enabled = True
+        lp.requirements_met = True
+        lp.host_daemon = HostDaemon(cmd=["yolo-claude-oauth-broker-host"])
+        return (None, lp, None)
+
+    def test_probe_skips_singleton_broker(self, monkeypatch, tmp_path):
+        """The broker is a singleton; its per-jail sockets-dir entry
+        is a bind-mount placeholder, not a real socket.  The per-jail
+        probe must skip this loophole entirely so doctor doesn't
+        report a healthy broker as dead."""
+        self._common_setup(monkeypatch, tmp_path)
+        monkeypatch.setattr(
+            cli._loopholes,
+            "validate_loopholes",
+            lambda: [self._broker_loophole_entry()],
+        )
+
+        events: list = []
+        cli._check_host_service_liveness(
+            lambda m, *a, **kw: events.append(("ok", m)),
+            lambda m, *a, **kw: events.append(("warn", m)),
+            lambda m, *a, **kw: events.append(("fail", m)),
+        )
+        # Critically: NO failure for the broker.  A "skipping broker"
+        # info line is fine; "socket dead" is not.
+        fails = [m for kind, m in events if kind == "fail"]
+        assert all("claude-oauth-broker" not in m for m in fails), (
+            f"per-jail probe must not fail for the singleton broker; got {fails}"
+        )
+
+    def test_probe_still_runs_for_non_broker_loopholes(self, monkeypatch, tmp_path):
+        """Other loopholes (e.g. host-processes) ARE per-jail and DO
+        have real sockets — the skip must be broker-only.  Verify a
+        synthetic non-broker loophole with a missing socket still gets
+        a fail (i.e. the probe's normal logic runs)."""
+        from unittest.mock import MagicMock as _MM
+        from src.loopholes import HostDaemon
+
+        sockets_dir = self._common_setup(monkeypatch, tmp_path)
+        # Don't create a socket for "host-processes" — the probe should
+        # report it missing.
+        other = _MM()
+        other.name = "host-processes"
+        other.enabled = True
+        other.requirements_met = True
+        other.host_daemon = HostDaemon(cmd=["yolo-host-processes"])
+
+        monkeypatch.setattr(
+            cli._loopholes, "validate_loopholes", lambda: [(None, other, None)]
+        )
+
+        events: list = []
+        cli._check_host_service_liveness(
+            lambda m, *a, **kw: events.append(("ok", m)),
+            lambda m, *a, **kw: events.append(("warn", m)),
+            lambda m, *a, **kw: events.append(("fail", m)),
+        )
+        # Probe ran; reported the missing socket as a fail.
+        fails = [m for kind, m in events if kind == "fail"]
+        assert any("host-processes" in m for m in fails)
+        # Sanity: sockets_dir is still the one we set up (no use-after-free).
+        assert sockets_dir.is_dir()

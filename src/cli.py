@@ -5315,6 +5315,16 @@ def _check_host_service_liveness(ok, warn, fail) -> None:
     for cname in cnames:
         sockets_dir = _host_service_sockets_dir(cname)
         for lp in externals:
+            # Singleton broker: its per-jail entry is a bind-mount
+            # placeholder (zero-byte regular file on the host;
+            # connect() against it raises ENOTSOCK).  Liveness for
+            # the singleton is checked separately in
+            # ``_check_loopholes`` via ``_broker_status`` against the
+            # well-known singleton path.  Probing here was producing
+            # ``socket dead`` false positives that sent investigators
+            # down the wrong trail (handoff 2026-04-28).
+            if lp.name == BROKER_LOOPHOLE_NAME:
+                continue
             sock_path = sockets_dir / f"{lp.name}.sock"
             label = f"loophole {lp.name} @ {cname}"
             if not sock_path.exists():
