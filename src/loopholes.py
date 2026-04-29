@@ -678,7 +678,7 @@ def validate_loopholes(
 # ---------------------------------------------------------------------------
 
 
-def docker_args_for(loopholes: List[Loophole]) -> List[str]:
+def docker_args_for(loopholes: List[Loophole], *, runtime: str = "docker") -> List[str]:
     """Translate file-backed loopholes into docker run flags.
 
     Emits --add-host, CA mounts, NODE_EXTRA_CA_CERTS, jail_env, plus the
@@ -687,12 +687,17 @@ def docker_args_for(loopholes: List[Loophole]) -> List[str]:
 
     Config-backed loopholes are ignored here — their wiring happens in
     ``cli.start_loopholes``.  Idempotent and side-effect free.
+
+    Apple Container (``runtime="container"``) does not support ``--add-host``;
+    intercept DNS entries are skipped with a warning when that runtime is
+    active.
     """
     import json as _json
 
     args: List[str] = []
     trusted_ca_paths: List[str] = []
     jail_daemons_payload: List[Dict[str, Any]] = []
+    is_apple_container = runtime == "container"
     for m in loopholes:
         # Config-backed loopholes: wiring lives in cli.start_loopholes.
         if m.from_config:
@@ -705,7 +710,15 @@ def docker_args_for(loopholes: List[Loophole]) -> List[str]:
         container_dir = f"/etc/yolo-jail/loopholes/{m.name}"
 
         for intercept in m.intercepts:
-            args.extend(["--add-host", f"{intercept.host}:{m.broker_ip}"])
+            if is_apple_container:
+                log.warning(
+                    "loophole %s: skipping --add-host for %s "
+                    "(Apple Container does not support --add-host)",
+                    m.name,
+                    intercept.host,
+                )
+            else:
+                args.extend(["--add-host", f"{intercept.host}:{m.broker_ip}"])
 
         # Track which container paths are already covered by a directory
         # mount so we can point NODE_EXTRA_CA_CERTS at the CA without

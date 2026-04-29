@@ -7585,7 +7585,8 @@ def run(
     # src/loopholes.py for the full schema.
     docker_cmd.extend(
         _loopholes.docker_args_for(
-            _loopholes.discover_loopholes(loopholes_config=config.get("loopholes"))
+            _loopholes.discover_loopholes(loopholes_config=config.get("loopholes")),
+            runtime=runtime,
         )
     )
 

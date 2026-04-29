@@ -45,7 +45,7 @@ What the loader does at each `yolo run`:
 
 1. Scans `~/.local/share/yolo-jail/loopholes/` for subdirectories with a valid `manifest.jsonc`.
 2. Skips any with `"enabled": false`.
-3. For `tls-intercept` loopholes: emits `--add-host <host>:<broker_ip>` for each intercept, bind-mounts the CA cert into the jail at `/etc/yolo-jail/loopholes/<name>/ca.crt`, and sets `NODE_EXTRA_CA_CERTS` to all loophole CAs concatenated.
+3. For `tls-intercept` loopholes: emits `--add-host <host>:<broker_ip>` for each intercept, bind-mounts the CA cert into the jail at `/etc/yolo-jail/loopholes/<name>/ca.crt`, and sets `NODE_EXTRA_CA_CERTS` to all loophole CAs concatenated. **Note:** Apple Container (`runtime=container`) does not support `--add-host`; intercept DNS entries are skipped with a warning. CA mounts, `jail_env`, and other wiring still apply.
 4. For `unix-socket` / `spawned` loopholes — declare them via the `loopholes` shorthand in `yolo-jail.jsonc`; yolo handles spawning the daemon, creating the socket, bind-mounting it into the jail, and cleanup.
 5. Merges `jail_env` into the container env.
 

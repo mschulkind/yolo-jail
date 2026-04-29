@@ -140,6 +140,45 @@ def test_docker_args_no_ca_no_env(mods_dir: Path):
     assert args == ["--add-host", "plain.test:host-gateway"]
 
 
+def test_docker_args_apple_container_skips_add_host(mods_dir: Path):
+    """Apple Container does not support --add-host; intercepts are skipped."""
+    mod = mods_dir / "broker"
+    mod.mkdir()
+    ca = mod / "ca.crt"
+    ca.write_text("-----FAKE CA-----\n")
+    _write_manifest(
+        mod,
+        {
+            "name": "broker",
+            "description": "x",
+            "intercepts": [{"host": "example.test"}, {"host": "api.example.test"}],
+            "broker_ip": "10.0.0.1",
+            "ca_cert": "ca.crt",
+            "jail_env": {"FOO": "bar"},
+        },
+    )
+    loaded = loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    args = loopholes.docker_args_for(loaded, runtime="container")
+    # --add-host must not appear
+    assert "--add-host" not in args
+    # CA mounts, env, and other flags should still be emitted
+    assert any(f"{ca}:/etc/yolo-jail/loopholes/broker/ca.crt:ro" in a for a in args)
+    assert "FOO=bar" in args
+    assert any(a.startswith("NODE_EXTRA_CA_CERTS=") for a in args)
+
+
+def test_docker_args_apple_container_no_intercepts(mods_dir: Path):
+    """Loophole with no intercepts works fine under Apple Container."""
+    mod = mods_dir / "plain"
+    mod.mkdir()
+    _write_manifest(mod, {"name": "plain", "description": "x"})
+    args = loopholes.docker_args_for(
+        loopholes.discover_loopholes(mods_dir, include_bundled=False),
+        runtime="container",
+    )
+    assert args == []
+
+
 def test_docker_args_skip_config_backed_loopholes(tmp_path: Path):
     # Config-backed (synthesized from yolo-jail.jsonc) loopholes have no
     # file-backed mounts or intercepts — their wiring lives in
