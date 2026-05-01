@@ -2730,6 +2730,32 @@ def _host_mise_dir() -> Path:
     return host_mise
 
 
+def _ac_materialize_under_ws_state(
+    src: Path, target_rel: str, ws_state: Path, *, is_dir: bool = False
+) -> None:
+    """Copy ``src`` into ``ws_state / target_rel`` for Apple Container.
+
+    Apple Container 0.12.3 silently drops the ``-v ws_state:/home/agent``
+    parent bind mount as soon as any ``-v host_file:/home/agent/sub/...``
+    single-file mount is added (apple/container#1089 — single-file mounts
+    use a separate virtiofs share via a hardlink tempdir, and the parent
+    dir share gets shadowed).  Nested directory mounts don't trip the
+    bug, but single-file mounts do.
+
+    Workaround: instead of bind-mounting, materialize the contents into
+    ``ws_state`` directly — the existing ``ws_state:/home/agent`` dir
+    mount then exposes them at the expected paths inside the jail.
+    """
+    dst = ws_state / target_rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if is_dir:
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst, symlinks=False)
+    else:
+        shutil.copy2(src, dst)
+
+
 def _seed_agent_dir(src: Path, dst: Path, *, skip: tuple[str, ...] = ()):
     """Copy auth-related files from GLOBAL_HOME agent dir into per-workspace overlay.
 
@@ -6996,7 +7022,16 @@ def run(
     else:
         # Ensure the file exists (empty) so the mount doesn't fail
         user_env_file.touch()
-    docker_cmd.extend(["-v", f"{user_env_file}:/home/agent/.config/yolo-user-env.sh"])
+    if runtime == "container":
+        # See _ac_materialize_under_ws_state — AC can't do single-file
+        # mounts under the ws_state parent mount without dropping it.
+        _ac_materialize_under_ws_state(
+            user_env_file, ".config/yolo-user-env.sh", ws_state
+        )
+    else:
+        docker_cmd.extend(
+            ["-v", f"{user_env_file}:/home/agent/.config/yolo-user-env.sh"]
+        )
 
     docker_cmd += [
         "--workdir",
@@ -7153,7 +7188,14 @@ def run(
     except Exception:
         excludes_path = Path.home() / ".config" / "git" / "ignore"
     if excludes_path.is_file():
-        docker_cmd.extend(["-v", f"{excludes_path}:/home/agent/.config/git/ignore:ro"])
+        if runtime == "container":
+            _ac_materialize_under_ws_state(
+                excludes_path, ".config/git/ignore", ws_state
+            )
+        else:
+            docker_cmd.extend(
+                ["-v", f"{excludes_path}:/home/agent/.config/git/ignore:ro"]
+            )
         docker_cmd.extend(
             ["-e", "YOLO_GLOBAL_GITIGNORE=/home/agent/.config/git/ignore"]
         )
@@ -7482,7 +7524,14 @@ def run(
     # yolo resolves to empty config, stomping the host's config snapshot.
     if USER_CONFIG_PATH.is_file():
         container_config = f"/home/agent/.config/yolo-jail/{USER_CONFIG_PATH.name}"
-        docker_cmd.extend(["-v", f"{USER_CONFIG_PATH}:{container_config}:ro"])
+        if runtime == "container":
+            _ac_materialize_under_ws_state(
+                USER_CONFIG_PATH,
+                f".config/yolo-jail/{USER_CONFIG_PATH.name}",
+                ws_state,
+            )
+        else:
+            docker_cmd.extend(["-v", f"{USER_CONFIG_PATH}:{container_config}:ro"])
 
     # Pass the mise path through to any nested jail so the same host path
     # keeps resolving one level deeper. The path is identical inside and out.
@@ -7561,15 +7610,32 @@ def run(
         mcp_servers=mcp_servers or None,
         mcp_presets=mcp_presets or None,
     )
-    docker_cmd.extend(
-        ["-v", f"{agents_path / 'AGENTS-copilot.md'}:/home/agent/.copilot/AGENTS.md:ro"]
-    )
-    docker_cmd.extend(
-        ["-v", f"{agents_path / 'AGENTS-gemini.md'}:/home/agent/.gemini/AGENTS.md:ro"]
-    )
-    docker_cmd.extend(
-        ["-v", f"{agents_path / 'CLAUDE.md'}:/home/agent/.claude/CLAUDE.md:ro"]
-    )
+    if runtime == "container":
+        _ac_materialize_under_ws_state(
+            agents_path / "AGENTS-copilot.md", ".copilot/AGENTS.md", ws_state
+        )
+        _ac_materialize_under_ws_state(
+            agents_path / "AGENTS-gemini.md", ".gemini/AGENTS.md", ws_state
+        )
+        _ac_materialize_under_ws_state(
+            agents_path / "CLAUDE.md", ".claude/CLAUDE.md", ws_state
+        )
+    else:
+        docker_cmd.extend(
+            [
+                "-v",
+                f"{agents_path / 'AGENTS-copilot.md'}:/home/agent/.copilot/AGENTS.md:ro",
+            ]
+        )
+        docker_cmd.extend(
+            [
+                "-v",
+                f"{agents_path / 'AGENTS-gemini.md'}:/home/agent/.gemini/AGENTS.md:ro",
+            ]
+        )
+        docker_cmd.extend(
+            ["-v", f"{agents_path / 'CLAUDE.md'}:/home/agent/.claude/CLAUDE.md:ro"]
+        )
 
     if "TERM" in os.environ:
         docker_cmd.extend(["-e", f"TERM={os.environ['TERM']}"])
@@ -7585,7 +7651,8 @@ def run(
     # src/loopholes.py for the full schema.
     docker_cmd.extend(
         _loopholes.docker_args_for(
-            _loopholes.discover_loopholes(loopholes_config=config.get("loopholes"))
+            _loopholes.discover_loopholes(loopholes_config=config.get("loopholes")),
+            runtime=runtime,
         )
     )
 

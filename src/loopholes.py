@@ -678,7 +678,9 @@ def validate_loopholes(
 # ---------------------------------------------------------------------------
 
 
-def docker_args_for(loopholes: List[Loophole]) -> List[str]:
+def docker_args_for(
+    loopholes: List[Loophole], *, runtime: Optional[str] = None
+) -> List[str]:
     """Translate file-backed loopholes into docker run flags.
 
     Emits --add-host, CA mounts, NODE_EXTRA_CA_CERTS, jail_env, plus the
@@ -687,6 +689,12 @@ def docker_args_for(loopholes: List[Loophole]) -> List[str]:
 
     Config-backed loopholes are ignored here — their wiring happens in
     ``cli.start_loopholes``.  Idempotent and side-effect free.
+
+    ``runtime="container"`` (Apple Container) skips TLS-intercept
+    loopholes entirely: Apple Container 0.12.3 has no ``--add-host``
+    (apple/container#673), and its single-file bind mounts collide with
+    the ws_state parent mount (apple/container#1089).  Spawned/unix-socket
+    loopholes can't run on AC either — see ``start_loopholes``.
     """
     import json as _json
 
@@ -701,6 +709,11 @@ def docker_args_for(loopholes: List[Loophole]) -> List[str]:
         # emit nothing — they show up in ``yolo loopholes list`` but are
         # not wired into the jail.
         if not m.active:
+            continue
+        # Apple Container: TLS-intercept wiring needs --add-host, which
+        # this runtime doesn't support.  The jail_daemon/state mounts
+        # also trip the single-file-mount bug.  Skip the whole loophole.
+        if runtime == "container" and m.transport == "tls-intercept":
             continue
         container_dir = f"/etc/yolo-jail/loopholes/{m.name}"
 

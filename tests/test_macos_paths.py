@@ -886,3 +886,191 @@ class TestAppleContainerRuntime:
             rt, err = cli._runtime_for_check({"runtime": "container"})
             assert rt == "container"
             assert err is None
+
+
+# ---------------------------------------------------------------------------
+# Apple Container mount workarounds — apple/container#673, #1089
+#
+# AC 0.12.3:
+#   * has no --add-host (apple/container#673)
+#   * silently drops the ws_state parent bind mount whenever any -v <file>:
+#     target under it is added (apple/container#1089)
+#
+# cli.py's AC branch must therefore (a) skip tls-intercept loopholes and
+# (b) materialize single-file "config" inputs into ws_state directly
+# instead of emitting a -v flag for each.  These tests pin both
+# invariants so regressions don't slip through.
+# ---------------------------------------------------------------------------
+
+
+class TestAppleContainerMountWorkarounds:
+    """AC can't do single-file -v into /home/agent/* — verify we don't."""
+
+    @patch("subprocess.Popen")
+    @patch("cli.auto_load_image")
+    @patch("cli._check_config_changes", return_value=True)
+    @patch("cli.find_running_container", return_value=None)
+    @patch("subprocess.run")
+    @patch("subprocess.check_output")
+    @patch("shutil.which")
+    def test_no_single_file_mounts_under_home_agent(
+        self,
+        mock_which,
+        mock_check_output,
+        mock_run,
+        mock_find,
+        mock_config_changes,
+        mock_auto_load,
+        mock_popen,
+        tmp_path,
+        monkeypatch,
+    ):
+        """AC run() must not emit any ``-v <host>:/home/agent/*/*`` single-file mount.
+
+        Directory mounts (e.g. ``.claude/skills``) are fine — they don't
+        trip apple/container#1089.  File mounts do, and they erase the
+        ``ws_state:/home/agent`` parent mount, which is why jails were
+        starting with ``/home/agent`` empty and read-only.
+        """
+        _set_macos(monkeypatch)
+        _run_monkeypatch(monkeypatch, tmp_path)
+        _mock_runtimes(mock_which, runtimes=("container", "nix"))
+        monkeypatch.setenv("YOLO_RUNTIME", "container")
+        monkeypatch.setattr(cli, "_runtime_is_connectable", lambda rt: True)
+        monkeypatch.setattr(cli, "_is_apple_container", lambda p: True)
+
+        # Force the git-ignore branch by making the global gitignore exist.
+        host_gitignore = tmp_path / "host-gitignore"
+        host_gitignore.write_text("*.pyc\n")
+        monkeypatch.setattr(
+            Path, "home", classmethod(lambda cls: tmp_path / "fake-home")
+        )
+        (tmp_path / "fake-home" / ".config" / "git").mkdir(parents=True)
+        (tmp_path / "fake-home" / ".config" / "git" / "ignore").write_text("*.pyc\n")
+
+        # Force the user-config branch by writing a user config.
+        (tmp_path / "user-config.jsonc").write_text('{"packages": []}')
+
+        # Force user_env so the yolo-user-env.sh path runs with content.
+        (tmp_path / "yolo-jail.jsonc").write_text('{"env": {"FOO": "bar"}}')
+        mock_check_output.side_effect = FileNotFoundError
+
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["run", "--", "bash"])
+        assert mock_popen.called, f"popen should be called; output: {result.output}"
+
+        docker_cmd = [str(a) for a in mock_popen.call_args[0][0]]
+
+        # Walk `-v <spec>` pairs and reject any single-file mount whose
+        # target sits inside /home/agent/<subdir>/ (apple/container#1089).
+        # File vs dir is decided by the host-side path (trusted here —
+        # the CLI constructs both explicitly).
+        bad = []
+        for i, arg in enumerate(docker_cmd):
+            if arg != "-v":
+                continue
+            spec = docker_cmd[i + 1]
+            # "volname:/target[:ro]" — first colon separates source from
+            # target (volume names don't contain colons).
+            src, _, rest = spec.partition(":")
+            target = rest.split(":", 1)[0]
+            if not target.startswith("/home/agent/"):
+                continue
+            if target == "/home/agent":
+                continue  # the parent mount itself
+            # File mount = host-side src is a file (not a dir).  Volume
+            # names (no leading /) are always dir-like — skip them.
+            if not src.startswith("/"):
+                continue
+            src_path = Path(src)
+            if src_path.is_file():
+                bad.append(spec)
+
+        assert not bad, (
+            f"Apple Container can't do single-file bind mounts under "
+            f"/home/agent/* without dropping the parent mount "
+            f"(apple/container#1089). Offending specs: {bad}"
+        )
+
+    @patch("subprocess.Popen")
+    @patch("cli.auto_load_image")
+    @patch("cli._check_config_changes", return_value=True)
+    @patch("cli.find_running_container", return_value=None)
+    @patch("subprocess.run")
+    @patch("subprocess.check_output")
+    @patch("shutil.which")
+    def test_materializes_into_ws_state(
+        self,
+        mock_which,
+        mock_check_output,
+        mock_run,
+        mock_find,
+        mock_config_changes,
+        mock_auto_load,
+        mock_popen,
+        tmp_path,
+        monkeypatch,
+    ):
+        """Files that would have been single-file mounts must land in ws_state.
+
+        The AC branch mounts ``ws_state`` at ``/home/agent`` as a single
+        writable virtiofs share, so writing into ``ws_state/.config/...``
+        surfaces inside the jail at the same path the old ``-v`` emitted.
+        """
+        _set_macos(monkeypatch)
+        _run_monkeypatch(monkeypatch, tmp_path)
+        _mock_runtimes(mock_which, runtimes=("container", "nix"))
+        monkeypatch.setenv("YOLO_RUNTIME", "container")
+        monkeypatch.setattr(cli, "_runtime_is_connectable", lambda rt: True)
+        monkeypatch.setattr(cli, "_is_apple_container", lambda p: True)
+
+        # Seed a host gitignore so the branch at cli.py runs.
+        monkeypatch.setattr(
+            Path, "home", classmethod(lambda cls: tmp_path / "fake-home")
+        )
+        fake_home = tmp_path / "fake-home"
+        (fake_home / ".config" / "git").mkdir(parents=True)
+        (fake_home / ".config" / "git" / "ignore").write_text("*.pyc\n")
+
+        # Seed a user-level yolo config.
+        (tmp_path / "user-config.jsonc").write_text('{"packages": []}')
+
+        # Workspace config with a user env var so yolo-user-env.sh gets content.
+        workspace = tmp_path
+        (workspace / "yolo-jail.jsonc").write_text('{"env": {"HELLO": "world"}}')
+        mock_check_output.side_effect = FileNotFoundError
+
+        mock_proc = MagicMock()
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["run", "--", "bash"])
+        assert mock_popen.called, f"popen should be called; output: {result.output}"
+
+        ws_state = workspace / ".yolo" / "home"
+        # yolo-user-env.sh materialized under .config/
+        user_env = ws_state / ".config" / "yolo-user-env.sh"
+        assert user_env.is_file(), f"expected {user_env} to exist"
+        assert "HELLO" in user_env.read_text()
+
+        # Global gitignore materialized under .config/git/
+        gitignore = ws_state / ".config" / "git" / "ignore"
+        assert gitignore.is_file(), f"expected {gitignore} to exist"
+        assert gitignore.read_text() == "*.pyc\n"
+
+        # User-level yolo config materialized under .config/yolo-jail/
+        user_cfg = ws_state / ".config" / "yolo-jail" / "user-config.jsonc"
+        assert user_cfg.is_file(), f"expected {user_cfg} to exist"
+
+        # AGENTS.md / CLAUDE.md materialized under the dotted agent dirs
+        for rel in (".copilot/AGENTS.md", ".gemini/AGENTS.md", ".claude/CLAUDE.md"):
+            assert (ws_state / rel).is_file(), (
+                f"expected {ws_state / rel} to exist after AC materialization"
+            )
