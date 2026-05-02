@@ -441,11 +441,7 @@ class TestCheckCommand:
         # Extract the line that mentions docker's version — it should
         # carry the "not selected" qualifier and no warning glyph.
         docker_line = next(
-            (
-                line
-                for line in result.output.splitlines()
-                if "Docker version" in line
-            ),
+            (line for line in result.output.splitlines() if "Docker version" in line),
             "",
         )
         assert docker_line, f"expected a docker version line, got: {result.output}"
@@ -497,11 +493,7 @@ class TestCheckCommand:
         runner = CliRunner()
         result = runner.invoke(app, ["check", "--no-build"])
         docker_line = next(
-            (
-                line
-                for line in result.output.splitlines()
-                if "Docker version" in line
-            ),
+            (line for line in result.output.splitlines() if "Docker version" in line),
             "",
         )
         assert docker_line, f"expected docker version line, got: {result.output}"

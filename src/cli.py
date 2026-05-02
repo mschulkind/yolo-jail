@@ -722,7 +722,7 @@ def _nix_custom_conf_included() -> Optional[bool]:
         # (non-fatal).  Tolerate extra whitespace.
         for prefix in ("!include", "include"):
             if stripped.startswith(prefix):
-                rest = stripped[len(prefix):].lstrip()
+                rest = stripped[len(prefix) :].lstrip()
                 if rest == "/etc/nix/nix.custom.conf":
                     return True
     return False
@@ -5587,8 +5587,18 @@ def check(
     # `container info` — the latter returns usage text even without a
     # running apiserver.
     runtime_probes = [
-        ("podman", ["podman", "--version"], ["podman", "info"], "Run 'podman info' to diagnose"),
-        ("docker", ["docker", "--version"], ["docker", "info"], "Run 'docker info' to diagnose"),
+        (
+            "podman",
+            ["podman", "--version"],
+            ["podman", "info"],
+            "Run 'podman info' to diagnose",
+        ),
+        (
+            "docker",
+            ["docker", "--version"],
+            ["docker", "info"],
+            "Run 'docker info' to diagnose",
+        ),
         (
             "container",
             ["container", "--version"],
@@ -5642,7 +5652,9 @@ def check(
         if rt == selected_runtime or detected_runtime is None:
             warn(f"{rt}: {version} (not connected)", hint)
         else:
-            console.print(f"  [dim]· {rt}: {version} (not connected — not selected)[/dim]")
+            console.print(
+                f"  [dim]· {rt}: {version} (not connected — not selected)[/dim]"
+            )
     if detected_runtime is None:
         fail(
             "No container runtime found",

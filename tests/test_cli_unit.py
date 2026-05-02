@@ -1300,8 +1300,7 @@ class TestNixCustomConfIncluded:
 
         conf = tmp_path / "nix.conf"
         conf.write_text(
-            "build-users-group = nixbld\n"
-            "!include /etc/nix/nix.custom.conf\n"
+            "build-users-group = nixbld\n!include /etc/nix/nix.custom.conf\n"
         )
         self._patch_conf(monkeypatch, conf)
         assert _nix_custom_conf_included() is True
