@@ -1104,25 +1104,8 @@ def _install_claude_plugins(plugin_map: dict, lsp_servers: dict):
             pass  # non-fatal — plugin will be installed on next boot
 
 
-def _credentials_expiry(path: Path) -> int:
-    """Return the expiresAt timestamp (ms) from a Claude credentials file, or 0."""
-    import json as _json
-
-    try:
-        data = _json.loads(path.read_text())
-        oauth = data.get("claudeAiOauth") or {}
-        return int(oauth.get("expiresAt", 0))
-    except (ValueError, OSError, KeyError):
-        return 0
-
-
 def _sync_host_claude_files():
-    """Copy host ~/.claude/ files into the jail, except settings.json (merged separately).
-
-    For .credentials.json, keeps the freshest token — if the jail already has
-    credentials with a later expiry (from a prior /login), the host copy is
-    skipped so the user doesn't have to re-login in every jail.
-    """
+    """Copy host ~/.claude/ files into the jail, except settings.json (merged separately)."""
     import json as _json
 
     host_claude_files = _json.loads(os.environ.get("YOLO_HOST_CLAUDE_FILES", "[]"))
@@ -1132,21 +1115,9 @@ def _sync_host_claude_files():
         if fname == "settings.json":
             continue  # handled by configure_claude() via deep-merge
         src = host_claude_dir / fname
-        # Credentials live in the shared dir (directory bind mount that
-        # supports atomic rename).  Other files go to the per-workspace
-        # .claude/ overlay as before.
-        if fname == ".credentials.json":
-            dst = CLAUDE_SHARED_CREDENTIALS_DIR / fname
-        else:
-            dst = CLAUDE_DIR / fname
+        dst = CLAUDE_DIR / fname
         if not src.exists():
             continue
-        # For credentials: keep the token with the later expiry.
-        if fname == ".credentials.json":
-            dst_expiry = _credentials_expiry(dst)
-            src_expiry = _credentials_expiry(src)
-            if dst_expiry >= src_expiry and dst_expiry > 0:
-                continue  # jail credentials are fresher — keep them
         try:
             shutil.copy2(str(src), str(dst))
         except shutil.SameFileError:
