@@ -127,6 +127,7 @@ and needs **no macOS changes**. Only `cli.py` (host-side) is platform-aware.
 | | | | | |
 | **Networking** | | | | |
 | Bridge mode (default) | ✅ | ✅ | ✅¹ | ¹Container gets own IP on 192.168.64.x |
+| `--add-host` DNS overrides | ✅ | ✅ | ❌ | AC: not supported; `tls-intercept` loopholes skipped |
 | Host networking (`--network host`) | ✅ | ✅ | ❌ | Not supported by Apple Container |
 | Port publishing (`network.ports`) | ✅ | ✅ | ✅ | |
 | Port forwarding (`forward_host_ports`) | ✅ | ✅ | ✅ | Native `--publish-socket` on AC |

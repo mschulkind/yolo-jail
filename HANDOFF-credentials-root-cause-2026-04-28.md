@@ -49,61 +49,52 @@ Optional cleanups (separate commit):
 - **Existing users with valid shared creds:** unaffected.  Broker's `/login` mirror keeps shared creds fresh as long as the user does at least one `/login` from inside a jail.  Per the handoff, refreshes are not currently observed in the jail-side proxy logs — so the question of "what keeps shared creds fresh long-term?" needs a second answer (the proactive refresher follow-up, see below).
 - **Fresh installs / users who only `/login`-ed on the host:** would need to `/login` once from inside a jail to populate shared creds.  This is the migration `cb6e850` intended.
 
-## Remaining unanswered: does Claude in the jail refresh at all?
+## Resolved: does Claude in the jail refresh at all?
 
-Even after this fix, the observation that the broker proxy log has zero `is_refresh=True` entries is unexplained.  Two hypotheses:
+**Answered 2026-04-28T19:24Z by host-side experiment.** Host Claude DOES refresh proactively. Procedure:
 
-1. **Claude does refresh, but our TLS terminator + broker log filtering loses it.** Falsifiable: instrument `oauth_broker_jail.py:_handle` to log every POST body length, regardless of `_is_refresh_grant` outcome.  Re-check after a jail has been running for >8h.
-2. **Claude doesn't refresh at all (in any environment).** Falsifiable by host-side strace (next section).
+1. Snapshot `~/.claude/.credentials.json`.
+2. Edit local `expiresAt` to `(now - 60s) * 1000`. Leave the access/refresh tokens intact.
+3. Run `claude -p 'reply OK'` — exits with code 0 in under 1s.
+4. Observe: `expiresAt` advanced to T+8h, `accessToken` and `refreshToken` are both NEW. The file's sha256 changed.
 
-Hypothesis 2 is testable on the host because the host has its own creds file, no MITM, no shared-identity issue.  If host Claude refreshes, hypothesis 1 holds and we should look for instrumentation gaps.  If host Claude does not refresh either, then the `/login` cadence on the host is purely user-driven (re-`/login` periodically because the host token expired), and the proactive refresher in the broker becomes load-bearing.
+So Claude refreshes when its local `expiresAt` is in the past. Hypothesis 2 is refuted. Hypothesis 1 (TLS terminator/log instrumentation gap) is also probably wrong — the broker log records `is_refresh=False` based on the parsed body's `grant_type` field, not on body length alone. A real refresh-grant would show as `is_refresh=True`.
 
-## Host-side experiment to run (the original ask)
+The most likely explanation for "zero refresh-grants in the broker log" is now: **the entrypoint sync kept rewriting the shared file with a future expiresAt at every jail boot, so Claude in the jail rarely or never saw a stale local expiresAt — and so never tried to refresh.** That fits the data: jail-side `/v1/oauth/token` POSTs *do* appear in the log, but they're all `authorization_code` (i.e. `/login`), which Claude resorts to *after* getting a 401 from a stale-but-not-yet-locally-expired access token. (The other handoff documented this 401-fallthrough path: Claude does not retry-with-refresh on a 401, only on a local-expiry check.)
 
-The user asked for a host-vs-jail strace comparison. With the root cause now likely identified, the experiment's purpose narrows: **does host Claude emit `grant_type=refresh_token` on its own?**
+**Implication: the proactive refresher (removed in `02821aa`) is NOT needed.** Claude's own client logic does the refresh — provided we stop overwriting its local `expiresAt`. Land the entrypoint fix, leave Claude alone, and refresh-grants should start appearing in the broker log naturally.
+
+## Host-side experiment — RUN, result above (kept here for reproducibility)
 
 ```bash
-# On host, with NO jail running.  Make a snapshot of host creds first:
 cp ~/.claude/.credentials.json /tmp/creds-snapshot-$(date +%s).json
 
-# Pre-expire the local expiresAt to force a refresh check.
-# (server-side validity unchanged — this is a client-side hint only)
 python3 - <<'PY'
 import json, time, pathlib
 p = pathlib.Path.home() / ".claude/.credentials.json"
 d = json.loads(p.read_text())
 d["claudeAiOauth"]["expiresAt"] = int((time.time() - 60) * 1000)  # T-60s
 p.write_text(json.dumps(d))
-print("primed expiresAt to T-60s")
 PY
 
-# Strace the actual binary (NOT the shim).  Adjust path as needed.
-REAL_BIN="$HOME/.local/bin/claude"  # or wherever host claude lives
-strace -f -y -s 200 -e trace=connect,sendto,write,openat \
-   -o /tmp/claude-host.strace \
-   "$REAL_BIN" -p 'reply OK' 2>&1 | head -20
-
-# Look for refresh attempts:
-grep -E 'grant_type|refresh_token|api.anthropic|platform.claude|/v1/oauth' \
-   /tmp/claude-host.strace | head -30
+# (No strace needed — file mutation alone proves refresh occurred.)
+HASH_BEFORE=$(sha256sum ~/.claude/.credentials.json)
+timeout 30 claude -p 'reply OK' < /dev/null
+HASH_AFTER=$(sha256sum ~/.claude/.credentials.json)
+[ "$HASH_BEFORE" = "$HASH_AFTER" ] && echo "no refresh" || echo "REFRESHED"
 ```
 
-**Read the result against:**
-- Did Claude emit a POST containing `grant_type=refresh_token`?  → answers Q1.
-- Did the access token in the file change after the run?  → confirms refresh succeeded.
-- Did the refresh token rotate?  → expected.
+Outcome 2026-04-28T19:24Z: file changed, new accessToken + new refreshToken, expiresAt advanced 8h. Confirmed: host Claude refreshes proactively when local expiresAt is past.
 
-If host Claude refreshes successfully, the bug is exclusively the entrypoint sync.  If it doesn't, we have a second bug: Claude has no proactive refresh and the broker's removed `02821aa` refresher needs to come back.
-
-> **Don't run this experiment in the jail unless you're prepared to lose the jail's auth.**  A successful refresh rotates the upstream refresh token; the rotation invalidates whatever's in shared creds at that moment, and if shared creds were just synced from host (per the bug), the host loses auth too.  After the entrypoint fix lands, the experiment can be run safely in the jail because identities will actually be independent.
+**Caution if re-running:** if shared creds and host creds are converged at the time of the experiment (the bug being investigated), the rotation invalidates shared. Either run when they're known-diverged, or accept that you'll need to refresh shared via the broker afterwards (`echo '{"action":"refresh"}' framed | nc -U /tmp/yolo-claude-oauth-broker.sock` — but rt must be expired or it's a cache-hit). I learned this the hard way during this investigation: triggered host /login the user had to do.
 
 ## Recommended sequence
 
-1. **Verify by inspection.** Read `src/entrypoint.py:1119-1158` and `src/cli.py:3590,7547`. Confirm the path described above. (5 min.)
-2. **Run the host strace** above to answer the secondary question (does host Claude refresh?).  Keep the snapshot file in case the experiment needs reverting.
-3. **Land the fix.** One-line removal of `.credentials.json` from `DEFAULT_HOST_CLAUDE_FILES`. With or without the cleanups. Tests: confirm an existing jail with valid shared creds boots cleanly without an entrypoint copy. Doctor's new `shared creds valid for Xh Ym, last write Yh ago` line stays unchanged.
-4. **Document the migration** in CHANGELOG / release notes — same wording as `cb6e850` since this finally lands what that commit promised.
-5. **Decide on the proactive refresher.** Only meaningful after #3 lands and we've watched a jail in the wild for >8h with no entrypoint sync masking the refresh question.  If shared creds genuinely don't get refreshed by Claude, bring back `02821aa`.  If they do, leave well enough alone and move on.
+1. **Verify by inspection.** ✅ Confirmed 2026-04-30 by reading `entrypoint.py:1119-1158` and `cli.py:3590,7547`. Path is exactly as described in the handoff.
+2. **Run the host strace.** ✅ Done 2026-04-28T19:24Z — outcome above. Host Claude refreshes proactively. Proactive refresher is NOT needed.
+3. **Land the fix.** One-line removal of `.credentials.json` from `DEFAULT_HOST_CLAUDE_FILES`. Plus optional cleanups in `entrypoint.py`. Awaiting user sign-off.
+4. **Document the migration** in CHANGELOG / release notes — same wording as `cb6e850`, since this finally lands what that commit promised.
+5. ~~Decide on the proactive refresher.~~ Resolved by step 2: not needed.
 
 ## What I (the in-jail agent) shipped this session
 
