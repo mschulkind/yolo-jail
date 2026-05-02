@@ -392,6 +392,117 @@ class TestCheckCommand:
 
     @patch("subprocess.run")
     @patch("shutil.which")
+    def test_check_dormant_runtime_is_dim_info_when_another_is_live(
+        self, mock_which, mock_run, tmp_path, monkeypatch
+    ):
+        """A dormant docker CLI next to a working podman should not warn.
+
+        The user has podman running but also has the docker client
+        installed (e.g. for Colima).  Docker's daemon is off.  Yolo
+        check should report docker quietly (dim info), not as a
+        yellow warning — there's nothing to fix.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("YOLO_REPO_ROOT", str(REPO_ROOT))
+        monkeypatch.delenv("YOLO_RUNTIME", raising=False)
+        mock_which.side_effect = lambda x: (
+            f"/usr/bin/{x}" if x in ("podman", "docker", "nix") else None
+        )
+
+        def run_router(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd:
+                prog = cmd[0]
+                if prog == "podman":
+                    if "--version" in cmd:
+                        return MagicMock(returncode=0, stdout="podman version 4.9.0\n")
+                    if cmd[1:] == ["info"]:
+                        return MagicMock(returncode=0, stdout="ok\n")
+                    return MagicMock(returncode=0, stdout="")
+                if prog == "docker":
+                    if "--version" in cmd:
+                        return MagicMock(
+                            returncode=0, stdout="Docker version 20.10.9\n"
+                        )
+                    if cmd[1:] == ["info"]:
+                        return MagicMock(
+                            returncode=1, stderr="Cannot connect to the Docker daemon"
+                        )
+                    return MagicMock(returncode=1, stdout="")
+                if prog == "nix":
+                    return MagicMock(returncode=0, stdout="nix (Nix) 2.18.1\n")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        mock_run.side_effect = run_router
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["check", "--no-build"])
+        # Docker line appears, but not as a warning.
+        assert "docker" in result.output.lower()
+        # Extract the line that mentions docker's version — it should
+        # carry the "not selected" qualifier and no warning glyph.
+        docker_line = next(
+            (line for line in result.output.splitlines() if "Docker version" in line),
+            "",
+        )
+        assert docker_line, f"expected a docker version line, got: {result.output}"
+        assert "⚠" not in docker_line, (
+            f"docker should not warn when another runtime is live: {docker_line!r}"
+        )
+        assert "not selected" in docker_line, (
+            f"expected 'not selected' qualifier, got: {docker_line!r}"
+        )
+
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    def test_check_warns_when_selected_runtime_offline(
+        self, mock_which, mock_run, tmp_path, monkeypatch
+    ):
+        """If YOLO_RUNTIME=docker is set and docker is offline, warn loudly.
+
+        Different from the dim-info case: here the user has explicitly
+        asked for docker.  An offline selection is a real problem.
+        """
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("YOLO_REPO_ROOT", str(REPO_ROOT))
+        monkeypatch.setenv("YOLO_RUNTIME", "docker")
+        mock_which.side_effect = lambda x: (
+            f"/usr/bin/{x}" if x in ("podman", "docker", "nix") else None
+        )
+
+        def run_router(cmd, **kwargs):
+            if isinstance(cmd, list) and cmd:
+                prog = cmd[0]
+                if prog == "podman":
+                    if "--version" in cmd:
+                        return MagicMock(returncode=0, stdout="podman version 4.9.0\n")
+                    if cmd[1:] == ["info"]:
+                        return MagicMock(returncode=0, stdout="ok\n")
+                if prog == "docker":
+                    if "--version" in cmd:
+                        return MagicMock(
+                            returncode=0, stdout="Docker version 20.10.9\n"
+                        )
+                    if cmd[1:] == ["info"]:
+                        return MagicMock(returncode=1, stderr="Cannot connect")
+                if prog == "nix":
+                    return MagicMock(returncode=0, stdout="nix (Nix) 2.18.1\n")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        mock_run.side_effect = run_router
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["check", "--no-build"])
+        docker_line = next(
+            (line for line in result.output.splitlines() if "Docker version" in line),
+            "",
+        )
+        assert docker_line, f"expected docker version line, got: {result.output}"
+        assert "⚠" in docker_line, (
+            f"docker should warn when selected via YOLO_RUNTIME: {docker_line!r}"
+        )
+
+    @patch("subprocess.run")
+    @patch("shutil.which")
     def test_check_validates_workspace_config(
         self, mock_which, mock_run, tmp_path, monkeypatch
     ):

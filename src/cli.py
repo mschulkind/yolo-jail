@@ -692,6 +692,62 @@ def _linux_multilib() -> str:
     return _MAP.get(machine, f"{machine}-linux-gnu")
 
 
+def _nix_custom_conf_included() -> Optional[bool]:
+    """Return True if /etc/nix/nix.conf includes /etc/nix/nix.custom.conf.
+
+    Nix reads ``/etc/nix/nix.conf`` (and ``$XDG_CONFIG_HOME/nix/nix.conf``)
+    but not arbitrary sibling files.  The Determinate Systems installer
+    adds ``!include /etc/nix/nix.custom.conf`` to ``nix.conf`` so the
+    "custom" file is actually loaded; the official NixOS installer does
+    not.  yolo-jail's macOS setup guide tells users to append settings
+    to ``nix.custom.conf``, which silently no-ops on the official
+    installer.  This helper lets the ``check`` command explain exactly
+    which of the two fixes the user needs.
+
+    Returns True/False if ``/etc/nix/nix.conf`` is readable, None if not
+    (e.g. non-macOS host, missing file, permission error).
+    """
+    conf = Path("/etc/nix/nix.conf")
+    if not conf.is_file():
+        return None
+    try:
+        text = conf.read_text()
+    except OSError:
+        return None
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("#") or not stripped:
+            continue
+        # Match both ``include`` (fatal if missing) and ``!include``
+        # (non-fatal).  Tolerate extra whitespace.
+        for prefix in ("!include", "include"):
+            if stripped.startswith(prefix):
+                rest = stripped[len(prefix) :].lstrip()
+                if rest == "/etc/nix/nix.custom.conf":
+                    return True
+    return False
+
+
+def _detect_nix_daemon_label() -> Optional[str]:
+    """Return the launchd Label of the installed nix-daemon on macOS, or None.
+
+    The Determinate Systems installer registers
+    ``systems.determinate.nix-daemon``; the official NixOS installer
+    registers ``org.nixos.nix-daemon``.  We look in
+    ``/Library/LaunchDaemons/`` for any file whose name ends in
+    ``nix-daemon.plist`` and return the stem — launchd labels match the
+    plist filename.  First match wins; returns None on non-macOS hosts
+    or if no matching plist exists.
+    """
+    daemon_dir = Path("/Library/LaunchDaemons")
+    if not daemon_dir.is_dir():
+        return None
+    for entry in sorted(daemon_dir.iterdir()):
+        if entry.name.endswith("nix-daemon.plist"):
+            return entry.stem
+    return None
+
+
 def _detect_host_timezone() -> Optional[str]:
     """Return the host's IANA timezone name (e.g. "America/New_York") or None.
 
@@ -2728,6 +2784,32 @@ def _host_mise_dir() -> Path:
     if not host_mise.exists():
         host_mise.mkdir(parents=True, exist_ok=True)
     return host_mise
+
+
+def _ac_materialize_under_ws_state(
+    src: Path, target_rel: str, ws_state: Path, *, is_dir: bool = False
+) -> None:
+    """Copy ``src`` into ``ws_state / target_rel`` for Apple Container.
+
+    Apple Container 0.12.3 silently drops the ``-v ws_state:/home/agent``
+    parent bind mount as soon as any ``-v host_file:/home/agent/sub/...``
+    single-file mount is added (apple/container#1089 — single-file mounts
+    use a separate virtiofs share via a hardlink tempdir, and the parent
+    dir share gets shadowed).  Nested directory mounts don't trip the
+    bug, but single-file mounts do.
+
+    Workaround: instead of bind-mounting, materialize the contents into
+    ``ws_state`` directly — the existing ``ws_state:/home/agent`` dir
+    mount then exposes them at the expected paths inside the jail.
+    """
+    dst = ws_state / target_rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if is_dir:
+        if dst.exists():
+            shutil.rmtree(dst)
+        shutil.copytree(src, dst, symlinks=False)
+    else:
+        shutil.copy2(src, dst)
 
 
 def _seed_agent_dir(src: Path, dst: Path, *, skip: tuple[str, ...] = ()):
@@ -5161,6 +5243,15 @@ def _check_broker_creds_freshness(ok, warn, fail) -> None:
         # First /login hasn't happened yet — nothing to grade.
         return
     try:
+        # ``ensure_global_storage`` touches an empty placeholder file so
+        # the bind-mount target exists on first boot.  Treat zero-byte
+        # as the documented pre-login state (same as "file absent"),
+        # not as a corruption warning.
+        if creds_path.stat().st_size == 0:
+            return
+    except OSError:
+        pass
+    try:
         data = json.loads(creds_path.read_text())
         expires_at_ms = int(data["claudeAiOauth"]["expiresAt"])
     except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as e:
@@ -5491,37 +5582,84 @@ def check(
 
     console.print("[bold]Container Runtime[/bold]")
     detected_runtime = None
-    for rt in ("podman", "docker"):
+    # Each entry: (name, version_cmd, liveness_cmd, liveness_hint)
+    # Apple Container's daemon check is `container system status`, not
+    # `container info` — the latter returns usage text even without a
+    # running apiserver.
+    runtime_probes = [
+        (
+            "podman",
+            ["podman", "--version"],
+            ["podman", "info"],
+            "Run 'podman info' to diagnose",
+        ),
+        (
+            "docker",
+            ["docker", "--version"],
+            ["docker", "info"],
+            "Run 'docker info' to diagnose",
+        ),
+        (
+            "container",
+            ["container", "--version"],
+            ["container", "system", "status"],
+            "Start with: container system start",
+        ),
+    ]
+    # Only warn about an offline runtime if the user explicitly selected
+    # it (YOLO_RUNTIME).  A dormant docker CLI next to a working podman
+    # or Apple Container is normal — users keep the docker client
+    # installed for Colima or ad-hoc use without actually running the
+    # daemon.  The merged-config runtime pick happens later and emits
+    # its own error via ``_runtime_for_check``.
+    selected_runtime = os.environ.get("YOLO_RUNTIME")
+    if selected_runtime not in ("podman", "docker", "container"):
+        selected_runtime = None
+    # First pass: collect probe results so we know whether anything is
+    # live before deciding severity on the rest.
+    offline: list[tuple[str, str, str]] = []  # (rt, version, hint)
+    for rt, version_cmd, liveness_cmd, liveness_hint in runtime_probes:
         path = shutil.which(rt)
-        if path:
-            try:
-                result = subprocess.run(
-                    [rt, "--version"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                version = result.stdout.strip().split("\n")[0]
-                # Verify the daemon is actually reachable, not just the CLI
-                ping = subprocess.run(
-                    [rt, "info"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                if ping.returncode == 0:
-                    ok(f"{rt}: {version}")
-                    if detected_runtime is None:
-                        detected_runtime = rt
-                else:
-                    warn(
-                        f"{rt}: {version} (not connected)",
-                        f"Run '{rt} info' to diagnose",
-                    )
-            except Exception as e:
-                fail(f"{rt} found but not working: {e}")
+        if not path:
+            continue
+        try:
+            result = subprocess.run(
+                version_cmd, capture_output=True, text=True, timeout=5
+            )
+            version = result.stdout.strip().split("\n")[0]
+            # Verify the daemon/apiserver is actually reachable, not just the CLI
+            ping = subprocess.run(
+                liveness_cmd, capture_output=True, text=True, timeout=10
+            )
+            ping_ok = ping.returncode == 0
+            if rt == "container" and ping_ok:
+                # `container system status` succeeds even when the apiserver
+                # is stopped — the real signal is "running" in stdout.
+                ping_ok = "running" in ping.stdout.lower()
+            if ping_ok:
+                ok(f"{rt}: {version}")
+                if detected_runtime is None:
+                    detected_runtime = rt
+            else:
+                offline.append((rt, version, liveness_hint))
+        except Exception as e:
+            fail(f"{rt} found but not working: {e}")
+    # Grade the offline runtimes after all probes finish.  If the user
+    # explicitly selected one and it's offline, that's a real problem.
+    # If another runtime is live, dormant siblings are just clutter —
+    # print them as dim info so the signal is there without a warning.
+    for rt, version, hint in offline:
+        if rt == selected_runtime or detected_runtime is None:
+            warn(f"{rt}: {version} (not connected)", hint)
+        else:
+            console.print(
+                f"  [dim]· {rt}: {version} (not connected — not selected)[/dim]"
+            )
     if detected_runtime is None:
-        fail("No container runtime found", "Install podman or docker")
+        fail(
+            "No container runtime found",
+            "Install podman, docker, or Apple Container (macOS)",
+        )
     console.print()
 
     console.print("[bold]Nix[/bold]")
@@ -5554,22 +5692,48 @@ def check(
             if result.returncode == 0 and "Trusted: 1" in output:
                 ok("Nix daemon: connected, user is trusted")
             elif result.returncode == 0:
-                fail(
-                    "Nix daemon: connected but user is NOT trusted",
-                    "Add your user to trusted-users in /etc/nix/nix.custom.conf "
-                    "and restart the Nix daemon",
-                )
+                included = _nix_custom_conf_included()
+                label = _detect_nix_daemon_label() or "<label>"
+                restart = f"sudo launchctl kickstart -k system/{label}"
+                if included is False:
+                    # nix.conf exists but has no include — the typical
+                    # official-NixOS-installer layout.  Writing to
+                    # nix.custom.conf alone won't do anything.
+                    hint = (
+                        "/etc/nix/nix.conf does not include nix.custom.conf. "
+                        "Either add it to the trusted-users line directly in "
+                        "/etc/nix/nix.conf, or add an include line once: "
+                        "echo '!include /etc/nix/nix.custom.conf' | "
+                        "sudo tee -a /etc/nix/nix.conf. Then add your user "
+                        "(trusted-users = root $(whoami)) and restart the "
+                        f"daemon: {restart}"
+                    )
+                else:
+                    # Determinate Systems layout (or unknown) — the
+                    # existing custom.conf advice is correct.
+                    hint = (
+                        "Add your user to trusted-users in "
+                        "/etc/nix/nix.custom.conf and restart the Nix daemon: "
+                        f"{restart}"
+                    )
+                fail("Nix daemon: connected but user is NOT trusted", hint)
             else:
                 fail(
                     "Nix daemon: connection failed",
                     result.stderr.strip().split("\n")[0] if result.stderr else "",
                 )
         except subprocess.TimeoutExpired:
+            label = _detect_nix_daemon_label()
+            kickstart = (
+                f"sudo launchctl kickstart -k system/{label}"
+                if label
+                else "sudo launchctl kickstart -k system/<label>"
+                " — check ls /Library/LaunchDaemons/ for your *nix-daemon.plist"
+            )
             fail(
                 "Nix daemon: store operation timed out (daemon may be hung)",
                 "This is a known issue with determinate-nixd. "
-                "Try: sudo launchctl kickstart -k system/systems.determinate.nix-daemon "
-                "or switch to the vanilla nix-daemon",
+                f"Try: {kickstart} or switch to the vanilla nix-daemon",
             )
         except Exception as e:
             warn(f"Could not verify Nix daemon connectivity: {e}")
@@ -6996,7 +7160,16 @@ def run(
     else:
         # Ensure the file exists (empty) so the mount doesn't fail
         user_env_file.touch()
-    docker_cmd.extend(["-v", f"{user_env_file}:/home/agent/.config/yolo-user-env.sh"])
+    if runtime == "container":
+        # See _ac_materialize_under_ws_state — AC can't do single-file
+        # mounts under the ws_state parent mount without dropping it.
+        _ac_materialize_under_ws_state(
+            user_env_file, ".config/yolo-user-env.sh", ws_state
+        )
+    else:
+        docker_cmd.extend(
+            ["-v", f"{user_env_file}:/home/agent/.config/yolo-user-env.sh"]
+        )
 
     docker_cmd += [
         "--workdir",
@@ -7153,7 +7326,14 @@ def run(
     except Exception:
         excludes_path = Path.home() / ".config" / "git" / "ignore"
     if excludes_path.is_file():
-        docker_cmd.extend(["-v", f"{excludes_path}:/home/agent/.config/git/ignore:ro"])
+        if runtime == "container":
+            _ac_materialize_under_ws_state(
+                excludes_path, ".config/git/ignore", ws_state
+            )
+        else:
+            docker_cmd.extend(
+                ["-v", f"{excludes_path}:/home/agent/.config/git/ignore:ro"]
+            )
         docker_cmd.extend(
             ["-e", "YOLO_GLOBAL_GITIGNORE=/home/agent/.config/git/ignore"]
         )
@@ -7482,7 +7662,14 @@ def run(
     # yolo resolves to empty config, stomping the host's config snapshot.
     if USER_CONFIG_PATH.is_file():
         container_config = f"/home/agent/.config/yolo-jail/{USER_CONFIG_PATH.name}"
-        docker_cmd.extend(["-v", f"{USER_CONFIG_PATH}:{container_config}:ro"])
+        if runtime == "container":
+            _ac_materialize_under_ws_state(
+                USER_CONFIG_PATH,
+                f".config/yolo-jail/{USER_CONFIG_PATH.name}",
+                ws_state,
+            )
+        else:
+            docker_cmd.extend(["-v", f"{USER_CONFIG_PATH}:{container_config}:ro"])
 
     # Pass the mise path through to any nested jail so the same host path
     # keeps resolving one level deeper. The path is identical inside and out.
@@ -7561,15 +7748,32 @@ def run(
         mcp_servers=mcp_servers or None,
         mcp_presets=mcp_presets or None,
     )
-    docker_cmd.extend(
-        ["-v", f"{agents_path / 'AGENTS-copilot.md'}:/home/agent/.copilot/AGENTS.md:ro"]
-    )
-    docker_cmd.extend(
-        ["-v", f"{agents_path / 'AGENTS-gemini.md'}:/home/agent/.gemini/AGENTS.md:ro"]
-    )
-    docker_cmd.extend(
-        ["-v", f"{agents_path / 'CLAUDE.md'}:/home/agent/.claude/CLAUDE.md:ro"]
-    )
+    if runtime == "container":
+        _ac_materialize_under_ws_state(
+            agents_path / "AGENTS-copilot.md", ".copilot/AGENTS.md", ws_state
+        )
+        _ac_materialize_under_ws_state(
+            agents_path / "AGENTS-gemini.md", ".gemini/AGENTS.md", ws_state
+        )
+        _ac_materialize_under_ws_state(
+            agents_path / "CLAUDE.md", ".claude/CLAUDE.md", ws_state
+        )
+    else:
+        docker_cmd.extend(
+            [
+                "-v",
+                f"{agents_path / 'AGENTS-copilot.md'}:/home/agent/.copilot/AGENTS.md:ro",
+            ]
+        )
+        docker_cmd.extend(
+            [
+                "-v",
+                f"{agents_path / 'AGENTS-gemini.md'}:/home/agent/.gemini/AGENTS.md:ro",
+            ]
+        )
+        docker_cmd.extend(
+            ["-v", f"{agents_path / 'CLAUDE.md'}:/home/agent/.claude/CLAUDE.md:ro"]
+        )
 
     if "TERM" in os.environ:
         docker_cmd.extend(["-e", f"TERM={os.environ['TERM']}"])
@@ -7585,7 +7789,8 @@ def run(
     # src/loopholes.py for the full schema.
     docker_cmd.extend(
         _loopholes.docker_args_for(
-            _loopholes.discover_loopholes(loopholes_config=config.get("loopholes"))
+            _loopholes.discover_loopholes(loopholes_config=config.get("loopholes")),
+            runtime=runtime,
         )
     )
 

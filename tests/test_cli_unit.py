@@ -1280,6 +1280,139 @@ class TestRuntimeForCheck:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 
+class TestNixCustomConfIncluded:
+    """_nix_custom_conf_included parses /etc/nix/nix.conf for the include line."""
+
+    def _patch_conf(self, monkeypatch, conf_path):
+        import cli
+
+        real_path = cli.Path
+
+        def fake_path(p, *args, **kwargs):
+            if p == "/etc/nix/nix.conf":
+                return conf_path
+            return real_path(p, *args, **kwargs)
+
+        monkeypatch.setattr(cli, "Path", fake_path)
+
+    def test_detects_bang_include(self, tmp_path, monkeypatch):
+        from cli import _nix_custom_conf_included
+
+        conf = tmp_path / "nix.conf"
+        conf.write_text(
+            "build-users-group = nixbld\n!include /etc/nix/nix.custom.conf\n"
+        )
+        self._patch_conf(monkeypatch, conf)
+        assert _nix_custom_conf_included() is True
+
+    def test_detects_plain_include(self, tmp_path, monkeypatch):
+        from cli import _nix_custom_conf_included
+
+        conf = tmp_path / "nix.conf"
+        conf.write_text("include /etc/nix/nix.custom.conf\n")
+        self._patch_conf(monkeypatch, conf)
+        assert _nix_custom_conf_included() is True
+
+    def test_returns_false_when_no_include(self, tmp_path, monkeypatch):
+        from cli import _nix_custom_conf_included
+
+        conf = tmp_path / "nix.conf"
+        conf.write_text("build-users-group = nixbld\n")
+        self._patch_conf(monkeypatch, conf)
+        assert _nix_custom_conf_included() is False
+
+    def test_ignores_commented_include(self, tmp_path, monkeypatch):
+        from cli import _nix_custom_conf_included
+
+        conf = tmp_path / "nix.conf"
+        conf.write_text("# !include /etc/nix/nix.custom.conf\n")
+        self._patch_conf(monkeypatch, conf)
+        assert _nix_custom_conf_included() is False
+
+    def test_returns_none_when_missing(self, tmp_path, monkeypatch):
+        from cli import _nix_custom_conf_included
+
+        self._patch_conf(monkeypatch, tmp_path / "does-not-exist")
+        assert _nix_custom_conf_included() is None
+
+
+class TestDetectNixDaemonLabel:
+    """_detect_nix_daemon_label returns the launchd Label based on the plist."""
+
+    def test_returns_official_label(self, tmp_path, monkeypatch):
+        from cli import _detect_nix_daemon_label
+
+        daemon_dir = tmp_path / "LaunchDaemons"
+        daemon_dir.mkdir()
+        (daemon_dir / "org.nixos.nix-daemon.plist").write_text("<plist/>")
+
+        import cli
+
+        real_path = cli.Path
+
+        def fake_path(p, *args, **kwargs):
+            if p == "/Library/LaunchDaemons":
+                return daemon_dir
+            return real_path(p, *args, **kwargs)
+
+        monkeypatch.setattr(cli, "Path", fake_path)
+        assert _detect_nix_daemon_label() == "org.nixos.nix-daemon"
+
+    def test_returns_determinate_label(self, tmp_path, monkeypatch):
+        from cli import _detect_nix_daemon_label
+
+        daemon_dir = tmp_path / "LaunchDaemons"
+        daemon_dir.mkdir()
+        (daemon_dir / "systems.determinate.nix-daemon.plist").write_text("<plist/>")
+        # An unrelated daemon shouldn't confuse the scan.
+        (daemon_dir / "com.apple.other.plist").write_text("<plist/>")
+
+        import cli
+
+        real_path = cli.Path
+
+        def fake_path(p, *args, **kwargs):
+            if p == "/Library/LaunchDaemons":
+                return daemon_dir
+            return real_path(p, *args, **kwargs)
+
+        monkeypatch.setattr(cli, "Path", fake_path)
+        assert _detect_nix_daemon_label() == "systems.determinate.nix-daemon"
+
+    def test_returns_none_when_no_plist(self, tmp_path, monkeypatch):
+        from cli import _detect_nix_daemon_label
+
+        daemon_dir = tmp_path / "LaunchDaemons"
+        daemon_dir.mkdir()
+
+        import cli
+
+        real_path = cli.Path
+
+        def fake_path(p, *args, **kwargs):
+            if p == "/Library/LaunchDaemons":
+                return daemon_dir
+            return real_path(p, *args, **kwargs)
+
+        monkeypatch.setattr(cli, "Path", fake_path)
+        assert _detect_nix_daemon_label() is None
+
+    def test_returns_none_on_non_macos(self, monkeypatch):
+        from cli import _detect_nix_daemon_label
+
+        import cli
+
+        real_path = cli.Path
+
+        def fake_path(p, *args, **kwargs):
+            if p == "/Library/LaunchDaemons":
+                return real_path("/does-not-exist-for-tests")
+            return real_path(p, *args, **kwargs)
+
+        monkeypatch.setattr(cli, "Path", fake_path)
+        assert _detect_nix_daemon_label() is None
+
+
 class TestDetectHostTimezone:
     """Cover all three detection paths: $TZ, /etc/timezone, /etc/localtime."""
 
@@ -3150,4 +3283,22 @@ class TestBrokerCredsFreshness:
         )
         assert any(kind == "warn" for kind, _ in events), (
             f"expected warn for unreadable creds, got {events}"
+        )
+
+    def test_silent_when_creds_empty(self, monkeypatch, tmp_path):
+        # ``ensure_global_storage`` touches the credentials file as a
+        # zero-byte mount-point placeholder before the first /login.
+        # Treat that as "pre-login" (silent), not "unreadable" (warn).
+        monkeypatch.setattr("cli.GLOBAL_HOME", tmp_path / "home")
+        creds_dir = tmp_path / "home" / ".claude-shared-credentials"
+        creds_dir.mkdir(parents=True)
+        (creds_dir / ".credentials.json").touch()
+        events: list = []
+        cli._check_broker_creds_freshness(
+            lambda m, *a, **kw: events.append(("ok", m)),
+            lambda m, *a, **kw: events.append(("warn", m)),
+            lambda m, *a, **kw: events.append(("fail", m)),
+        )
+        assert events == [], (
+            f"expected silent skip when creds file is empty, got {events}"
         )

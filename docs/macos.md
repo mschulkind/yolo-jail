@@ -142,9 +142,16 @@ echo "ssh-ng://nix-builder aarch64-linux $HOME/.colima/_lima/_config/user 4 1 be
 # Enable substitutes from the builder
 echo 'builders-use-substitutes = true' | sudo tee -a /etc/nix/nix.custom.conf
 
-# Restart Nix daemon
-sudo launchctl kickstart -k system/systems.determinate.nix-daemon
+# Restart Nix daemon (use whichever label matches your installer)
+sudo launchctl kickstart -k system/systems.determinate.nix-daemon  # Determinate installer
+# or:
+sudo launchctl kickstart -k system/org.nixos.nix-daemon             # Official NixOS installer
 ```
+
+> The service label depends on which Nix installer you used. Determinate
+> Systems' installer registers `systems.determinate.nix-daemon`; the
+> official NixOS installer registers `org.nixos.nix-daemon`. Check
+> `ls /Library/LaunchDaemons/ | grep nix-daemon` if you're unsure.
 
 > **Note:** The Colima SSH port changes on VM restart. After `colima start`,
 > update `~/.ssh/config` and `/var/root/.ssh/config` with the new port.
@@ -169,11 +176,45 @@ then `X` to quit the QEMU session, or kill the process from another terminal.
 > (e.g. tmux), press `Ctrl+A` twice so the first is consumed by the
 > multiplexer and the second reaches QEMU.
 
-**Step 2 — Ensure your user is trusted by the Nix daemon:**
+**Step 2 — Ensure your user is trusted by the Nix daemon.**
+
+Nix reads `/etc/nix/nix.conf` by default. The Determinate Systems
+installer also adds `!include /etc/nix/nix.custom.conf` to `nix.conf`
+so a sibling `nix.custom.conf` is picked up automatically; the official
+NixOS installer does **not**, so writing to `nix.custom.conf` alone is a
+no-op on that installer.
+
+Check whether your `nix.conf` includes the custom file:
 
 ```bash
-echo 'trusted-users = root <your-username>' | sudo tee -a /etc/nix/nix.custom.conf
+grep -F 'include /etc/nix/nix.custom.conf' /etc/nix/nix.conf \
+  && echo "custom.conf is included" \
+  || echo "custom.conf is NOT included"
 ```
+
+If it's included, append to `nix.custom.conf`:
+
+```bash
+echo 'trusted-users = root <your-username>' \
+  | sudo tee -a /etc/nix/nix.custom.conf
+```
+
+If it isn't (official NixOS installer), either add the include line
+once and keep using `nix.custom.conf`, or edit `nix.conf` directly:
+
+```bash
+# Option A — add the include line (survives installer upgrades for
+# Determinate; harmless for the official installer):
+echo '!include /etc/nix/nix.custom.conf' | sudo tee -a /etc/nix/nix.conf
+echo 'trusted-users = root <your-username>' \
+  | sudo tee -a /etc/nix/nix.custom.conf
+
+# Option B — edit nix.conf directly:
+echo 'trusted-users = root <your-username>' | sudo tee -a /etc/nix/nix.conf
+```
+
+Then restart the daemon so the new trust setting takes effect (see the
+label guidance in Option A above for which name to use).
 
 **Step 3 — Create an SSH config entry for the builder.**
 
@@ -215,10 +256,14 @@ echo 'ssh-ng://nix-linux-builder aarch64-linux /etc/nix/builder_ed25519 4 1 benc
   | sudo tee /etc/nix/machines
 ```
 
-**Step 5 — Restart the Nix daemon** to pick up the new config:
+**Step 5 — Restart the Nix daemon** to pick up the new config. The
+service label depends on your installer — see the note in Option A
+above if you're unsure:
 
 ```bash
-sudo launchctl kickstart -k system/systems.determinate.nix-daemon
+sudo launchctl kickstart -k system/systems.determinate.nix-daemon  # Determinate installer
+# or:
+sudo launchctl kickstart -k system/org.nixos.nix-daemon             # Official NixOS installer
 ```
 
 **Step 6 — Verify the builder is reachable:**

@@ -140,6 +140,37 @@ def test_docker_args_no_ca_no_env(mods_dir: Path):
     assert args == ["--add-host", "plain.test:host-gateway"]
 
 
+def test_docker_args_skip_tls_intercept_on_apple_container(mods_dir: Path):
+    # Apple Container 0.12.3 has no --add-host (apple/container#673) and its
+    # single-file bind mounts collide with the ws_state parent mount
+    # (apple/container#1089).  docker_args_for(runtime="container") must drop
+    # tls-intercept loopholes entirely — --add-host, CA mount, jail_env.
+    mod = mods_dir / "broker"
+    mod.mkdir()
+    (mod / "ca.crt").write_text("-----FAKE CA-----\n")
+    _write_manifest(
+        mod,
+        {
+            "name": "broker",
+            "description": "x",
+            "intercepts": [{"host": "example.test"}],
+            "broker_ip": "10.0.0.1",
+            "ca_cert": "ca.crt",
+            "jail_env": {"FOO": "bar"},
+        },
+    )
+    loaded = loopholes.discover_loopholes(mods_dir, include_bundled=False)
+    # Podman/docker: full wiring.
+    podman_args = loopholes.docker_args_for(loaded, runtime="podman")
+    assert "--add-host" in podman_args
+    assert "FOO=bar" in podman_args
+    # Apple Container: nothing.
+    ac_args = loopholes.docker_args_for(loaded, runtime="container")
+    assert "--add-host" not in ac_args
+    assert "FOO=bar" not in ac_args
+    assert ac_args == []
+
+
 def test_docker_args_skip_config_backed_loopholes(tmp_path: Path):
     # Config-backed (synthesized from yolo-jail.jsonc) loopholes have no
     # file-backed mounts or intercepts — their wiring lives in
