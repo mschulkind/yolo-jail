@@ -3587,7 +3587,7 @@ def load_config(
     return merge_config(user_config, workspace_config)
 
 
-DEFAULT_HOST_CLAUDE_FILES = ["settings.json", ".credentials.json"]
+DEFAULT_HOST_CLAUDE_FILES = ["settings.json"]
 
 KNOWN_TOP_LEVEL_CONFIG_KEYS = {
     "runtime",
