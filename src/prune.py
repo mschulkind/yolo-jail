@@ -563,6 +563,111 @@ def _disk_usage_report(*, workspaces: Iterable[Path], global_storage: Path) -> d
 
 
 # ---------------------------------------------------------------------------
+# Shadowed-home prune — purge :ro seed subtrees that are overlay-masked
+# at jail runtime so they can never be read.  Pre-cache-split cruft
+# typically hoards 70+ GiB under `.cache`, and also accumulates under
+# `.npm`/`.npm-global`/`.local`/`go` for operators who ran the jail
+# before those were split out into per-workspace overlays.
+#
+# SAFETY: every path here MUST be fully shadowed by an overlay bind
+# mount declared in cli.py's docker_cmd (or by a redirect env var like
+# NPM_CONFIG_CACHE that points reads elsewhere while the :ro base makes
+# writes fail).  The drift-check in tests/test_prune.py greps cli.py
+# at test time to enforce this — if an overlay mount is removed without
+# trimming this list, tests fail and CI blocks the change.
+#
+# NOT listed (intentionally):
+#   - .copilot / .gemini / .claude — seeded by _seed_agent_dir on every
+#     new workspace; deleting the base would break first-boot auth.
+#   - .claude-shared-credentials — rw shared-credential mount point.
+#   - .config — bind-mounted over but the seed may carry non-auth
+#     content the entrypoint relies on; too risky to add without audit.
+# ---------------------------------------------------------------------------
+
+SHADOWED_HOME_PATHS: Tuple[str, ...] = (
+    ".cache",
+    ".npm",
+    ".npm-global",
+    ".local",
+    "go",
+)
+
+
+def _prune_shadowed_home(
+    global_home: Path,
+    *,
+    apply: bool,
+) -> Tuple[int, int]:
+    """Delete subpaths of ``global_home`` listed in
+    ``SHADOWED_HOME_PATHS``.  Returns ``(bytes_removed, items_removed)``.
+
+    Symlinks are unlinked but never traversed — if the operator
+    relocated a shadowed dir to cold storage via ``ln -s``, the real
+    content on the HDD target is preserved.  The symlink itself has
+    no on-disk cost and can be recreated by the next jail boot (the
+    overlay mount will materialize the path fresh).
+
+    Entries containing ``..`` are refused defensively even though the
+    registry is a compile-time constant.
+    """
+    if not global_home.is_dir():
+        return 0, 0
+
+    bytes_removed = 0
+    items_removed = 0
+
+    import shutil as _shutil
+
+    for rel in SHADOWED_HOME_PATHS:
+        if ".." in rel.split("/") or rel.startswith("/"):
+            log.debug("refusing suspicious registry entry %r", rel)
+            continue
+        target = global_home / rel
+        try:
+            lst = target.lstat()
+        except OSError:
+            continue
+
+        import stat as _stat
+
+        if _stat.S_ISLNK(lst.st_mode):
+            # Symlink itself takes ~0 bytes but still counts as one item.
+            if apply:
+                try:
+                    target.unlink()
+                except OSError as e:
+                    log.debug("unlink symlink %s failed: %s", target, e)
+                    continue
+            items_removed += 1
+            continue
+
+        if _stat.S_ISDIR(lst.st_mode):
+            size = _dir_size_bytes(target)
+            if apply:
+                try:
+                    _shutil.rmtree(target)
+                except OSError as e:
+                    log.debug("rmtree %s failed: %s", target, e)
+                    continue
+            bytes_removed += size
+            items_removed += 1
+            continue
+
+        if _stat.S_ISREG(lst.st_mode):
+            size = lst.st_size
+            if apply:
+                try:
+                    target.unlink()
+                except OSError as e:
+                    log.debug("unlink %s failed: %s", target, e)
+                    continue
+            bytes_removed += size
+            items_removed += 1
+
+    return bytes_removed, items_removed
+
+
+# ---------------------------------------------------------------------------
 # Image-cache prune (keep newest N, sweep orphan tmp files)
 # ---------------------------------------------------------------------------
 

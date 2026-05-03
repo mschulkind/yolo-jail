@@ -8167,6 +8167,15 @@ def prune_cmd(
         "--no-image-cache",
         help="Skip the ~/.cache/images/ tarball cleanup.",
     ),
+    no_shadowed_home: bool = typer.Option(
+        False,
+        "--no-shadowed-home",
+        help="Skip the shadowed-seed cleanup.  By default, prune deletes "
+        "subdirs of the :ro GLOBAL_HOME seed that are fully masked by "
+        "overlay mounts at runtime (.cache, .npm, .npm-global, .local, "
+        "go).  These can never be read by any live jail but accumulate "
+        "tens of GiB from pre-cache-split installs.",
+    ),
     image_cache_keep: int = typer.Option(
         3,
         "--image-cache-keep",
@@ -8367,6 +8376,27 @@ def prune_cmd(
             console.print("  [dim]none[/dim]")
         total_saved += image_cache_bytes
 
+    shadowed_bytes = 0
+    shadowed_items = 0
+    if not no_shadowed_home:
+        console.print("\n[bold]Shadowed seed subtrees[/bold]")
+        console.print(
+            f"  [dim]targets: {', '.join(_prune.SHADOWED_HOME_PATHS)} "
+            "(each overlay-masked at runtime)[/dim]"
+        )
+        shadowed_bytes, shadowed_items = _prune._prune_shadowed_home(
+            GLOBAL_HOME, apply=apply
+        )
+        verb = "would remove" if not apply else "removed"
+        if shadowed_items:
+            console.print(
+                f"  {verb}: {_fmt_bytes(shadowed_bytes)} across "
+                f"{shadowed_items:,} path(s)"
+            )
+        else:
+            console.print("  [dim]none[/dim]")
+        total_saved += shadowed_bytes
+
     cache_bytes = 0
     cache_files = 0
     if cache_age > 0:
@@ -8396,6 +8426,7 @@ def prune_cmd(
             f"[bold green]Reclaimed {_fmt_bytes(total_saved)}[/bold green] via "
             f"{total_links:,} hardlinks, {len(removed_containers)} container(s), "
             f"{len(removed_images)} image(s), {image_cache_files:,} image tar(s), "
+            f"{shadowed_items:,} shadowed seed path(s), "
             f"{cache_files:,} cache file(s)."
         )
     else:
@@ -8405,6 +8436,7 @@ def prune_cmd(
             f"{len(removed_containers)} container(s), "
             f"{len(removed_images)} image(s), "
             f"{image_cache_files:,} image tar(s), "
+            f"{shadowed_items:,} shadowed seed path(s), "
             f"{cache_files:,} cache file(s).  "
             f"Re-run with [cyan]--apply[/cyan] to execute."
         )

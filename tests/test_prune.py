@@ -556,6 +556,184 @@ class TestPruneImageCache:
         assert (images / "README.md").exists()
 
 
+class TestPruneShadowedHome:
+    """``_prune_shadowed_home(global_home, *, apply)`` removes subpaths
+    under ``~/.local/share/yolo-jail/home`` that are fully shadowed by
+    per-workspace or shared overlay mounts at jail runtime.
+
+    These paths are baked into the ``:ro`` seed for historical reasons
+    (pre-cache-split layout) but are never read inside any live jail —
+    the overlay wins.  Leaving them there wastes tens of GiB of SSD
+    on every install.
+    """
+
+    def test_registry_is_a_concrete_tuple(self):
+        """SHADOWED_HOME_PATHS must be a literal sequence of relative
+        path strings.  Keeping it static makes it trivially reviewable
+        in a diff and prevents dynamic/wildcard expansion."""
+        assert isinstance(prune.SHADOWED_HOME_PATHS, tuple)
+        assert len(prune.SHADOWED_HOME_PATHS) > 0
+        for p in prune.SHADOWED_HOME_PATHS:
+            assert isinstance(p, str)
+            assert not p.startswith("/"), f"{p!r} must be relative"
+            assert ".." not in p.split("/"), f"{p!r} must not traverse up"
+
+    def test_registry_stays_in_sync_with_cli_mount_table(self):
+        """Every path in SHADOWED_HOME_PATHS must correspond to an
+        overlay mount in cli.py that masks the GLOBAL_HOME copy at
+        runtime — otherwise deleting the seed would actually affect
+        behaviour.  This grep-based check fires if someone removes an
+        overlay mount without also trimming the registry.
+
+        We look for either ``:/home/agent/<path>`` (per-workspace or
+        shared bind mount on top of the seed) OR an env var that
+        redirects reads/writes away from that path (e.g.
+        ``NPM_CONFIG_CACHE`` points .npm/ reads elsewhere).
+        """
+        cli_src = (
+            Path(__file__).parent.parent / "src" / "cli.py"
+        ).read_text()
+        for rel in prune.SHADOWED_HOME_PATHS:
+            mount_marker = f":/home/agent/{rel}"
+            env_marker_candidates = (
+                # .npm is shadowed via NPM_CONFIG_CACHE pointing elsewhere
+                # and the :ro seed making writes impossible.
+                "NPM_CONFIG_CACHE=/home/agent/.cache/npm",
+            )
+            has_overlay = mount_marker in cli_src
+            has_env_shadow = rel == ".npm" and any(
+                m in cli_src for m in env_marker_candidates
+            )
+            assert has_overlay or has_env_shadow, (
+                f"SHADOWED_HOME_PATHS lists {rel!r} but cli.py has no "
+                f"overlay mount {mount_marker!r} nor a known env-var "
+                f"shadow.  Either restore the mount or remove this "
+                f"entry — leaving it here would delete live seed data."
+            )
+
+    def test_registry_excludes_seeded_agent_dirs(self):
+        """``~/.copilot``, ``~/.gemini``, ``~/.claude`` under GLOBAL_HOME
+        feed ``_seed_agent_dir`` on first boot of a new workspace — they
+        are NOT shadowed.  Must not appear in the registry.  Also
+        ``.claude-shared-credentials`` is the rw shared-auth dir itself."""
+        forbidden = {
+            ".copilot",
+            ".gemini",
+            ".claude",
+            ".claude-shared-credentials",
+        }
+        for entry in prune.SHADOWED_HOME_PATHS:
+            top = entry.split("/", 1)[0]
+            assert top not in forbidden, (
+                f"{entry!r} has a seeded/shared top-level dir — must "
+                "not be in SHADOWED_HOME_PATHS"
+            )
+
+    def test_removes_listed_paths(self, monkeypatch, tmp_path):
+        gh = tmp_path / "home"
+        gh.mkdir()
+        (gh / ".cache").mkdir()
+        (gh / ".cache" / "big").write_bytes(b"x" * 5000)
+        (gh / ".npm").mkdir()
+        (gh / ".npm" / "big").write_bytes(b"y" * 3000)
+        # Not in registry — must survive.
+        (gh / ".copilot").mkdir()
+        (gh / ".copilot" / "auth.json").write_bytes(b"keepme")
+
+        monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", (".cache", ".npm"))
+
+        bytes_removed, items_removed = prune._prune_shadowed_home(
+            gh, apply=True
+        )
+
+        assert not (gh / ".cache").exists()
+        assert not (gh / ".npm").exists()
+        assert (gh / ".copilot" / "auth.json").exists()
+        assert items_removed == 2
+        assert bytes_removed == 8000
+
+    def test_dry_run_reports_but_does_not_delete(self, monkeypatch, tmp_path):
+        gh = tmp_path / "home"
+        gh.mkdir()
+        (gh / ".cache").mkdir()
+        (gh / ".cache" / "f").write_bytes(b"x" * 100)
+        monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", (".cache",))
+
+        bytes_removed, items_removed = prune._prune_shadowed_home(
+            gh, apply=False
+        )
+
+        assert (gh / ".cache").exists(), "dry-run must not delete"
+        assert items_removed == 1
+        assert bytes_removed == 100
+
+    def test_missing_paths_tolerated(self, monkeypatch, tmp_path):
+        """Fresh install won't have all the shadowed dirs yet — skip
+        silently, don't crash, don't miscount."""
+        gh = tmp_path / "home"
+        gh.mkdir()
+        monkeypatch.setattr(
+            prune, "SHADOWED_HOME_PATHS", (".cache", ".npm", ".local")
+        )
+
+        bytes_removed, items_removed = prune._prune_shadowed_home(
+            gh, apply=True
+        )
+        assert bytes_removed == 0
+        assert items_removed == 0
+
+    def test_missing_global_home_returns_zero(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", (".cache",))
+        bytes_removed, items_removed = prune._prune_shadowed_home(
+            tmp_path / "not-there", apply=True
+        )
+        assert (bytes_removed, items_removed) == (0, 0)
+
+    def test_refuses_to_follow_symlinks_out_of_home(
+        self, monkeypatch, tmp_path
+    ):
+        """If a shadowed subpath is actually a symlink to data outside
+        GLOBAL_HOME (e.g. user relocated the cache to HDD via ln -s),
+        the pass MUST NOT traverse and delete the real content.  Unlink
+        the symlink itself — that's still correct — but never rm -rf
+        through it."""
+        gh = tmp_path / "home"
+        gh.mkdir()
+        real_cache = tmp_path / "cold-storage" / "cache"
+        real_cache.mkdir(parents=True)
+        precious = real_cache / "do-not-delete"
+        precious.write_bytes(b"precious" * 1000)
+        (gh / ".cache").symlink_to(real_cache)
+
+        monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", (".cache",))
+
+        prune._prune_shadowed_home(gh, apply=True)
+
+        # The symlink itself is gone (user can recreate), but the real
+        # target and its contents survive.
+        assert not (gh / ".cache").is_symlink()
+        assert not (gh / ".cache").exists()
+        assert precious.exists()
+        assert precious.read_bytes() == b"precious" * 1000
+
+    def test_refuses_path_traversal_in_registry(
+        self, monkeypatch, tmp_path
+    ):
+        """Defence in depth: even if someone smuggles a ``..`` into the
+        registry at runtime, the pass refuses to act on it."""
+        gh = tmp_path / "home"
+        gh.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_bytes(b"not yours")
+        monkeypatch.setattr(
+            prune, "SHADOWED_HOME_PATHS", ("../outside.txt",)
+        )
+
+        prune._prune_shadowed_home(gh, apply=True)
+
+        assert outside.exists()
+
+
 class TestWalkGlobalDedupable:
     """`_walk_global_dedupable(global_storage)` yields regular non-empty
     files under the subtrees that are safe to hardlink-dedupe — the
@@ -1171,6 +1349,59 @@ class TestPruneCommand:
         result = self._invoke(["--image-cache-keep", "1"])
         assert result.exit_code == 0
         assert seen["keep"] == 1
+
+    def test_shadowed_home_pass_runs_by_default(self, monkeypatch):
+        """Plain `yolo prune` must exercise the shadowed-seed cleanup —
+        it's the only way the pre-cache-split cruft gets reclaimed."""
+        seen: dict = {}
+
+        def fake_prune(global_home, *, apply):
+            seen["apply"] = apply
+            seen["home"] = global_home
+            return (0, 0)
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+        monkeypatch.setattr(
+            prune,
+            "_prune_image_cache",
+            lambda images_dir, *, keep, apply: (0, 0),
+        )
+        monkeypatch.setattr(prune, "_prune_shadowed_home", fake_prune)
+
+        result = self._invoke([])
+        assert result.exit_code == 0
+        assert seen["apply"] is False
+
+    def test_no_shadowed_home_skips_pass(self, monkeypatch):
+        called = {"n": 0}
+
+        def fake_prune(global_home, *, apply):
+            called["n"] += 1
+            return (0, 0)
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+        monkeypatch.setattr(
+            prune,
+            "_prune_image_cache",
+            lambda images_dir, *, keep, apply: (0, 0),
+        )
+        monkeypatch.setattr(prune, "_prune_shadowed_home", fake_prune)
+
+        result = self._invoke(["--no-shadowed-home"])
+        assert result.exit_code == 0
+        assert called["n"] == 0
 
     def test_no_image_cache_skips_pass(self, monkeypatch):
         called = {"n": 0}
