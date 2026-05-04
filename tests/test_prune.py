@@ -590,9 +590,7 @@ class TestPruneShadowedHome:
         redirects reads/writes away from that path (e.g.
         ``NPM_CONFIG_CACHE`` points .npm/ reads elsewhere).
         """
-        cli_src = (
-            Path(__file__).parent.parent / "src" / "cli.py"
-        ).read_text()
+        cli_src = (Path(__file__).parent.parent / "src" / "cli.py").read_text()
         for rel in prune.SHADOWED_HOME_PATHS:
             mount_marker = f":/home/agent/{rel}"
             env_marker_candidates = (
@@ -642,9 +640,7 @@ class TestPruneShadowedHome:
 
         monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", (".cache", ".npm"))
 
-        bytes_removed, items_removed = prune._prune_shadowed_home(
-            gh, apply=True
-        )
+        bytes_removed, items_removed = prune._prune_shadowed_home(gh, apply=True)
 
         assert not (gh / ".cache").exists()
         assert not (gh / ".npm").exists()
@@ -659,9 +655,7 @@ class TestPruneShadowedHome:
         (gh / ".cache" / "f").write_bytes(b"x" * 100)
         monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", (".cache",))
 
-        bytes_removed, items_removed = prune._prune_shadowed_home(
-            gh, apply=False
-        )
+        bytes_removed, items_removed = prune._prune_shadowed_home(gh, apply=False)
 
         assert (gh / ".cache").exists(), "dry-run must not delete"
         assert items_removed == 1
@@ -672,13 +666,9 @@ class TestPruneShadowedHome:
         silently, don't crash, don't miscount."""
         gh = tmp_path / "home"
         gh.mkdir()
-        monkeypatch.setattr(
-            prune, "SHADOWED_HOME_PATHS", (".cache", ".npm", ".local")
-        )
+        monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", (".cache", ".npm", ".local"))
 
-        bytes_removed, items_removed = prune._prune_shadowed_home(
-            gh, apply=True
-        )
+        bytes_removed, items_removed = prune._prune_shadowed_home(gh, apply=True)
         assert bytes_removed == 0
         assert items_removed == 0
 
@@ -689,9 +679,7 @@ class TestPruneShadowedHome:
         )
         assert (bytes_removed, items_removed) == (0, 0)
 
-    def test_refuses_to_follow_symlinks_out_of_home(
-        self, monkeypatch, tmp_path
-    ):
+    def test_refuses_to_follow_symlinks_out_of_home(self, monkeypatch, tmp_path):
         """If a shadowed subpath is actually a symlink to data outside
         GLOBAL_HOME (e.g. user relocated the cache to HDD via ln -s),
         the pass MUST NOT traverse and delete the real content.  Unlink
@@ -716,18 +704,14 @@ class TestPruneShadowedHome:
         assert precious.exists()
         assert precious.read_bytes() == b"precious" * 1000
 
-    def test_refuses_path_traversal_in_registry(
-        self, monkeypatch, tmp_path
-    ):
+    def test_refuses_path_traversal_in_registry(self, monkeypatch, tmp_path):
         """Defence in depth: even if someone smuggles a ``..`` into the
         registry at runtime, the pass refuses to act on it."""
         gh = tmp_path / "home"
         gh.mkdir()
         outside = tmp_path / "outside.txt"
         outside.write_bytes(b"not yours")
-        monkeypatch.setattr(
-            prune, "SHADOWED_HOME_PATHS", ("../outside.txt",)
-        )
+        monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", ("../outside.txt",))
 
         prune._prune_shadowed_home(gh, apply=True)
 
@@ -1459,8 +1443,10 @@ class TestPruneCommand:
         assert result.exit_code == 0
         # The breakdown and the HDD-offload hint both appear in output.
         assert "images" in result.output
-        assert "HDD" in result.output or "cold" in result.output.lower() or (
-            "symlink" in result.output.lower()
+        assert (
+            "HDD" in result.output
+            or "cold" in result.output.lower()
+            or ("symlink" in result.output.lower())
         )
 
     def test_dedup_global_includes_cache_entries(self, monkeypatch):
