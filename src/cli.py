@@ -8162,12 +8162,37 @@ def prune_cmd(
         "--keep-images",
         help="Number of most-recent yolo-jail images to retain (default: 2).",
     ),
+    no_image_cache: bool = typer.Option(
+        False,
+        "--no-image-cache",
+        help="Skip the ~/.cache/images/ tarball cleanup.",
+    ),
+    no_shadowed_home: bool = typer.Option(
+        False,
+        "--no-shadowed-home",
+        help="Skip the shadowed-seed cleanup.  By default, prune deletes "
+        "subdirs of the :ro GLOBAL_HOME seed that are fully masked by "
+        "overlay mounts at runtime (.cache, .npm, .npm-global, .local, "
+        "go).  These can never be read by any live jail but accumulate "
+        "tens of GiB from pre-cache-split installs.",
+    ),
+    image_cache_keep: int = typer.Option(
+        3,
+        "--image-cache-keep",
+        help="Number of most-recent cached image tarballs to retain "
+        "under ~/.cache/images/ (default: 3).  Each tar is ~3 GiB, so "
+        "this bucket dominates disk use — it's the single biggest win "
+        "for most users.  Orphan .tmp files from crashed builds are "
+        "always swept regardless of this count.",
+    ),
     cache_age: int = typer.Option(
-        0,
+        30,
         "--cache-age",
-        help="If >0, purge files under ~/.cache/{uv,pip,npm,go-build,mise} "
-        "older than this many days.  Content is re-downloadable from PyPI/"
-        "npm/go/mise on next install.  Default 0 disables the pass.",
+        help="Purge files under re-downloadable ~/.cache/ subdirs "
+        "(uv, pip, npm, go-build, mise, pex, pants, node-gyp, gopls) "
+        "older than this many days.  Pass 0 to skip the pass entirely; "
+        "pass a smaller number to be more aggressive.  Content is "
+        "re-downloadable from PyPI/npm/go/mise on next install.",
     ),
     purge_heavy_caches: bool = typer.Option(
         False,
@@ -8215,10 +8240,33 @@ def prune_cmd(
         for name, size in sorted(breakdown.items(), key=lambda kv: kv[1], reverse=True):
             console.print(f"    {name:<20} {_fmt_bytes(size):>12}")
 
+    # When the cache bucket dominates, break it down too — saves the
+    # operator from running `du -sh` manually to find the fat subdir.
+    cache_breakdown = before.get("cache_breakdown") or {}
+    if cache_breakdown:
+        top = sorted(cache_breakdown.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        console.print("  [dim]cache/ top 5 (largest first):[/dim]")
+        for name, size in top:
+            console.print(f"    cache/{name:<14} {_fmt_bytes(size):>12}")
+
+    # Hint: the image tar cache is almost always the biggest offender
+    # and an ideal candidate for cold storage (HDD).  Surface it once,
+    # proactively, when it exceeds a reasonable SSD budget.
+    images_bytes = cache_breakdown.get("images", 0)
+    if images_bytes >= 20 * (1024**3):  # 20 GiB
+        console.print(
+            f"  [yellow]hint:[/yellow] cache/images holds "
+            f"{_fmt_bytes(images_bytes)} of jail tarballs.  They're "
+            "streamed once at podman load then unused — consider "
+            "symlinking this subdir to HDD storage if you have it."
+        )
+
     total_saved = 0
     total_links = 0
     removed_containers: list[str] = []
     removed_images: list[str] = []
+    image_cache_bytes = 0
+    image_cache_files = 0
 
     if not no_hardlink and (workspaces or dedup_global):
         console.print("\n[bold]Hardlink dedup[/bold]")
@@ -8309,6 +8357,46 @@ def prune_cmd(
         else:
             console.print("  [dim]none[/dim]")
 
+    if not no_image_cache:
+        console.print(
+            f"\n[bold]Cached image tarballs[/bold]  (keep={image_cache_keep})"
+        )
+        image_cache_bytes, image_cache_files = _prune._prune_image_cache(
+            GLOBAL_CACHE / "images",
+            keep=image_cache_keep,
+            apply=apply,
+        )
+        verb = "would remove" if not apply else "removed"
+        if image_cache_files:
+            console.print(
+                f"  {verb}: {_fmt_bytes(image_cache_bytes)} across "
+                f"{image_cache_files:,} file(s)"
+            )
+        else:
+            console.print("  [dim]none[/dim]")
+        total_saved += image_cache_bytes
+
+    shadowed_bytes = 0
+    shadowed_items = 0
+    if not no_shadowed_home:
+        console.print("\n[bold]Shadowed seed subtrees[/bold]")
+        console.print(
+            f"  [dim]targets: {', '.join(_prune.SHADOWED_HOME_PATHS)} "
+            "(each overlay-masked at runtime)[/dim]"
+        )
+        shadowed_bytes, shadowed_items = _prune._prune_shadowed_home(
+            GLOBAL_HOME, apply=apply
+        )
+        verb = "would remove" if not apply else "removed"
+        if shadowed_items:
+            console.print(
+                f"  {verb}: {_fmt_bytes(shadowed_bytes)} across "
+                f"{shadowed_items:,} path(s)"
+            )
+        else:
+            console.print("  [dim]none[/dim]")
+        total_saved += shadowed_bytes
+
     cache_bytes = 0
     cache_files = 0
     if cache_age > 0:
@@ -8337,14 +8425,19 @@ def prune_cmd(
         console.print(
             f"[bold green]Reclaimed {_fmt_bytes(total_saved)}[/bold green] via "
             f"{total_links:,} hardlinks, {len(removed_containers)} container(s), "
-            f"{len(removed_images)} image(s), {cache_files:,} cache file(s)."
+            f"{len(removed_images)} image(s), {image_cache_files:,} image tar(s), "
+            f"{shadowed_items:,} shadowed seed path(s), "
+            f"{cache_files:,} cache file(s)."
         )
     else:
         console.print(
             f"[bold yellow]DRY-RUN:[/bold yellow] would reclaim "
             f"{_fmt_bytes(total_saved)} via {total_links:,} hardlinks, remove "
             f"{len(removed_containers)} container(s), "
-            f"{len(removed_images)} image(s), {cache_files:,} cache file(s).  "
+            f"{len(removed_images)} image(s), "
+            f"{image_cache_files:,} image tar(s), "
+            f"{shadowed_items:,} shadowed seed path(s), "
+            f"{cache_files:,} cache file(s).  "
             f"Re-run with [cyan]--apply[/cyan] to execute."
         )
 

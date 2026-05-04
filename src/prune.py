@@ -46,19 +46,46 @@ _GLOBAL_DEDUPE_SUBDIRS = ("cache", "mise", "home")
 # is pure CAS with a fast re-download path.  ``go-build`` is
 # re-compile-able.  Heavy re-downloads (playwright browsers, HF
 # models) live in a separate opt-in set below.
-CACHE_PURGE_DEFAULT_SUBDIRS = ("uv", "pip", "npm", "go-build", "mise")
+#
+# ``pex`` and ``pants`` caches rebuild on next invocation (wheels +
+# cached interpreters); the rebuild can take a few minutes but content
+# is fully reproducible from pypi + python-build-standalone.
+# ``node-gyp`` and ``gopls`` are small tool caches, trivially
+# recomputed.  NOT listed here (intentionally): ``copilot`` (holds the
+# actual CLI installation at pkg/, not re-downloadable state) and
+# anything under the forbidden browser set.
+CACHE_PURGE_DEFAULT_SUBDIRS: Tuple[str, ...] = (
+    "uv",
+    "pip",
+    "npm",
+    "go-build",
+    "mise",
+    "pex",
+    "pants",
+    "node-gyp",
+    "gopls",
+)
 
 # Opt-in.  Same safety profile but the re-fetch cost is meaningful:
 # playwright re-downloads are ~400 MiB per browser; huggingface
 # models can be GiBs each.
-CACHE_PURGE_HEAVY_SUBDIRS = ("ms-playwright", "huggingface")
+CACHE_PURGE_HEAVY_SUBDIRS: Tuple[str, ...] = ("ms-playwright", "huggingface")
 
 # Hard-excluded.  These aren't pure caches — they carry live user
-# profile state (cookies, IndexedDB, extensions, bookmarks).
-# ``_purge_cache_by_age`` refuses to touch them even if the caller
-# explicitly names them in ``subdirs``.
+# profile state (cookies, IndexedDB, extensions, bookmarks), OR they
+# hold the installed binaries of a tool (copilot's pkg/) rather than
+# regenerable cache.  ``_purge_cache_by_age`` refuses to touch them
+# even if the caller explicitly names them in ``subdirs``.
 _CACHE_PURGE_FORBIDDEN = frozenset(
-    {"chromium", "google-chrome", "chrome", "mozilla", "firefox", "thunderbird"}
+    {
+        "chromium",
+        "google-chrome",
+        "chrome",
+        "mozilla",
+        "firefox",
+        "thunderbird",
+        "copilot",
+    }
 )
 
 # Hardlink detection reads files in chunks; avoid loading multi-GB
@@ -468,6 +495,11 @@ def _disk_usage_report(*, workspaces: Iterable[Path], global_storage: Path) -> d
         (cache? mise? containers?).  Stray top-level files roll up
         into ``"_files"`` so the breakdown sum equals the top-level
         total exactly — nothing stays hidden.
+      - ``cache_breakdown``: {subdir_name: bytes} for every direct
+        child of ``global_storage/cache``.  The cache bucket typically
+        dominates; surfacing its internal breakdown tells the operator
+        which tool cache is actually fat (images? pip? go-build?).
+        Empty dict if ``cache/`` doesn't exist.
     """
     breakdown: dict[str, int] = {}
     gs_bytes = 0
@@ -494,18 +526,223 @@ def _disk_usage_report(*, workspaces: Iterable[Path], global_storage: Path) -> d
         if stray:
             breakdown["_files"] = stray
 
+    cache_breakdown: dict[str, int] = {}
+    cache_root = global_storage / "cache"
+    if cache_root.is_dir():
+        stray = 0
+        try:
+            entries = list(cache_root.iterdir())
+        except OSError:
+            entries = []
+        for child in entries:
+            try:
+                if child.is_symlink():
+                    continue
+                if child.is_dir():
+                    cache_breakdown[child.name] = _dir_size_bytes(child)
+                elif child.is_file():
+                    stray += child.lstat().st_size
+            except OSError:
+                continue
+        if stray:
+            cache_breakdown["_files"] = stray
+
     ws_bytes = sum(_dir_size_bytes(ws / ".yolo") for ws in workspaces)
     return {
         "global_storage": gs_bytes,
         "workspaces": ws_bytes,
         "total": gs_bytes + ws_bytes,
         "breakdown": breakdown,
+        "cache_breakdown": cache_breakdown,
     }
 
 
 # ---------------------------------------------------------------------------
 # Age-based cache purge
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Shadowed-home prune — purge :ro seed subtrees that are overlay-masked
+# at jail runtime so they can never be read.  Pre-cache-split cruft
+# typically hoards 70+ GiB under `.cache`, and also accumulates under
+# `.npm`/`.npm-global`/`.local`/`go` for operators who ran the jail
+# before those were split out into per-workspace overlays.
+#
+# SAFETY: every path here MUST be fully shadowed by an overlay bind
+# mount declared in cli.py's docker_cmd (or by a redirect env var like
+# NPM_CONFIG_CACHE that points reads elsewhere while the :ro base makes
+# writes fail).  The drift-check in tests/test_prune.py greps cli.py
+# at test time to enforce this — if an overlay mount is removed without
+# trimming this list, tests fail and CI blocks the change.
+#
+# NOT listed (intentionally):
+#   - .copilot / .gemini / .claude — seeded by _seed_agent_dir on every
+#     new workspace; deleting the base would break first-boot auth.
+#   - .claude-shared-credentials — rw shared-credential mount point.
+#   - .config — bind-mounted over but the seed may carry non-auth
+#     content the entrypoint relies on; too risky to add without audit.
+# ---------------------------------------------------------------------------
+
+SHADOWED_HOME_PATHS: Tuple[str, ...] = (
+    ".cache",
+    ".npm",
+    ".npm-global",
+    ".local",
+    "go",
+)
+
+
+def _prune_shadowed_home(
+    global_home: Path,
+    *,
+    apply: bool,
+) -> Tuple[int, int]:
+    """Delete subpaths of ``global_home`` listed in
+    ``SHADOWED_HOME_PATHS``.  Returns ``(bytes_removed, items_removed)``.
+
+    Symlinks are unlinked but never traversed — if the operator
+    relocated a shadowed dir to cold storage via ``ln -s``, the real
+    content on the HDD target is preserved.  The symlink itself has
+    no on-disk cost and can be recreated by the next jail boot (the
+    overlay mount will materialize the path fresh).
+
+    Entries containing ``..`` are refused defensively even though the
+    registry is a compile-time constant.
+    """
+    if not global_home.is_dir():
+        return 0, 0
+
+    bytes_removed = 0
+    items_removed = 0
+
+    import shutil as _shutil
+
+    for rel in SHADOWED_HOME_PATHS:
+        if ".." in rel.split("/") or rel.startswith("/"):
+            log.debug("refusing suspicious registry entry %r", rel)
+            continue
+        target = global_home / rel
+        try:
+            lst = target.lstat()
+        except OSError:
+            continue
+
+        import stat as _stat
+
+        if _stat.S_ISLNK(lst.st_mode):
+            # Symlink itself takes ~0 bytes but still counts as one item.
+            if apply:
+                try:
+                    target.unlink()
+                except OSError as e:
+                    log.debug("unlink symlink %s failed: %s", target, e)
+                    continue
+            items_removed += 1
+            continue
+
+        if _stat.S_ISDIR(lst.st_mode):
+            size = _dir_size_bytes(target)
+            if apply:
+                try:
+                    _shutil.rmtree(target)
+                except OSError as e:
+                    log.debug("rmtree %s failed: %s", target, e)
+                    continue
+            bytes_removed += size
+            items_removed += 1
+            continue
+
+        if _stat.S_ISREG(lst.st_mode):
+            size = lst.st_size
+            if apply:
+                try:
+                    target.unlink()
+                except OSError as e:
+                    log.debug("unlink %s failed: %s", target, e)
+                    continue
+            bytes_removed += size
+            items_removed += 1
+
+    return bytes_removed, items_removed
+
+
+# ---------------------------------------------------------------------------
+# Image-cache prune (keep newest N, sweep orphan tmp files)
+# ---------------------------------------------------------------------------
+
+
+def _prune_image_cache(
+    images_dir: Path,
+    *,
+    keep: int,
+    apply: bool,
+) -> Tuple[int, int]:
+    """Keep the ``keep`` newest ``*.tar`` files under ``images_dir`` and
+    remove the rest.  Always sweeps orphan ``*.tmp`` files (leftovers
+    from a crashed ``_materialize_image``) regardless of ``keep``.
+
+    Returns ``(bytes_removed, files_removed)``.  Dry-run reports what
+    would go without touching disk.
+
+    Why: the image tar cache can hit 80+ GiB (one ~3 GiB tar per
+    distinct nix store path, and every config change / package bump
+    mints a new one).  The fallback path in ``auto_load_image`` only
+    needs the newest one or two as a recovery option when ``nix build``
+    fails inside a nested jail — anything older is pure cruft.
+    """
+    if not images_dir.is_dir():
+        return 0, 0
+
+    bytes_removed = 0
+    files_removed = 0
+
+    try:
+        children = list(images_dir.iterdir())
+    except OSError:
+        return 0, 0
+
+    tars: List[Tuple[Path, int, float]] = []
+    tmps: List[Tuple[Path, int]] = []
+    for child in children:
+        try:
+            if child.is_symlink() or not child.is_file():
+                continue
+            st = child.lstat()
+        except OSError:
+            continue
+        if child.suffix == ".tar":
+            tars.append((child, st.st_size, st.st_mtime))
+        elif child.suffix == ".tmp":
+            tmps.append((child, st.st_size))
+
+    # Tars: newest first, drop the tail beyond `keep`.
+    tars.sort(key=lambda t: t[2], reverse=True)
+    for path, size, _ in tars[keep:]:
+        if apply:
+            try:
+                path.unlink()
+            except OSError as e:
+                log.debug("unlink %s failed: %s", path, e)
+                continue
+        bytes_removed += size
+        files_removed += 1
+
+    # Orphan tmp files: always sweep.  A live materialization holds an
+    # open fd on its .tmp, but unlink() is safe — the fd keeps the
+    # inode alive until close.  Still, the risk is low enough and the
+    # win high enough that we just do it.
+    for path, size in tmps:
+        if apply:
+            try:
+                path.unlink()
+            except OSError as e:
+                log.debug("unlink %s failed: %s", path, e)
+                continue
+        bytes_removed += size
+        files_removed += 1
+
+    return bytes_removed, files_removed
 
 
 def _purge_cache_by_age(

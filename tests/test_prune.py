@@ -352,7 +352,7 @@ class TestPurgeCacheByAge:
         chromium.mkdir(parents=True)
         self._touch_old(chromium / "Cookies", days_old=365)
 
-        removed_bytes, removed_count = prune._purge_cache_by_age(
+        _removed_bytes, removed_count = prune._purge_cache_by_age(
             cache,
             subdirs=["chromium", "google-chrome", "mozilla"],
             older_than_days=30,
@@ -361,6 +361,25 @@ class TestPurgeCacheByAge:
 
         assert removed_count == 0
         assert (chromium / "Cookies").exists()
+
+    def test_copilot_hard_excluded(self, tmp_path):
+        """``~/.cache/copilot/pkg/`` holds the installed CLI tree, not
+        a re-downloadable cache.  Must never be purged even if the
+        caller names it — would silently break the CLI until reinstall."""
+        cache = tmp_path / "cache"
+        copilot = cache / "copilot" / "pkg" / "linux-x64"
+        copilot.mkdir(parents=True)
+        self._touch_old(copilot / "copilot", days_old=365)
+
+        _removed_bytes, removed_count = prune._purge_cache_by_age(
+            cache,
+            subdirs=["copilot"],
+            older_than_days=30,
+            apply=True,
+        )
+
+        assert removed_count == 0
+        assert (copilot / "copilot").exists()
 
     def test_missing_subdir_tolerated(self, tmp_path):
         """Some installs won't have all tool caches — missing subdir
@@ -413,6 +432,290 @@ class TestPurgeCacheByAge:
         )
         assert elsewhere.exists()
         assert removed_count == 0
+
+
+class TestPruneImageCache:
+    """``_prune_image_cache(cache_images_dir, *, keep, apply)`` retains
+    the ``keep`` newest ``*.tar`` files under the image cache and removes
+    the rest (plus any stale ``*.tmp`` from aborted materializations).
+
+    The cached tars are recreated by `nix build` + `podman load` on next
+    jail startup — the penalty is re-streaming one 3 GiB tarball, which
+    takes ~30 seconds on an SSD.  Keeping a handful around handles the
+    nested-jail-without-nix-build fallback path (see auto_load_image).
+    """
+
+    def _touch(self, p: Path, *, size: int, days_old: float) -> None:
+        import time
+
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x" * size)
+        old = time.time() - (days_old * 86400)
+        os.utime(p, (old, old))
+
+    def test_keeps_newest_n_tars(self, tmp_path):
+        images = tmp_path / "images"
+        self._touch(images / "newest.tar", size=100, days_old=1)
+        self._touch(images / "middle.tar", size=200, days_old=10)
+        self._touch(images / "oldest.tar", size=300, days_old=30)
+
+        bytes_removed, files_removed = prune._prune_image_cache(
+            images, keep=1, apply=True
+        )
+
+        assert (images / "newest.tar").exists()
+        assert not (images / "middle.tar").exists()
+        assert not (images / "oldest.tar").exists()
+        assert files_removed == 2
+        assert bytes_removed == 500
+
+    def test_dry_run_reports_but_does_not_delete(self, tmp_path):
+        images = tmp_path / "images"
+        self._touch(images / "a.tar", size=10, days_old=1)
+        self._touch(images / "b.tar", size=20, days_old=5)
+        self._touch(images / "c.tar", size=30, days_old=10)
+
+        bytes_removed, files_removed = prune._prune_image_cache(
+            images, keep=1, apply=False
+        )
+
+        assert (images / "a.tar").exists()
+        assert (images / "b.tar").exists()
+        assert (images / "c.tar").exists()
+        assert files_removed == 2
+        assert bytes_removed == 50
+
+    def test_keep_zero_removes_all(self, tmp_path):
+        """``keep=0`` is valid — nuke the entire cache.  Useful after a
+        failed image build when the cached tars reference a now-gone
+        store path."""
+        images = tmp_path / "images"
+        self._touch(images / "a.tar", size=10, days_old=1)
+        self._touch(images / "b.tar", size=20, days_old=5)
+
+        bytes_removed, files_removed = prune._prune_image_cache(
+            images, keep=0, apply=True
+        )
+
+        assert not (images / "a.tar").exists()
+        assert not (images / "b.tar").exists()
+        assert files_removed == 2
+        assert bytes_removed == 30
+
+    def test_under_threshold_is_noop(self, tmp_path):
+        images = tmp_path / "images"
+        self._touch(images / "a.tar", size=10, days_old=1)
+        self._touch(images / "b.tar", size=20, days_old=5)
+
+        bytes_removed, files_removed = prune._prune_image_cache(
+            images, keep=5, apply=True
+        )
+        assert files_removed == 0
+        assert bytes_removed == 0
+        assert (images / "a.tar").exists()
+        assert (images / "b.tar").exists()
+
+    def test_sweeps_orphan_tmp_files(self, tmp_path):
+        """``_materialize_image`` writes to ``<hash>.tmp`` before renaming
+        to ``<hash>.tar``.  A crashed build leaves the .tmp behind — it
+        serves no purpose and can be multiple GiB.  Always sweep, even
+        when the tar count is under ``keep``."""
+        images = tmp_path / "images"
+        self._touch(images / "live.tar", size=10, days_old=1)
+        self._touch(images / "abandoned.tmp", size=1000, days_old=5)
+
+        bytes_removed, files_removed = prune._prune_image_cache(
+            images, keep=5, apply=True
+        )
+
+        assert (images / "live.tar").exists()
+        assert not (images / "abandoned.tmp").exists()
+        assert files_removed == 1
+        assert bytes_removed == 1000
+
+    def test_missing_dir_tolerated(self, tmp_path):
+        """Fresh install has no image cache yet — function returns zeros,
+        does not crash."""
+        bytes_removed, files_removed = prune._prune_image_cache(
+            tmp_path / "missing", keep=3, apply=True
+        )
+        assert bytes_removed == 0
+        assert files_removed == 0
+
+    def test_ignores_non_tar_tmp_files(self, tmp_path):
+        """Only ``*.tar`` and ``*.tmp`` are managed.  An operator who
+        drops a README or a partial rsync file is not our business."""
+        images = tmp_path / "images"
+        self._touch(images / "a.tar", size=10, days_old=1)
+        self._touch(images / "b.tar", size=20, days_old=5)
+        self._touch(images / "README.md", size=100, days_old=100)
+
+        prune._prune_image_cache(images, keep=1, apply=True)
+
+        # Foreign file untouched.
+        assert (images / "README.md").exists()
+
+
+class TestPruneShadowedHome:
+    """``_prune_shadowed_home(global_home, *, apply)`` removes subpaths
+    under ``~/.local/share/yolo-jail/home`` that are fully shadowed by
+    per-workspace or shared overlay mounts at jail runtime.
+
+    These paths are baked into the ``:ro`` seed for historical reasons
+    (pre-cache-split layout) but are never read inside any live jail —
+    the overlay wins.  Leaving them there wastes tens of GiB of SSD
+    on every install.
+    """
+
+    def test_registry_is_a_concrete_tuple(self):
+        """SHADOWED_HOME_PATHS must be a literal sequence of relative
+        path strings.  Keeping it static makes it trivially reviewable
+        in a diff and prevents dynamic/wildcard expansion."""
+        assert isinstance(prune.SHADOWED_HOME_PATHS, tuple)
+        assert len(prune.SHADOWED_HOME_PATHS) > 0
+        for p in prune.SHADOWED_HOME_PATHS:
+            assert isinstance(p, str)
+            assert not p.startswith("/"), f"{p!r} must be relative"
+            assert ".." not in p.split("/"), f"{p!r} must not traverse up"
+
+    def test_registry_stays_in_sync_with_cli_mount_table(self):
+        """Every path in SHADOWED_HOME_PATHS must correspond to an
+        overlay mount in cli.py that masks the GLOBAL_HOME copy at
+        runtime — otherwise deleting the seed would actually affect
+        behaviour.  This grep-based check fires if someone removes an
+        overlay mount without also trimming the registry.
+
+        We look for either ``:/home/agent/<path>`` (per-workspace or
+        shared bind mount on top of the seed) OR an env var that
+        redirects reads/writes away from that path (e.g.
+        ``NPM_CONFIG_CACHE`` points .npm/ reads elsewhere).
+        """
+        cli_src = (Path(__file__).parent.parent / "src" / "cli.py").read_text()
+        for rel in prune.SHADOWED_HOME_PATHS:
+            mount_marker = f":/home/agent/{rel}"
+            env_marker_candidates = (
+                # .npm is shadowed via NPM_CONFIG_CACHE pointing elsewhere
+                # and the :ro seed making writes impossible.
+                "NPM_CONFIG_CACHE=/home/agent/.cache/npm",
+            )
+            has_overlay = mount_marker in cli_src
+            has_env_shadow = rel == ".npm" and any(
+                m in cli_src for m in env_marker_candidates
+            )
+            assert has_overlay or has_env_shadow, (
+                f"SHADOWED_HOME_PATHS lists {rel!r} but cli.py has no "
+                f"overlay mount {mount_marker!r} nor a known env-var "
+                f"shadow.  Either restore the mount or remove this "
+                f"entry — leaving it here would delete live seed data."
+            )
+
+    def test_registry_excludes_seeded_agent_dirs(self):
+        """``~/.copilot``, ``~/.gemini``, ``~/.claude`` under GLOBAL_HOME
+        feed ``_seed_agent_dir`` on first boot of a new workspace — they
+        are NOT shadowed.  Must not appear in the registry.  Also
+        ``.claude-shared-credentials`` is the rw shared-auth dir itself."""
+        forbidden = {
+            ".copilot",
+            ".gemini",
+            ".claude",
+            ".claude-shared-credentials",
+        }
+        for entry in prune.SHADOWED_HOME_PATHS:
+            top = entry.split("/", 1)[0]
+            assert top not in forbidden, (
+                f"{entry!r} has a seeded/shared top-level dir — must "
+                "not be in SHADOWED_HOME_PATHS"
+            )
+
+    def test_removes_listed_paths(self, monkeypatch, tmp_path):
+        gh = tmp_path / "home"
+        gh.mkdir()
+        (gh / ".cache").mkdir()
+        (gh / ".cache" / "big").write_bytes(b"x" * 5000)
+        (gh / ".npm").mkdir()
+        (gh / ".npm" / "big").write_bytes(b"y" * 3000)
+        # Not in registry — must survive.
+        (gh / ".copilot").mkdir()
+        (gh / ".copilot" / "auth.json").write_bytes(b"keepme")
+
+        monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", (".cache", ".npm"))
+
+        bytes_removed, items_removed = prune._prune_shadowed_home(gh, apply=True)
+
+        assert not (gh / ".cache").exists()
+        assert not (gh / ".npm").exists()
+        assert (gh / ".copilot" / "auth.json").exists()
+        assert items_removed == 2
+        assert bytes_removed == 8000
+
+    def test_dry_run_reports_but_does_not_delete(self, monkeypatch, tmp_path):
+        gh = tmp_path / "home"
+        gh.mkdir()
+        (gh / ".cache").mkdir()
+        (gh / ".cache" / "f").write_bytes(b"x" * 100)
+        monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", (".cache",))
+
+        bytes_removed, items_removed = prune._prune_shadowed_home(gh, apply=False)
+
+        assert (gh / ".cache").exists(), "dry-run must not delete"
+        assert items_removed == 1
+        assert bytes_removed == 100
+
+    def test_missing_paths_tolerated(self, monkeypatch, tmp_path):
+        """Fresh install won't have all the shadowed dirs yet — skip
+        silently, don't crash, don't miscount."""
+        gh = tmp_path / "home"
+        gh.mkdir()
+        monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", (".cache", ".npm", ".local"))
+
+        bytes_removed, items_removed = prune._prune_shadowed_home(gh, apply=True)
+        assert bytes_removed == 0
+        assert items_removed == 0
+
+    def test_missing_global_home_returns_zero(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", (".cache",))
+        bytes_removed, items_removed = prune._prune_shadowed_home(
+            tmp_path / "not-there", apply=True
+        )
+        assert (bytes_removed, items_removed) == (0, 0)
+
+    def test_refuses_to_follow_symlinks_out_of_home(self, monkeypatch, tmp_path):
+        """If a shadowed subpath is actually a symlink to data outside
+        GLOBAL_HOME (e.g. user relocated the cache to HDD via ln -s),
+        the pass MUST NOT traverse and delete the real content.  Unlink
+        the symlink itself — that's still correct — but never rm -rf
+        through it."""
+        gh = tmp_path / "home"
+        gh.mkdir()
+        real_cache = tmp_path / "cold-storage" / "cache"
+        real_cache.mkdir(parents=True)
+        precious = real_cache / "do-not-delete"
+        precious.write_bytes(b"precious" * 1000)
+        (gh / ".cache").symlink_to(real_cache)
+
+        monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", (".cache",))
+
+        prune._prune_shadowed_home(gh, apply=True)
+
+        # The symlink itself is gone (user can recreate), but the real
+        # target and its contents survive.
+        assert not (gh / ".cache").is_symlink()
+        assert not (gh / ".cache").exists()
+        assert precious.exists()
+        assert precious.read_bytes() == b"precious" * 1000
+
+    def test_refuses_path_traversal_in_registry(self, monkeypatch, tmp_path):
+        """Defence in depth: even if someone smuggles a ``..`` into the
+        registry at runtime, the pass refuses to act on it."""
+        gh = tmp_path / "home"
+        gh.mkdir()
+        outside = tmp_path / "outside.txt"
+        outside.write_bytes(b"not yours")
+        monkeypatch.setattr(prune, "SHADOWED_HOME_PATHS", ("../outside.txt",))
+
+        prune._prune_shadowed_home(gh, apply=True)
+
+        assert outside.exists()
 
 
 class TestWalkGlobalDedupable:
@@ -806,6 +1109,35 @@ class TestDiskUsageReport:
         assert report["total"] == 0
         assert report["breakdown"] == {}
 
+    def test_cache_breakdown_surfaces_fat_subdir(self, tmp_path):
+        """When the cache bucket dominates global storage (images/ can
+        hit 80+ GiB), the operator needs to see which cache subdir is
+        fat without running ``du`` manually.  Report carries a
+        ``cache_breakdown`` mapping every direct child of
+        ``global_storage/cache`` to its byte size."""
+        gs = tmp_path / "yolo-jail"
+        cache = gs / "cache"
+        cache.mkdir(parents=True)
+        (cache / "images").mkdir()
+        (cache / "images" / "big.tar").write_bytes(b"x" * 5000)
+        (cache / "pip").mkdir()
+        (cache / "pip" / "w.whl").write_bytes(b"y" * 300)
+        (cache / "go-build").mkdir()
+        (cache / "go-build" / "o.out").write_bytes(b"z" * 100)
+
+        report = prune._disk_usage_report(workspaces=[], global_storage=gs)
+        cb = report["cache_breakdown"]
+
+        assert cb["images"] == 5000
+        assert cb["pip"] == 300
+        assert cb["go-build"] == 100
+
+    def test_cache_breakdown_empty_when_no_cache_dir(self, tmp_path):
+        gs = tmp_path / "yolo-jail"
+        (gs / "mise").mkdir(parents=True)
+        report = prune._disk_usage_report(workspaces=[], global_storage=gs)
+        assert report["cache_breakdown"] == {}
+
     def test_breaks_down_global_storage_by_subdir(self, tmp_path):
         """When 177 GiB is sitting in ~/.local/share/yolo-jail the user
         needs to know WHICH subdir is fat.  Report carries a
@@ -955,6 +1287,168 @@ class TestPruneCommand:
         assert result.exit_code == 0
         assert seen["keep"] == 5
 
+    def test_image_cache_pass_runs_by_default(self, monkeypatch):
+        """The image-tar cache is the biggest offender (~3 GiB per tar,
+        often 20+ cached) — the cleanup pass must run on a plain
+        `yolo prune` so the operator sees reclaim candidates without
+        opting in."""
+        seen: dict = {}
+
+        def fake_image_cache(images_dir, *, keep, apply):
+            seen["keep"] = keep
+            seen["apply"] = apply
+            seen["dir"] = images_dir
+            return (0, 0)
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+        monkeypatch.setattr(prune, "_prune_image_cache", fake_image_cache)
+
+        result = self._invoke([])
+        assert result.exit_code == 0
+        assert seen["keep"] == 3  # default
+        assert seen["apply"] is False
+
+    def test_image_cache_keep_flag_overrides_default(self, monkeypatch):
+        seen: dict = {}
+
+        def fake_image_cache(images_dir, *, keep, apply):
+            seen["keep"] = keep
+            return (0, 0)
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+        monkeypatch.setattr(prune, "_prune_image_cache", fake_image_cache)
+
+        result = self._invoke(["--image-cache-keep", "1"])
+        assert result.exit_code == 0
+        assert seen["keep"] == 1
+
+    def test_shadowed_home_pass_runs_by_default(self, monkeypatch):
+        """Plain `yolo prune` must exercise the shadowed-seed cleanup —
+        it's the only way the pre-cache-split cruft gets reclaimed."""
+        seen: dict = {}
+
+        def fake_prune(global_home, *, apply):
+            seen["apply"] = apply
+            seen["home"] = global_home
+            return (0, 0)
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+        monkeypatch.setattr(
+            prune,
+            "_prune_image_cache",
+            lambda images_dir, *, keep, apply: (0, 0),
+        )
+        monkeypatch.setattr(prune, "_prune_shadowed_home", fake_prune)
+
+        result = self._invoke([])
+        assert result.exit_code == 0
+        assert seen["apply"] is False
+
+    def test_no_shadowed_home_skips_pass(self, monkeypatch):
+        called = {"n": 0}
+
+        def fake_prune(global_home, *, apply):
+            called["n"] += 1
+            return (0, 0)
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+        monkeypatch.setattr(
+            prune,
+            "_prune_image_cache",
+            lambda images_dir, *, keep, apply: (0, 0),
+        )
+        monkeypatch.setattr(prune, "_prune_shadowed_home", fake_prune)
+
+        result = self._invoke(["--no-shadowed-home"])
+        assert result.exit_code == 0
+        assert called["n"] == 0
+
+    def test_no_image_cache_skips_pass(self, monkeypatch):
+        called = {"n": 0}
+
+        def fake_image_cache(images_dir, *, keep, apply):
+            called["n"] += 1
+            return (0, 0)
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+        monkeypatch.setattr(prune, "_prune_image_cache", fake_image_cache)
+
+        result = self._invoke(["--no-image-cache"])
+        assert result.exit_code == 0
+        assert called["n"] == 0
+
+    def test_cold_storage_hint_when_images_large(self, monkeypatch):
+        """When cache/images is >20 GiB, dry-run output must nudge the
+        operator toward offloading that subdir to HDD — it's read
+        sequentially at container load and doesn't need SSD speed."""
+
+        def fake_report(*, workspaces, global_storage):
+            return {
+                "global_storage": 100 * (1024**3),
+                "workspaces": 0,
+                "total": 100 * (1024**3),
+                "breakdown": {"cache": 100 * (1024**3)},
+                "cache_breakdown": {
+                    "images": 80 * (1024**3),
+                    "pip": 4 * (1024**3),
+                    "uv": 1 * (1024**3),
+                },
+            }
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(prune, "_disk_usage_report", fake_report)
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+        monkeypatch.setattr(
+            prune,
+            "_prune_image_cache",
+            lambda images_dir, *, keep, apply: (0, 0),
+        )
+
+        result = self._invoke([])
+        assert result.exit_code == 0
+        # The breakdown and the HDD-offload hint both appear in output.
+        assert "images" in result.output
+        assert (
+            "HDD" in result.output
+            or "cold" in result.output.lower()
+            or ("symlink" in result.output.lower())
+        )
+
     def test_dedup_global_includes_cache_entries(self, monkeypatch):
         """With --dedup-global the pass must walk the shared caches
         too, not just the per-workspace subtrees."""
@@ -1015,8 +1509,16 @@ class TestPruneCommand:
         assert seen["apply"] is False  # dry-run default
         # Default subdirs list, heavy caches NOT included.
         assert "uv" in seen["subdirs"]
+        assert "pip" in seen["subdirs"]
+        # Expanded defaults: pex + pants are rebuildable CAS, add
+        # gigabytes of overhead on ML / monorepo boxes.
+        assert "pex" in seen["subdirs"]
+        assert "pants" in seen["subdirs"]
         assert "huggingface" not in seen["subdirs"]
         assert "ms-playwright" not in seen["subdirs"]
+        # copilot holds the installed CLI pkg/ directory, not cache
+        # state — must never be a default target.
+        assert "copilot" not in seen["subdirs"]
 
     def test_purge_heavy_caches_extends_subdirs(self, monkeypatch):
         seen: dict = {}
@@ -1040,9 +1542,36 @@ class TestPruneCommand:
         assert "huggingface" in seen["subdirs"]
         assert "ms-playwright" in seen["subdirs"]
 
-    def test_no_cache_age_skips_purge(self, monkeypatch):
-        """Without --cache-age, the purge must be skipped entirely —
-        never a default-on destructive action."""
+    def test_default_cache_age_is_30d_dry_run(self, monkeypatch):
+        """With no flags, the cache-age pass runs at the 30d default in
+        DRY-RUN so the operator sees reclaim candidates without having
+        to remember the flag.  The whole prune run is dry-run by default
+        so nothing actually gets deleted."""
+        seen: dict = {}
+
+        def fake_purge(cache_root, *, subdirs, older_than_days, apply):
+            seen["older_than_days"] = older_than_days
+            seen["apply"] = apply
+            return (0, 0)
+
+        monkeypatch.setattr(prune, "_find_yolo_workspaces", lambda runtime: [])
+        monkeypatch.setattr(
+            prune, "_prune_stopped_containers", lambda runtime, *, apply: []
+        )
+        monkeypatch.setattr(
+            prune, "_prune_old_images", lambda runtime, *, keep, apply: []
+        )
+        monkeypatch.setattr(prune, "_purge_cache_by_age", fake_purge)
+
+        result = self._invoke([])
+        assert result.exit_code == 0
+        assert seen["older_than_days"] == 30
+        assert seen["apply"] is False
+
+    def test_cache_age_zero_skips_purge(self, monkeypatch):
+        """``--cache-age 0`` is the explicit opt-out for operators who
+        don't want the cache pass (e.g. running prune purely for
+        image / container cleanup)."""
         called = {"n": 0}
 
         def fake_purge(cache_root, *, subdirs, older_than_days, apply):
@@ -1058,7 +1587,7 @@ class TestPruneCommand:
         )
         monkeypatch.setattr(prune, "_purge_cache_by_age", fake_purge)
 
-        result = self._invoke([])
+        result = self._invoke(["--cache-age", "0"])
         assert result.exit_code == 0
         assert called["n"] == 0
 
